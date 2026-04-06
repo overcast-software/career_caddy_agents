@@ -38,17 +38,18 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
 WORKDIR /app
 
+ENV CAMOUFOX_DATA_DIR=/opt/camoufox
+
 # Install dependencies (better layer caching — source changes won't invalidate this)
 COPY pyproject.toml uv.lock /app/
 RUN uv sync --frozen --no-dev --no-install-project
 
+# Download the Camoufox Firefox binary before copying source so this layer
+# is only invalidated when pyproject.toml/uv.lock change, not on app changes
+RUN uv run python -m camoufox fetch
+
 # Copy the rest of the source
 COPY . /app
 RUN uv sync --frozen --no-dev
-
-# Download the Camoufox Firefox binary at build time
-# Set a stable data dir so the binary survives user/path changes
-ENV CAMOUFOX_DATA_DIR=/opt/camoufox
-RUN uv run python -m camoufox fetch
 
 # No default CMD — overridden per-service in docker-compose
