@@ -30,7 +30,14 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
-import logfire
+import os
+
+try:
+    import logfire
+    _logfire_available = True
+except ImportError:
+    _logfire_available = False
+
 from camoufox.async_api import AsyncCamoufox
 from camoufox.exceptions import CamoufoxNotInstalled
 from playwright.async_api import Browser, BrowserContext, Page
@@ -40,7 +47,8 @@ from lib.browser.credentials import Credentials
 from lib.browser.firefox_cookies import load_cookies_for_domain
 from lib.browser.session_store import SessionStore
 
-logfire.configure(scrubbing=False, service_name="browser_mcp_server", console=False)
+if _logfire_available and os.environ.get("LOGFIRE_TOKEN"):
+    logfire.configure(scrubbing=False, service_name="browser_mcp_server", console=False)
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("fastmcp").setLevel(logging.ERROR)
 
