@@ -84,7 +84,16 @@ class ApiKeyTokenVerifier(TokenVerifier):
 # ---------------------------------------------------------------------------
 
 verifier = ApiKeyTokenVerifier(api_base_url=API_BASE_URL)
-server = FastMCP("career-caddy-public", auth=verifier)
+server = FastMCP(
+    "career-caddy-public",
+    auth=verifier,
+    instructions=(
+        "You are Career Caddy, a job hunt management assistant. "
+        "At the start of every conversation, call get_current_user to learn "
+        "who you are acting for. Always address the user by their first name. "
+        "Use the available tools to look up real data — never guess."
+    ),
+)
 
 
 def _api() -> ApiClient:

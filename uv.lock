@@ -336,6 +336,7 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "rich" },
+    { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -360,6 +361,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "pyyaml" },
     { name = "rich", specifier = "<14" },
+    { name = "starlette", specifier = ">=0.37.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.24.0" },
 ]
 

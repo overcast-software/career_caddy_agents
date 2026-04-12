@@ -17,6 +17,7 @@ dependencies = [
     "pyyaml",
     "camoufox>=0.4.11",
     "jinja2>=3.0.0",
+    "starlette>=0.37.0",
 ]
 
 [project.scripts]
@@ -24,6 +25,7 @@ caddy-gateway  = "mcp_servers.gateway:main"
 caddy-pipeline = "agents.job_email_to_caddy:run"
 caddy-classify = "agents.email_classifier_agent:run"
 caddy-public   = "mcp_servers.public_server:main"
+caddy-chat     = "mcp_servers.chat_server:main"
 caddy-fetch-browser = "camoufox.__main__:main"
 
 [tool.hatch.build.targets.wheel]
