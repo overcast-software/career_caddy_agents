@@ -372,6 +372,7 @@ def register_defaults() -> None:
         system_prompt="",  # chat_server injects user-profile-aware prompt at runtime
         deps_type=CareerCaddyDeps,
         toolset_factories=[lambda: CareerCaddyToolset(scope="all")],
+        history_processors=_common_history,
     ))
 
     # -- email_classifier --
