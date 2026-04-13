@@ -19,6 +19,7 @@ Security invariants:
     - No secrets.yml or mail directory access
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -37,9 +38,10 @@ from starlette.routing import Route
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
-from pydantic_ai import Agent  # noqa: E402
 from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart  # noqa: E402
-from lib.toolsets import CareerCaddyToolset, CareerCaddyDeps  # noqa: E402
+from lib.toolsets import CareerCaddyDeps  # noqa: E402
+from lib.usage_reporter import report_usage  # noqa: E402
+from agents.agent_factory import get_agent, register_defaults  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,6 +65,57 @@ Important rules:
 - Always call find_job_post_by_link before creating a job post to avoid duplicates
 - Use create_job_post_with_company_check (not create_job_post) to handle companies
 - If a tool returns {{"success": false}}, report the error and stop — do not retry
+
+## Frontend URLs — CRITICAL
+ALWAYS provide frontend links when referencing resources. NEVER give API paths
+(like /api/v1/...). Use relative paths only (e.g. /job-posts/244, not
+http://localhost:4200/job-posts/244) — the user may not be on localhost.
+
+When a tool returns a resource with an ID, IMMEDIATELY include a markdown link.
+Do not wait for the user to ask for the URL — proactively include it.
+
+Primary resources:
+- Job post:          /job-posts/{{id}}
+- Job application:   /job-applications/{{id}}
+- Company:           /companies/{{id}}
+- Score:             /scores/{{id}}
+- Resume:            /resumes/{{id}}
+- Cover letter:      /cover-letters/{{id}}
+- Question:          /questions/{{id}}
+- Summary:           /summaries/{{id}}
+- Scrape:            /scrapes/{{id}}
+
+Nested views (child resources under a parent):
+- Job post scores:        /job-posts/{{id}}/scores
+- Job post applications:  /job-posts/{{id}}/job-applications
+- Job post questions:     /job-posts/{{id}}/questions
+- Job post cover letters: /job-posts/{{id}}/cover-letters
+- Job post scrapes:       /job-posts/{{id}}/scrapes
+- Job post summaries:     /job-posts/{{id}}/summaries
+- Company job posts:      /companies/{{id}}/job-posts
+- Company scores:         /companies/{{id}}/scores
+- Question answers:       /questions/{{id}}/answers
+
+Create forms:
+- New job post:        /job-posts/new
+- New application:     /job-applications/new  or  /job-posts/{{id}}/job-applications/new
+- New score:           /scores/new
+- New question:        /questions/new  or  /job-posts/{{id}}/questions/new
+- Scrape a URL:        /job-posts/scrape
+
+Other pages:
+- Career data:    /career-data
+- Settings:       /settings
+- AI Spend:       /settings/ai-spend
+
+Examples:
+- "Here's your [score](/scores/42) for that post."
+- "View the [job post](/job-posts/7) or its [scores](/job-posts/7/scores)."
+- "You can [create an application](/job-posts/7/job-applications/new) for it."
+
+EVERY response that mentions a resource MUST include a clickable link.
+If a tool returns id=244 for a job post, your response must contain
+[job post](/job-posts/244) — not "/api/v1/job-posts/244", not "job post #244".
 
 ## User Profile
 The following profile was loaded from the user's account when this session
@@ -114,12 +167,13 @@ async def _fetch_user_profile(api_key: str) -> str:
         )
 
 
-def _build_agent(user_profile: str) -> Agent:
+register_defaults()
+
+
+def _build_agent(user_profile: str):
     """Build a fresh agent with all career caddy tools."""
-    return Agent(
-        DEFAULT_MODEL,
-        deps_type=CareerCaddyDeps,
-        toolsets=[CareerCaddyToolset(scope="all")],
+    return get_agent(
+        "chat",
         system_prompt=SYSTEM_PROMPT.format(user_profile=user_profile),
     )
 
@@ -191,12 +245,32 @@ async def chat(request: Request):
                     event = json.dumps({"type": "text", "content": chunk})
                     yield f"data: {event}\n\n"
 
+                usage = result.usage()
+                logger.info(
+                    "Chat usage: request_tokens=%s response_tokens=%s total=%s requests=%s",
+                    usage.request_tokens, usage.response_tokens,
+                    usage.total_tokens, usage.requests,
+                )
                 done_event = json.dumps({
                     "type": "done",
                     "content": full_text,
                     "conversation_id": conversation_id,
+                    "usage": {
+                        "request_tokens": usage.request_tokens or 0,
+                        "response_tokens": usage.response_tokens or 0,
+                        "total_tokens": usage.total_tokens or 0,
+                    },
                 })
                 yield f"data: {done_event}\n\n"
+
+                asyncio.create_task(report_usage(
+                    api_token=token,
+                    agent_name="career_caddy_chat",
+                    model_name=DEFAULT_MODEL,
+                    usage=usage,
+                    trigger="chat",
+                    base_url=API_BASE_URL,
+                ))
 
         except Exception as e:
             logger.exception("Chat agent error")

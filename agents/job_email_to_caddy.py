@@ -1,16 +1,16 @@
 # job email to caddy
 #
 import os
+import uuid
 import logfire
 import logging
 import json
 import argparse
 from pydantic import BaseModel
-from lib.models.job_models import JobPostData
 from agents.career_caddy_agent import add_job_post
 from agents.job_extractor_agent import extract_job_from_content
-from pydantic_ai import Agent
-from pydantic_ai.mcp import MCPServerStdio
+from agents.agent_factory import get_model, get_model_name, get_agent, register_defaults
+from lib.usage_reporter import report_usage
 from pydantic_ai.usage import UsageLimits
 import asyncio
 
@@ -27,15 +27,14 @@ class JobOpportunity(BaseModel):
     title: str
 
 
-# Inline email-job agent — searches job_post-tagged emails, extracts URLs.
-# Uses email_server.py as a stdio MCP subprocess so no external service is needed.
-_email_mcp = MCPServerStdio("python", args=["mcp_servers/email_server.py"], env=os.environ.copy())
+# Ensure factory defaults are registered before creating agents
+register_defaults()
+_pipeline_model = get_model("pipeline")
 
-email_job_agent = Agent(
-    "openai:gpt-4o-mini",
+email_job_agent = get_agent(
+    "pipeline",
     name="email_job_agent",
     output_type=list[JobOpportunity],
-    toolsets=[_email_mcp],
     system_prompt=(
         "Search for emails tagged 'job_post'. "
         "For each email found, read it and extract the job title and one primary job posting URL. "
@@ -45,43 +44,52 @@ email_job_agent = Agent(
 )
 
 
-async def scrape_url_and_add_to_caddy(url: str):
+async def scrape_url_and_add_to_caddy(url: str, pipeline_run_id: str | None = None):
     """Scrape a job URL and add it to career caddy."""
     logger.info(f"Scraping job URL: {url}")
-    return await _scrape_url_and_add_to_caddy(url)
+    run_id = pipeline_run_id or str(uuid.uuid4())
+    return await _scrape_url_and_add_to_caddy(url, pipeline_run_id=run_id)
 
 
-async def _scrape_url_and_add_to_caddy(url: str):
-    # Spawn browser_server as a stdio subprocess — no running docker service required.
-    # scrape_page is a one-shot tool: create tab → navigate → snapshot → close.
-    browser_mcp = MCPServerStdio(
-        "python", args=["mcp_servers/browser_server.py"], env=os.environ.copy()
-    )
-    scraper_agent = Agent(
-        "openai:gpt-4o-mini",
-        name="browser_scraper",
-        toolsets=[browser_mcp],
-        system_prompt="Use the scrape_page tool to retrieve all visible text from the given URL. Return the raw text.",
-    )
+async def _scrape_url_and_add_to_caddy(url: str, pipeline_run_id: str | None = None):
+    api_token = os.environ.get("CC_API_TOKEN", "")
 
-    with logfire.span("browser.scrape_job", url=url):
+    # Factory creates the browser_scraper with its MCP toolset from the registry
+    scraper_model = get_model("browser_scraper")
+    scraper_agent = get_agent("browser_scraper")
+
+    with logfire.span("browser.scrape_job", url=url, pipeline_run_id=pipeline_run_id):
         scrape_result = await scraper_agent.run(
             f"Scrape this URL and return all visible text: {url}",
             usage_limits=UsageLimits(request_limit=5),
+        )
+
+    if api_token:
+        await report_usage(
+            api_token=api_token,
+            agent_name="browser_scraper",
+            model_name=get_model_name(scraper_model),
+            usage=scrape_result.usage(),
+            trigger="pipeline",
+            pipeline_run_id=pipeline_run_id,
         )
 
     raw_text = str(scrape_result.output or "")
     logger.info(f"Browser scrape output length: {len(raw_text)}")
 
     # Parse raw text into structured JobPostData via the dedicated extractor agent
-    with logfire.span("browser.parse_job_data", url=url):
-        job_data = await extract_job_from_content(raw_text, url=url)
+    with logfire.span("browser.parse_job_data", url=url, pipeline_run_id=pipeline_run_id):
+        job_data = await extract_job_from_content(
+            raw_text, url=url, api_token=api_token, pipeline_run_id=pipeline_run_id
+        )
 
     logger.info(f"Extracted job data: {job_data.title} at {job_data.company_name}")
 
     # Add to career caddy
-    with logfire.span("caddy.add_job_post", title=job_data.title, company=job_data.company_name, url=url):
-        caddy_result = await add_job_post(job_data)
+    with logfire.span("caddy.add_job_post", title=job_data.title, company=job_data.company_name, url=url, pipeline_run_id=pipeline_run_id):
+        caddy_result = await add_job_post(
+            job_data, api_token=api_token, pipeline_run_id=pipeline_run_id
+        )
     print("\n=== Added Job Post to Career Caddy ===")
     print(f"Title: {job_data.title}")
     print(f"Company: {job_data.company_name}")
@@ -103,18 +111,31 @@ async def main():
     )
     args = parser.parse_args()
 
+    pipeline_run_id = str(uuid.uuid4())
+    api_token = os.environ.get("CC_API_TOKEN", "")
+
     if args.url:
         # Direct URL scraping mode
-        await scrape_url_and_add_to_caddy(args.url)
+        await scrape_url_and_add_to_caddy(args.url, pipeline_run_id=pipeline_run_id)
         return
 
     # Step 1: Find job opportunities in emails using the email_job_agent
     logger.info("Step 1: Searching for job opportunities in emails...")
 
-    with logfire.span("pipeline.find_job_emails"):
+    with logfire.span("pipeline.find_job_emails", pipeline_run_id=pipeline_run_id):
         email_result = await email_job_agent.run(
             "Search for emails tagged 'job_post'. "
             "Extract the job title and URL for each job posting found."
+        )
+
+    if api_token:
+        await report_usage(
+            api_token=api_token,
+            agent_name="email_job_agent",
+            model_name=get_model_name(_pipeline_model),
+            usage=email_result.usage(),
+            trigger="pipeline",
+            pipeline_run_id=pipeline_run_id,
         )
 
     print("\n=== Job Opportunities Found ===")
@@ -131,11 +152,11 @@ async def main():
 
     # Step 2: Scrape and submit all jobs concurrently
     async def _process(job: JobOpportunity):
-        with logfire.span("pipeline.process_job", title=job.title, url=job.url):
+        with logfire.span("pipeline.process_job", title=job.title, url=job.url, pipeline_run_id=pipeline_run_id):
             logger.info(f"Processing: {job.title}")
-            return await scrape_url_and_add_to_caddy(job.url)
+            return await scrape_url_and_add_to_caddy(job.url, pipeline_run_id=pipeline_run_id)
 
-    with logfire.span("pipeline.scrape_and_submit_all", job_count=len(jobs)):
+    with logfire.span("pipeline.scrape_and_submit_all", job_count=len(jobs), pipeline_run_id=pipeline_run_id):
         results = await asyncio.gather(*[_process(job) for job in jobs], return_exceptions=True)
 
     for job, result in zip(jobs, results):

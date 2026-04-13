@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 import json
+import os
 import subprocess
 import asyncio
 import logfire
 from datetime import datetime, timedelta
-from pydantic_ai import Agent
-from pydantic_ai.mcp import MCPServerStdio
-from lib.history import sanitize_orphaned_tool_calls, truncate_message_history
+from lib.usage_reporter import report_usage
+from agents.agent_factory import get_model, get_model_name, get_agent, register_defaults
 
 logfire.configure(service_name="email_classifier_agent")
 logfire.instrument_pydantic_ai()
-
-# Email server MCP connection
-email_server = MCPServerStdio("python", args=["mcp_servers/email_server.py"])
 
 SYSTEM_PROMPT = """You are an email classifier. You will be given a single email ID.
 
@@ -24,12 +21,12 @@ Your job:
 
 Reply with one line: "job_post" or "not_job_post", followed by the email subject."""
 
-email_agent = Agent(
-    "openai:gpt-4o-mini",
-    name="email_classifier_agent",
-    toolsets=[email_server],
+register_defaults()
+_classifier_model = get_model("email_classifier")
+
+email_agent = get_agent(
+    "email_classifier",
     system_prompt=SYSTEM_PROMPT,
-    history_processors=[truncate_message_history, sanitize_orphaned_tool_calls],
 )
 
 
@@ -64,6 +61,17 @@ def fetch_unevaluated_email_ids(limit: int = 20, days_back: int = 7) -> list[str
 async def classify_email(email_id: str) -> str:
     """Run a fresh isolated agent call for a single email."""
     result = await email_agent.run(f"Classify email id: {email_id}")
+
+    api_token = os.environ.get("CC_API_TOKEN", "")
+    if api_token:
+        await report_usage(
+            api_token=api_token,
+            agent_name="email_classifier",
+            model_name=get_model_name(_classifier_model),
+            usage=result.usage(),
+            trigger="classify",
+        )
+
     return result.output
 
 

@@ -5,12 +5,11 @@ import logging
 import json
 from typing import Optional
 from lib.models.job_models import JobPostData
-from agents.ollama_agent import global_model
+from agents.agent_factory import get_model, get_model_name, get_agent, register_defaults
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent, RunContext
 from pydantic_ai.usage import UsageLimits
-from lib.history import sanitize_orphaned_tool_calls, truncate_message_history
-from lib.toolsets import CareerCaddyToolset, CareerCaddyDeps
+from lib.toolsets import CareerCaddyDeps
+from lib.usage_reporter import report_usage
 import asyncio
 
 
@@ -183,14 +182,12 @@ _CAREER_CADDY_SYSTEM_PROMPT = """
     """
 
 # Module-level agent for web UI / single-conversation use
-career_caddy_agent = Agent(
-    model=global_model,
-    name="career_caddy_agent",
-    deps_type=CareerCaddyDeps,
+register_defaults()
+_caddy_model = get_model("caddy")
+career_caddy_agent = get_agent(
+    "caddy",
     output_type=CareerCaddyResponse,
-    toolsets=[CareerCaddyToolset(scope="career_caddy")],
     system_prompt=_CAREER_CADDY_SYSTEM_PROMPT,
-    history_processors=[truncate_message_history, sanitize_orphaned_tool_calls],
 )
 
 
@@ -221,7 +218,7 @@ async def parse_and_add_job(job_content: str, url: Optional[str] = None, scrape_
     return await add_job_post(job_data)
 
 
-async def add_job_post(job_data: JobPostData) -> dict:
+async def add_job_post(job_data: JobPostData, api_token: str | None = None, pipeline_run_id: str | None = None) -> dict:
     """Add a job post to the career caddy system.
 
     This function takes validated JobPostData and uses the career_caddy_agent
@@ -271,17 +268,26 @@ async def add_job_post(job_data: JobPostData) -> dict:
     """
 
     try:
-        # In-process toolset — no subprocess spawning
-        agent = Agent(
-            "openai:gpt-4o-mini",
-            name="career_caddy_agent",
-            deps_type=CareerCaddyDeps,
+        register_defaults()
+        model = get_model("caddy")
+        agent = get_agent(
+            "caddy",
             output_type=CareerCaddyResponse,
-            toolsets=[CareerCaddyToolset(scope="career_caddy")],
             system_prompt=_CAREER_CADDY_SYSTEM_PROMPT,
         )
-        deps = CareerCaddyDeps(api_token=os.environ["CC_API_TOKEN"])
+        token = api_token or os.environ["CC_API_TOKEN"]
+        deps = CareerCaddyDeps(api_token=token)
         result = await agent.run(prompt, deps=deps, usage_limits=UsageLimits(request_limit=20))
+
+        await report_usage(
+            api_token=token,
+            agent_name="career_caddy_agent",
+            model_name=get_model_name(model),
+            usage=result.usage(),
+            trigger="pipeline",
+            pipeline_run_id=pipeline_run_id,
+        )
+
         response: CareerCaddyResponse = result.output
         return {
             "success": response.action_taken != "error",
