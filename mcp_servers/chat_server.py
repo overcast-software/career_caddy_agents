@@ -64,7 +64,12 @@ current information rather than guessing.
 Important rules:
 - Always call find_job_post_by_link before creating a job post to avoid duplicates
 - Use create_job_post_with_company_check (not create_job_post) to handle companies
+- NEVER use placeholder names like "unknown", "N/A", or "TBD" as a company name.
+  Infer the company from: (1) the recruiter's company, (2) the email sender domain,
+  (3) the job posting URL domain. If none work, ask the user
 - If a tool returns {{"success": false}}, report the error and stop — do not retry
+- Use get_resumes to count or list resumes — do not infer resume counts from career
+  data, which may only include favorites
 
 ## Frontend URLs — CRITICAL
 ALWAYS provide frontend links when referencing resources. NEVER give API paths
@@ -121,6 +126,68 @@ link to it as [scrape](/scrapes/44). NEVER link to external job URLs as the
 If a tool returns id=244 for a job post, your response must contain
 [job post](/job-posts/244) — not "/api/v1/job-posts/244", not "job post #244".
 
+CRITICAL: ALWAYS use markdown link syntax: [text](/path). NEVER output raw HTML
+anchor tags like <a href="...">. Raw HTML links produce malformed URLs (e.g.
+https://resumes/31 instead of /resumes/31) and break SPA navigation.
+
+## Navigation — IMPORTANT
+When the user says "take me to", "go to", "navigate to", "open", or "show me"
+a page, they want to be NAVIGATED there — NOT shown the data. Do NOT call tools
+to fetch the resource. Instead, respond with a short confirmation and include a
+hidden HTML comment that triggers navigation:
+
+<!-- navigate:/resumes -->
+
+The frontend detects this marker and navigates the user's browser automatically.
+
+Navigation targets (use these, not resource IDs, for list pages):
+- "my resumes"       → <!-- navigate:/resumes -->
+- "my job posts"     → <!-- navigate:/job-posts -->
+- "my applications"  → <!-- navigate:/job-applications -->
+- "my companies"     → <!-- navigate:/companies -->
+- "my scores"        → <!-- navigate:/scores -->
+- "career data"      → <!-- navigate:/career-data -->
+- "settings"         → <!-- navigate:/settings -->
+
+For a specific resource, use the ID:
+- "show me job post 42" → <!-- navigate:/job-posts/42 -->
+
+Always include a visible markdown link too so the user sees where they're going.
+Example response: "Taking you to your [resumes](/resumes) now! <!-- navigate:/resumes -->"
+
+Only fetch data when the user asks a QUESTION about the data (e.g. "how many
+resumes do I have?", "what jobs have I applied to?"). If they just want to GO
+somewhere, navigate — do not dump data.
+
+## Action Buttons (Elicitation)
+When you complete an action that has a natural follow-up, offer the user quick
+action buttons by including a JSON block at the END of your response (after all
+text). Use this exact format — the frontend will render it as clickable buttons:
+
+```json
+{{"elicitation": true, "actions": [{{"label": "Button text", "message": "What to send as chat message"}}, ...]}}
+```
+
+Examples of when to offer buttons:
+- After creating a job post: offer to score it or create an application
+- After scoring: offer to view the score details
+- When the user has no resumes: offer to navigate to the create form
+- After finding a job post: offer to view it, score it, or apply
+
+Rules:
+- Maximum 3 actions per elicitation
+- Each action's "message" should be a natural user message that you can act on
+- Only offer actions that make sense in context — do not add buttons to every response
+- The "label" should be short (2-5 words)
+
+## Onboarding Help
+When the user sends a greeting or asks "what can you do?", check the Current Page
+context (if available). If they are on a resource list page (resumes, job-posts,
+companies, etc.), use the corresponding tool to check if they have any data.
+If the list is empty, proactively suggest creating their first item with a link
+to the create form (e.g., "You don't have any resumes yet — [create one](/resumes/new)!").
+This makes the experience feel guided rather than empty.
+
 ## User Profile
 The following profile was loaded from the user's account when this session
 started. You KNOW this information — it is not a guess. Always address the
@@ -174,11 +241,23 @@ async def _fetch_user_profile(api_key: str) -> str:
 register_defaults()
 
 
-def _build_agent(user_profile: str):
+def _build_agent(user_profile: str, page_context: dict | None = None):
     """Build a fresh agent with all career caddy tools."""
+    prompt = SYSTEM_PROMPT.format(user_profile=user_profile)
+    if page_context:
+        route = page_context.get("route", "unknown")
+        url = page_context.get("url", "")
+        prompt += (
+            f"\n\n## Current Page\n"
+            f"The user is currently viewing: {route} ({url})\n"
+            f"Use this context to understand what they're looking at. If they say "
+            f'"this job post" or "these resumes", they mean the resource on their '
+            f"current page. If they ask about what's on screen, use the appropriate "
+            f"tool to fetch data for the resource ID in the URL."
+        )
     return get_agent(
         "chat",
-        system_prompt=SYSTEM_PROMPT.format(user_profile=user_profile),
+        system_prompt=prompt,
     )
 
 
@@ -216,6 +295,7 @@ async def chat(request: Request):
     token = body.get("token", "").strip()
     history = body.get("history", [])
     conversation_id = body.get("conversation_id", str(uuid.uuid4()))
+    page_context = body.get("page_context")
 
     if not message:
         return JSONResponse({"error": "message is required"}, status_code=400)
@@ -224,7 +304,7 @@ async def chat(request: Request):
 
     async def event_stream():
         user_profile = await _fetch_user_profile(token)
-        agent = _build_agent(user_profile)
+        agent = _build_agent(user_profile, page_context=page_context)
         deps = CareerCaddyDeps(api_token=token, base_url=API_BASE_URL)
 
         # Build message history for context

@@ -259,6 +259,21 @@ async def create_job_post_with_company_check(
             indent=2,
         )
 
+    _PLACEHOLDER_NAMES = {"unknown", "n/a", "na", "none", "tbd", "not specified", ""}
+    if company_name.strip().lower() in _PLACEHOLDER_NAMES:
+        return json.dumps(
+            APIResponse(
+                success=False,
+                error=(
+                    f"'{company_name}' is not an acceptable company name. "
+                    "Infer the company from: (1) the recruiter's company, "
+                    "(2) the email sender domain, (3) the job posting URL domain. "
+                    "If you cannot determine the company, ask the user."
+                ),
+            ).model_dump(),
+            indent=2,
+        )
+
     try:
         # Check for duplicate by URL
         if job_url:
@@ -553,6 +568,30 @@ async def update_job_application(
 async def get_career_data(api: ApiClient) -> str:
     """Fetch the user's personal career profile."""
     return await api.get("/api/v1/career-data/")
+
+
+async def get_resumes(
+    api: ApiClient,
+    id: Optional[int] = None,
+    favorite: Optional[bool] = None,
+    page: Optional[int] = None,
+    per_page: Optional[int] = None,
+) -> str:
+    """Fetch resumes. Pass id for a single resume; omit for a paginated list.
+
+    Use this tool to count or list ALL resumes — do not infer resume counts
+    from career data, which may only include favorites.
+    """
+    if id is not None:
+        return await api.get(f"/api/v1/resumes/{id}/")
+    params = {}
+    if favorite is not None:
+        params["favorite"] = str(favorite).lower()
+    if page is not None:
+        params["page"] = page
+    if per_page is not None:
+        params["per_page"] = per_page
+    return await api.get("/api/v1/resumes/", params=params)
 
 
 # ---------------------------------------------------------------------------

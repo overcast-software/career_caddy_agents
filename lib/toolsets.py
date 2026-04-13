@@ -56,6 +56,8 @@ TOOL_REGISTRY: dict[str, Any] = {
     "update_job_application": api_tools.update_job_application,
     # Career data
     "get_career_data": api_tools.get_career_data,
+    # Resumes
+    "get_resumes": api_tools.get_resumes,
     # Scrapes
     "create_scrape": api_tools.create_scrape,
     "get_scrapes": api_tools.get_scrapes,
@@ -79,6 +81,7 @@ SCOPES: dict[str, set[str]] = {
         "create_job_application", "get_job_applications",
         "get_applications_for_job_post", "update_job_application",
         "get_career_data",
+        "get_resumes",
     },
     "job_discovery": {
         "find_company_by_name", "search_companies", "get_companies",
