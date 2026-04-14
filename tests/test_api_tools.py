@@ -18,7 +18,7 @@ class TestApiClient:
     def test_init(self):
         client = ApiClient("http://localhost:8000", "jh_test")
         assert client.base_url == "http://localhost:8000"
-        assert client._headers == {"Authorization": "Bearer jh_test"}
+        assert client._headers == {"Authorization": "Bearer jh_test", "X-Forwarded-Proto": "https"}
 
     def test_ok_success(self):
         client = ApiClient("http://test:8000", "jh_x")
