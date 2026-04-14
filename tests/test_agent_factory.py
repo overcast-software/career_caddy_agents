@@ -104,9 +104,12 @@ class TestGetModel:
         result = get_model("nonexistent_role")
         assert result == "openai:gpt-4o-mini"
 
-    def test_pipeline_and_browser_share_env_var(self):
+    def test_pipeline_and_browser_have_separate_env_vars(self):
         with patch.dict(os.environ, {"PIPELINE_MODEL": "openai:gpt-4o"}, clear=True):
             assert get_model("pipeline") == "openai:gpt-4o"
+            assert get_model("browser_scraper") == "openai:gpt-4o-mini"
+        with patch.dict(os.environ, {"BROWSER_SCRAPER_MODEL": "openai:gpt-4o"}, clear=True):
+            assert get_model("pipeline") == "openai:gpt-4o-mini"
             assert get_model("browser_scraper") == "openai:gpt-4o"
 
 
