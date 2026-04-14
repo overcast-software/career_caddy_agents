@@ -637,8 +637,9 @@ async def get_scrapes(
     sort: Optional[str] = None,
     page: Optional[int] = None,
     per_page: Optional[int] = None,
+    status: Optional[str] = None,
 ) -> str:
-    """Fetch scrape records. Pass id for a single scrape; omit for a paginated list. Use sort='-id' for most recent first, per_page=1 for just the latest."""
+    """Fetch scrape records. Pass id for a single scrape; omit for a paginated list. Use sort='-id' for most recent first, per_page=1 for just the latest. Filter by status with status='hold'."""
     if id is not None:
         return await api.get(f"/api/v1/scrapes/{id}/")
     params = {}
@@ -648,6 +649,8 @@ async def get_scrapes(
         params["page"] = page
     if per_page is not None:
         params["per_page"] = per_page
+    if status is not None:
+        params["filter[status]"] = status
     return await api.get("/api/v1/scrapes/", params=params)
 
 

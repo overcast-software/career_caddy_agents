@@ -134,9 +134,26 @@ Domain lookup normalizes subdomains automatically (`www.linkedin.com` → `linke
 
 ## LLM Configuration
 
-`agents/ollama_agent.py` defines `global_model` (used by `career_caddy_agent.py`). To use a local Ollama model instead of OpenAI, change the model string in `ollama_agent.py` (e.g., `"ollama:phi3"`).
+Per-agent model overrides are controlled via environment variables in `agents/agent_factory.py:get_model()`.
 
-The pipeline (`job_email_to_caddy.py`) uses `openai:gpt-4o-mini` directly and is independent of `ollama_agent.py`.
+Resolution order: role-specific env var → `CADDY_DEFAULT_MODEL` → hardcoded `openai:gpt-4o-mini`.
+
+| Env Var | Agent Role | Recommended |
+|---------|------------|-------------|
+| `CADDY_MODEL` | career_caddy_agent (CRUD) | gpt-4o-mini |
+| `CHAT_MODEL` | chat_server (user-facing) | claude-haiku-4-5 |
+| `EMAIL_CLASSIFIER_MODEL` | email_classifier | gpt-4o-mini |
+| `JOB_EXTRACTOR_MODEL` | job_extractor | claude-haiku-4-5 |
+| `PIPELINE_MODEL` | pipeline (email search) | gpt-4o-mini |
+| `BROWSER_SCRAPER_MODEL` | browser scraper | gpt-4o-mini |
+| `CADDY_DEFAULT_MODEL` | fallback for all roles | gpt-4o-mini |
+
+Example — use Haiku for job extraction:
+```bash
+JOB_EXTRACTOR_MODEL=anthropic:claude-haiku-4-5-20251001
+```
+
+The hold poller (`scripts/hold_poller.py`) skips the browser_scraper LLM entirely — it calls `scrape_page()` directly as a Python function, then hands content to the job extractor.
 
 ## No Formal Test Framework
 

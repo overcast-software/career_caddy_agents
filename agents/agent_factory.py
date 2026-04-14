@@ -189,12 +189,13 @@ _DEFAULT_MODEL = "openai:gpt-4o-mini"
 # ---------------------------------------------------------------------------
 # Per-agent model overrides via environment variables.
 # Set any of these to switch an individual agent's model:
-#   CADDY_MODEL           — career_caddy_agent (main agent + add_job_post)
-#   CHAT_MODEL            — chat_server (already read there, re-exported here)
+#   CADDY_MODEL            — career_caddy_agent (main agent + add_job_post)
+#   CHAT_MODEL             — chat_server (already read there, re-exported here)
 #   EMAIL_CLASSIFIER_MODEL — email_classifier_agent
-#   JOB_EXTRACTOR_MODEL   — job_extractor_agent
-#   PIPELINE_MODEL        — pipeline agents (email search, browser scraper)
-#   CADDY_DEFAULT_MODEL   — fallback for all agents not individually overridden
+#   JOB_EXTRACTOR_MODEL    — job_extractor_agent
+#   PIPELINE_MODEL         — pipeline agents (email search)
+#   BROWSER_SCRAPER_MODEL  — browser scraper agent
+#   CADDY_DEFAULT_MODEL    — fallback for all agents not individually overridden
 # ---------------------------------------------------------------------------
 
 def get_model(role: str | None = None) -> str:
@@ -208,7 +209,7 @@ def get_model(role: str | None = None) -> str:
         "email_classifier": "EMAIL_CLASSIFIER_MODEL",
         "job_extractor": "JOB_EXTRACTOR_MODEL",
         "pipeline": "PIPELINE_MODEL",
-        "browser_scraper": "PIPELINE_MODEL",
+        "browser_scraper": "BROWSER_SCRAPER_MODEL",
     }
     if role and role in role_env_map:
         val = os.environ.get(role_env_map[role])

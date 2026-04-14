@@ -34,10 +34,6 @@ logfire.configure(
     console=False,
 )
 
-# Create screenshots directory if it doesn't exist
-SCREENSHOTS_DIR = Path("screenshots")
-SCREENSHOTS_DIR.mkdir(exist_ok=True)
-
 # Load credentials
 try:
     credentials = Credentials.load_credentials()

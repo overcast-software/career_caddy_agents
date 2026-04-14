@@ -55,6 +55,35 @@ logging.getLogger("fastmcp").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+from datetime import datetime
+from pathlib import Path
+
+SCREENSHOT_DIR = Path(os.environ.get("SCREENSHOT_DIR", "screenshots"))
+SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+LOGIN_WALL_SIGNALS = [
+    "sign in", "log in", "login", "create an account",
+    "forgot password", "enter your email", "join now",
+]
+
+
+def _is_headless() -> bool:
+    return os.environ.get("BROWSER_HEADLESS", "true").lower() not in ("false", "0", "no")
+
+
+def _detect_login_wall(content: str) -> bool:
+    stripped = content.strip().lower()
+    word_count = len(stripped.split())
+    return (
+        word_count < 200
+        and sum(1 for s in LOGIN_WALL_SIGNALS if s in stripped) >= 2
+    )
+
+
+# ---------------------------------------------------------------------------
 # Credentials
 # ---------------------------------------------------------------------------
 
@@ -142,9 +171,10 @@ async def _ensure_context() -> BrowserContext:
     if _context is not None and _browser is not None and _browser.is_connected():
         return _context
 
-    logger.info("Starting camoufox browser")
+    headless = _is_headless()
+    logger.info("Starting camoufox browser (headless=%s)", headless)
     try:
-        _camoufox = AsyncCamoufox(headless=True)
+        _camoufox = AsyncCamoufox(headless=headless)
         _browser = await _camoufox.__aenter__()
     except CamoufoxNotInstalled:
         logging.critical("Camoufox browser binary not found. Run: python -m camoufox fetch")
@@ -595,12 +625,33 @@ async def close_tab(tab_id: str) -> str:
 
 
 @server.tool()
+async def screenshot(tab_id: str, full_page: bool = False) -> str:
+    """Save a PNG screenshot of the current page, return the file path.
+
+    Args:
+        tab_id: Tab ID from create_tab.
+        full_page: If True, capture the full scrollable page. Default: viewport only.
+    """
+    tab_id = _resolve_tab_id(tab_id)
+    page = _tabs.get(tab_id)
+    if page is None:
+        return json.dumps({"error": f"Unknown tab_id: {tab_id}"})
+
+    domain = _domain_from_url(page.url)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = SCREENSHOT_DIR / f"{domain}_{ts}.png"
+    await page.screenshot(path=str(path), full_page=full_page)
+    return json.dumps({"path": str(path), "domain": domain})
+
+
+@server.tool()
 async def scrape_page(url: str) -> str:
     """Navigate to a URL and return all visible text in one call.
 
-    Runs in a temporary headless browser (closed when done) so it leaves no
-    visible window. Automatically injects Firefox session cookies for the
-    URL's domain so that pages requiring login are handled transparently.
+    Uses BROWSER_HEADLESS env var (default true). Automatically injects
+    saved session cookies for the URL's domain. Detects login walls and
+    returns an error instead of garbage content. Captures a screenshot
+    on every scrape (saved to SCREENSHOT_DIR).
 
     Args:
         url: Full URL including protocol.
@@ -610,7 +661,6 @@ async def scrape_page(url: str) -> str:
     norm_domain = Credentials.normalize_domain(raw_domain) if raw_domain else ""
     cookies: list[dict] = []
     if raw_domain:
-        # Prefer saved session cookies; fall back to Firefox profile cookies
         saved = session_store.load(norm_domain) if norm_domain else None
         if saved:
             cookies = saved
@@ -623,23 +673,22 @@ async def scrape_page(url: str) -> str:
             except Exception as e:
                 logfire.warn(f"could not load Firefox cookies for {raw_domain}: {e}")
 
+    headless = _is_headless()
     try:
-        async with AsyncCamoufox(headless=True) as headless_browser:
-            ctx = await headless_browser.new_context()
+        async with AsyncCamoufox(headless=headless) as browser:
+            ctx = await browser.new_context()
             if cookies:
                 await ctx.add_cookies(cookies)
             page = await ctx.new_page()
             try:
                 with logfire.span("browser.scrape_page", url=url):
-                    logfire.info("loading page")
+                    logfire.info("loading page (headless=%s)", headless)
                     await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                     await asyncio.sleep(1)
                     try:
                         await page.wait_for_load_state("networkidle", timeout=15_000)
                     except Exception:
                         pass
-                    # SPA data fetches may still be in-flight after networkidle.
-                    # Poll until the body has real content (up to ~6 extra seconds).
                     content = ""
                     for _ in range(3):
                         content = await page.inner_text("body")
@@ -649,11 +698,40 @@ async def scrape_page(url: str) -> str:
                         logfire.info("page still loading, waiting...")
                         await asyncio.sleep(2)
                     logfire.info("finished loading")
+
+                    # Capture screenshot
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    screenshot_name = f"{norm_domain or 'unknown'}_{ts}.png"
+                    screenshot_path = SCREENSHOT_DIR / screenshot_name
+                    try:
+                        await page.screenshot(path=str(screenshot_path), full_page=False)
+                        logfire.info(f"screenshot saved: {screenshot_path}")
+                    except Exception as e:
+                        logfire.warn(f"screenshot failed: {e}")
+                        screenshot_name = None
+
+                    # Detect login walls
+                    if _detect_login_wall(content):
+                        word_count = len(content.strip().split())
+                        return json.dumps({
+                            "title": await page.title(),
+                            "url": page.url,
+                            "content": "",
+                            "error": "login_wall_detected",
+                            "message": (
+                                f"Page appears to be a login wall ({word_count} words, "
+                                "login signals found). Use ensure_authenticated or "
+                                "manual_login.py to seed session cookies for this domain."
+                            ),
+                            "screenshot": screenshot_name,
+                        })
+
                 return json.dumps(
                     {
                         "title": await page.title(),
                         "url": page.url,
                         "content": content,
+                        "screenshot": screenshot_name,
                     }
                 )
             except Exception as e:
