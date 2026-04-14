@@ -15,11 +15,12 @@ import asyncio
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logfire.configure(
-    service_name="career_caddy_agent",
-    scrubbing=False,
-)
-logfire.instrument_pydantic_ai()
+if os.environ.get("LOGFIRE_TOKEN"):
+    logfire.configure(
+        service_name="career_caddy_agent",
+        scrubbing=False,
+    )
+    logfire.instrument_pydantic_ai()
 
 
 class CareerCaddyResponse(BaseModel):

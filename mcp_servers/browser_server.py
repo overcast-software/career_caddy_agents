@@ -682,7 +682,7 @@ async def scrape_page(url: str) -> str:
             page = await ctx.new_page()
             try:
                 with logfire.span("browser.scrape_page", url=url):
-                    logfire.info("loading page (headless=%s)", headless)
+                    logfire.info(f"loading page (headless={headless})")
                     await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                     await asyncio.sleep(1)
                     try:

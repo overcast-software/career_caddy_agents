@@ -144,9 +144,7 @@ async def main():
         logger.error("CC_API_BASE_URL and CC_API_TOKEN are required")
         sys.exit(1)
 
-    # Use Api-Key auth for the poller (not JWT Bearer)
     api = ApiClient(base_url=base_url, token=token)
-    api._headers["Authorization"] = f"Api-Key {token}"
 
     running = True
 
