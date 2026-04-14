@@ -611,9 +611,12 @@ async def create_scrape(
     url: str,
     job_post_id: Optional[int] = None,
     company_id: Optional[int] = None,
+    status: Optional[str] = None,
 ) -> str:
-    """Create a scrape record with status='hold' for later processing."""
-    attributes = {"url": url, "status": "hold"}
+    """Create a scrape record. Omit status (or pass 'pending') to start scraping immediately; pass 'hold' to queue for later."""
+    attributes = {"url": url}
+    if status:
+        attributes["status"] = status
     relationships = {}
     if job_post_id is not None:
         relationships["job-post"] = {

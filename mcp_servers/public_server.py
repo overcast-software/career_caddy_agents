@@ -365,7 +365,7 @@ async def create_scrape(
     Use this to queue a URL for scraping by a separate process. The scrape is
     NOT dispatched immediately — it sits in 'hold' status until picked up.
     """
-    return await api_tools.create_scrape(_api(), url, job_post_id, company_id)
+    return await api_tools.create_scrape(_api(), url, job_post_id, company_id, status="hold")
 
 
 @server.tool()
