@@ -690,6 +690,80 @@ async def update_scrape(
     return await api.patch(f"/api/v1/scrapes/{scrape_id}/", payload)
 
 
+async def get_questions(
+    api: ApiClient,
+    id: Optional[int] = None,
+    company_id: Optional[int] = None,
+    job_post_id: Optional[int] = None,
+    page: Optional[int] = None,
+    per_page: Optional[int] = None,
+) -> str:
+    """Fetch interview questions. Pass id for a single question; omit for a paginated list. Filter by company_id or job_post_id."""
+    if id is not None:
+        return await api.get(f"/api/v1/questions/{id}/")
+    params = {}
+    if company_id is not None:
+        params["filter[company_id]"] = company_id
+    if job_post_id is not None:
+        params["filter[job_post_id]"] = job_post_id
+    if page is not None:
+        params["page"] = page
+    if per_page is not None:
+        params["per_page"] = per_page
+    return await api.get("/api/v1/questions/", params=params)
+
+
+async def get_answers(
+    api: ApiClient,
+    id: Optional[int] = None,
+    question_id: Optional[int] = None,
+    favorite: Optional[bool] = None,
+    page: Optional[int] = None,
+    per_page: Optional[int] = None,
+) -> str:
+    """Fetch answers to interview questions. Pass id for a single answer; omit for a paginated list. Filter by question_id or favorite status."""
+    if id is not None:
+        return await api.get(f"/api/v1/answers/{id}/")
+    params = {}
+    if question_id is not None:
+        params["filter[question_id]"] = question_id
+    if favorite is not None:
+        params["favorite"] = str(favorite).lower()
+    if page is not None:
+        params["page"] = page
+    if per_page is not None:
+        params["per_page"] = per_page
+    return await api.get("/api/v1/answers/", params=params)
+
+
+async def create_answer(
+    api: ApiClient,
+    question_id: int,
+    content: str,
+    ai_assist: bool = False,
+    prompt: Optional[str] = None,
+) -> str:
+    """Create an answer for an interview question. Set ai_assist=true to let the backend AI generate the content (content can be empty in that case). Optionally pass a prompt to guide AI generation."""
+    attributes: dict = {}
+    if content:
+        attributes["content"] = content
+    if ai_assist:
+        attributes["ai_assist"] = True
+    if prompt:
+        attributes["prompt"] = prompt
+
+    payload = {
+        "data": {
+            "type": "answer",
+            "attributes": attributes,
+            "relationships": {
+                "question": {"data": {"type": "question", "id": str(question_id)}}
+            },
+        }
+    }
+    return await api.post("/api/v1/answers/", payload)
+
+
 async def score_job_post(api: ApiClient, job_post_id: int) -> str:
     """Score a job post against the user's career data."""
     payload = {
