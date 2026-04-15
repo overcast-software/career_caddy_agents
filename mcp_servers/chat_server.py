@@ -262,7 +262,7 @@ under a question), you know which question they're looking at. If they ask you t
 4. After creating the answer, offer a button to navigate to it using the elicitation
    pattern (NOT a raw link). Example:
    ```json
-   {"elicitation": true, "actions": [{"label": "View answer", "message": "Navigate to the answer"}]}
+   {{"elicitation": true, "actions": [{{"label": "View answer", "message": "Navigate to the answer"}}]}}
    ```
    And include the navigate marker: <!-- navigate:/questions/{{question_id}}/answers/{{answer_id}} -->
    NEVER output raw API URLs (like https://...) — always use frontend paths (/questions/ID/answers/ID).
