@@ -51,11 +51,12 @@ async def _fetch_profile(api: ApiClient, hostname: str) -> dict | None:
     if not hostname:
         return None
     raw = await get_scrape_profile(api, hostname)
-    data = json.loads(raw)
-    profiles = data.get("data", [])
+    wrapper = json.loads(raw)
+    body = wrapper.get("data") or {}
+    profiles = body.get("data", [])
     if not profiles:
         return None
-    p = profiles[0]
+    p = profiles[0] if isinstance(profiles, list) else profiles
     return {
         "id": int(p["id"]),
         "css_selectors": (p.get("attributes") or {}).get("css-selectors") or {},
