@@ -8,22 +8,23 @@ Usage:
     python scripts/manual_login.py monster.com dice.com   # opens each domain
 """
 
+import argparse
 import asyncio
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from camoufox.async_api import AsyncCamoufox
 from lib.browser.credentials import Credentials
+from lib.browser.engine import configure as configure_engine, get_engine, launch_browser
 from lib.browser.session_store import SessionStore
 
 
-async def main(domains: list[str]) -> None:
+async def main(domains: list[str], engine: str) -> None:
     session_store = SessionStore()
 
-    print("Starting browser...")
-    async with AsyncCamoufox(headless=False) as browser:
+    print(f"Starting browser (engine={engine})...")
+    async with launch_browser(engine, headless=False) as browser:
         ctx = await browser.new_context()
 
         if domains:
@@ -64,5 +65,14 @@ async def main(domains: list[str]) -> None:
 
 
 if __name__ == "__main__":
-    targets = [Credentials.normalize_domain(d) for d in sys.argv[1:]]
-    asyncio.run(main(targets))
+    parser = argparse.ArgumentParser(description="Manual browser login for session capture")
+    parser.add_argument(
+        "--engine", choices=["camoufox", "chrome"], default=None,
+        help="Browser engine (default: BROWSER_ENGINE env or 'camoufox')",
+    )
+    parser.add_argument("domains", nargs="*", help="Domains to open (e.g. monster.com dice.com)")
+    args = parser.parse_args()
+
+    configure_engine(engine=args.engine)
+    targets = [Credentials.normalize_domain(d) for d in args.domains]
+    asyncio.run(main(targets, get_engine()))

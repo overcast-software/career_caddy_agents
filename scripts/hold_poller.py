@@ -10,6 +10,7 @@ Usage:
     uv run caddy-poller
 """
 
+import argparse
 import asyncio
 import json
 import logging
@@ -22,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib.api_tools import ApiClient, get_scrapes, update_scrape
+from lib.browser.engine import configure as configure_engine
 from mcp_servers.browser_server import scrape_page
 
 logging.basicConfig(
@@ -30,7 +32,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hold_poller")
 
-POLL_INTERVAL = int(os.environ.get("HOLD_POLL_INTERVAL", "30"))
 POLL_INTERVAL = int(os.environ.get("HOLD_POLL_INTERVAL", "30"))
 
 
@@ -119,7 +120,21 @@ async def poll_once(api: ApiClient) -> int:
     return processed
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Poll for hold scrapes and process them")
+    parser.add_argument(
+        "--engine", choices=["camoufox", "chrome"], default=None,
+        help="Browser engine (default: BROWSER_ENGINE env or 'camoufox')",
+    )
+    parser.add_argument("--headless", action="store_true", default=None, help="Run headless")
+    parser.add_argument("--headed", dest="headless", action="store_false", help="Run headed")
+    return parser.parse_args()
+
+
 async def main():
+    args = _parse_args()
+    configure_engine(engine=args.engine, headless=args.headless)
+
     base_url = os.environ.get("CC_API_BASE_URL")
     token = os.environ.get("CC_API_TOKEN")
 
@@ -139,11 +154,13 @@ async def main():
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
+    from lib.browser.engine import get_engine, get_headless
     logger.info(
-        "Hold poller started (interval=%ds, api=%s, headless=%s)",
+        "Hold poller started (interval=%ds, api=%s, engine=%s, headless=%s)",
         POLL_INTERVAL,
         base_url,
-        os.environ.get("BROWSER_HEADLESS", "true"),
+        get_engine(),
+        get_headless(),
     )
 
     while running:

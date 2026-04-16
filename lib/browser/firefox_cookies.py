@@ -1,9 +1,13 @@
 """
 Read session cookies from a local Firefox profile and convert them to
-Playwright's add_cookies() format for use with Camoufox.
+Playwright's add_cookies() format. Output works with any Playwright-based
+engine (Camoufox or Chromium).
 
 Firefox stores cookies in an SQLite database (cookies.sqlite).  The file is
 locked while Firefox is running, so we copy it to a temp file first.
+
+Requires Firefox to be installed on the host. On systems without Firefox
+(e.g. Raspberry Pi), use manual_login.py to seed sessions instead.
 
 Usage:
     from lib.browser.firefox_cookies import load_cookies_for_domain

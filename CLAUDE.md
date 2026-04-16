@@ -18,6 +18,8 @@ Dependencies are managed via `pyproject.toml` with `uv`. Environment variables c
 | `FASTMCP_HOST` | No | MCP server bind host (default: `0.0.0.0`) |
 | `FASTMCP_PORT` | No | MCP server port (default: `3002`) |
 | `CAMOUFOX_DATA_DIR` | No | Where camoufox stores its browser binary |
+| `BROWSER_ENGINE` | No | `camoufox` (default) or `chrome` (Playwright Chromium + stealth) |
+| `BROWSER_HEADLESS` | No | `true` (default) or `false` — also settable via `--headless`/`--headed` CLI flags |
 | `LOGFIRE_TOKEN` | No | Observability / tracing |
 | `OLLAMA_API_BASE` | No | Local Ollama endpoint (default: `http://127.0.0.1:11434`) |
 
@@ -26,8 +28,10 @@ Dependencies are managed via `pyproject.toml` with `uv`. Environment variables c
 pip install uv
 uv sync
 
-# 2. Download the Camoufox Firefox binary (one-time, ~200MB)
-python -m camoufox fetch
+# 2. Download browser binary (one-time)
+python -m camoufox fetch          # Camoufox/Firefox (~200MB, default engine)
+# OR for ARM/Raspberry Pi:
+uv run caddy-fetch-chromium       # Playwright Chromium (ARM-compatible)
 
 # 3. Configure environment
 cp .envrc.example .envrc    # Required: CC_API_TOKEN, OPENAI_API_KEY
@@ -50,6 +54,28 @@ curl -X POST http://localhost:8000/api/v1/api-keys/ \
   -d '{"name":"ai-agent"}'
 # Copy the "key" field from the response → CC_API_TOKEN
 ```
+
+## Browser Engine
+
+Two engines are available — select via `--engine` CLI flag or `BROWSER_ENGINE` env var:
+
+| Engine | Binary | Anti-fingerprint | ARM/Pi |
+|--------|--------|------------------|--------|
+| `camoufox` (default) | Firefox fork | C++-level patches | No |
+| `chrome` | Playwright Chromium | `playwright-stealth` CDP patches | Yes |
+
+```bash
+# Browser MCP server
+python mcp_servers/browser_server.py --engine chrome --headless
+
+# Hold poller (Raspberry Pi)
+uv run caddy-poller --engine chrome --headless
+
+# Manual login (always headed)
+python scripts/manual_login.py --engine chrome linkedin.com
+```
+
+Sessions (`~/.career_caddy/sessions/`) are stored in Playwright's universal cookie format and are portable across engines. A session saved with Camoufox works with Chromium and vice versa.
 
 ## Running the Pipeline
 

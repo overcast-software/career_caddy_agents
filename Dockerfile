@@ -4,6 +4,8 @@ FROM python:3.13-slim AS base
 # Set to "true" to install the Camoufox Firefox binary (~700 MB).
 # Required by the browser-mcp service; not needed for the pipeline-only image.
 ARG INSTALL_CAMOUFOX=false
+# Set to "true" to install Playwright Chromium (alternative engine, works on ARM).
+ARG INSTALL_CHROMIUM=false
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -57,6 +59,9 @@ RUN uv sync --frozen --no-dev --no-install-project
 # Download Camoufox Firefox binary — only when INSTALL_CAMOUFOX=true
 # Placed here (before COPY . /app) so it is only invalidated by lockfile changes
 RUN if [ "$INSTALL_CAMOUFOX" = "true" ]; then uv run python -m camoufox fetch; fi
+
+# Download Playwright Chromium — only when INSTALL_CHROMIUM=true (ARM-compatible)
+RUN if [ "$INSTALL_CHROMIUM" = "true" ]; then uv run playwright install chromium --with-deps; fi
 
 # Copy source and finish install
 COPY . /app

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Browser MCP server backed by the camoufox Python package (local Firefox,
-anti-fingerprint). No NPM subprocess, no cloud API key required.
+Browser MCP server with pluggable engine: Camoufox (Firefox, anti-fingerprint)
+or Playwright Chromium + stealth patches (ARM-compatible).
+
+Engine selection: --engine camoufox|chrome (or BROWSER_ENGINE env var).
 
 Maintains a single persistent browser instance and a tab registry.
-Session cookies are persisted to disk (~/.career_caddy/sessions/) so that
-authenticated state survives server restarts.
+Session cookies are persisted to disk (~/.career_caddy/sessions/) in
+Playwright's universal format — sessions are portable across engines.
 
 Tools:
     create_tab              — open a new tab, return tab_id
@@ -38,9 +40,15 @@ try:
 except ImportError:
     _logfire_available = False
 
-from camoufox.async_api import AsyncCamoufox
-from camoufox.exceptions import CamoufoxNotInstalled
 from playwright.async_api import Browser, BrowserContext, Page
+
+from lib.browser.engine import (
+    BrowserEngineError,
+    configure as configure_engine,
+    get_engine,
+    get_headless,
+    launch_browser,
+)
 from fastmcp import FastMCP
 
 from lib.browser.credentials import Credentials
@@ -73,7 +81,7 @@ LOGIN_WALL_SIGNALS = [
 
 
 def _is_headless() -> bool:
-    return os.environ.get("BROWSER_HEADLESS", "true").lower() not in ("false", "0", "no")
+    return get_headless()
 
 
 def _detect_login_wall(content: str) -> bool:
@@ -162,39 +170,40 @@ async def _save_session(ctx: BrowserContext, domain: str) -> int:
 # Persistent browser session — lazy init, auto-recover on crash
 # ---------------------------------------------------------------------------
 
-_camoufox: Optional[AsyncCamoufox] = None
+_engine_cm = None  # async context manager from launch_browser
 _browser: Optional[Browser] = None
 _context: Optional[BrowserContext] = None
 _tabs: dict[str, Page] = {}
 
 
 async def _ensure_context() -> BrowserContext:
-    global _camoufox, _browser, _context
+    global _engine_cm, _browser, _context
     if _context is not None and _browser is not None and _browser.is_connected():
         return _context
 
+    engine = get_engine()
     headless = _is_headless()
-    logger.info("Starting camoufox browser (headless=%s)", headless)
+    logger.info("Starting %s browser (headless=%s)", engine, headless)
     try:
-        _camoufox = AsyncCamoufox(headless=headless)
-        _browser = await _camoufox.__aenter__()
-    except CamoufoxNotInstalled:
-        logging.critical("Camoufox browser binary not found. Run: python -m camoufox fetch")
+        _engine_cm = launch_browser(engine, headless)
+        _browser = await _engine_cm.__aenter__()
+    except BrowserEngineError as exc:
+        logging.critical(str(exc))
         raise SystemExit(1)
     _context = await _browser.new_context()
     return _context
 
 
 async def _shutdown() -> None:
-    global _camoufox, _browser, _context
+    global _engine_cm, _browser, _context
     if _context:
         await _context.close()
         _context = None
-    if _camoufox:
-        await _camoufox.__aexit__(None, None, None)
-        _camoufox = None
+    if _engine_cm:
+        await _engine_cm.__aexit__(None, None, None)
+        _engine_cm = None
         _browser = None
-    logger.info("Camoufox browser stopped")
+    logger.info("Browser stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +480,13 @@ async def get_form_fields(tab_id: str) -> str:
 @server.tool()
 async def inject_firefox_cookies(domain: str) -> str:
     """Load cookies from the local Firefox profile and inject them into the
-    shared browser context so Camoufox reuses an existing Firefox session.
+    browser context. Works with any engine (Camoufox or Chromium) — the
+    cookies are converted to Playwright's universal format.
+
+    Requires Firefox to be installed on the host (reads cookies.sqlite).
+    On systems without Firefox (e.g. Raspberry Pi), use manual_login.py
+    to seed sessions instead — those are saved to ~/.career_caddy/sessions/
+    and auto-injected on navigation regardless of engine.
 
     Call this before navigate/navigate_and_snapshot to skip login entirely.
 
@@ -676,15 +691,16 @@ async def scrape_page(url: str) -> str:
                 logfire.warn(f"could not load Firefox cookies for {raw_domain}: {e}")
 
     headless = _is_headless()
+    engine = get_engine()
     try:
-        async with AsyncCamoufox(headless=headless) as browser:
+        async with launch_browser(engine, headless) as browser:
             ctx = await browser.new_context()
             if cookies:
                 await ctx.add_cookies(cookies)
             page = await ctx.new_page()
             try:
                 with logfire.span("browser.scrape_page", url=url):
-                    logfire.info(f"loading page (headless={headless})")
+                    logfire.info(f"loading page (engine={engine}, headless={headless})")
                     await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
                     await asyncio.sleep(1)
                     try:
@@ -738,11 +754,21 @@ async def scrape_page(url: str) -> str:
                 )
             except Exception as e:
                 return json.dumps({"error": str(e)})
-    except CamoufoxNotInstalled:
-        return json.dumps({
-            "error": "Camoufox browser binary not found. Run: python -m camoufox fetch"
-        })
+    except BrowserEngineError as exc:
+        return json.dumps({"error": str(exc)})
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Browser MCP server")
+    parser.add_argument(
+        "--engine", choices=["camoufox", "chrome"], default=None,
+        help="Browser engine (default: BROWSER_ENGINE env or 'camoufox')",
+    )
+    parser.add_argument("--headless", action="store_true", default=None, help="Run headless")
+    parser.add_argument("--headed", dest="headless", action="store_false", help="Run headed")
+    args = parser.parse_args()
+
+    configure_engine(engine=args.engine, headless=args.headless)
     server.run(transport="sse", host="0.0.0.0", port=3004)
