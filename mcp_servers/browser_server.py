@@ -93,6 +93,88 @@ def _detect_login_wall(content: str) -> bool:
     )
 
 
+async def _check_profile_selectors(page, css_selectors: dict) -> dict:
+    """Check which profile selectors match the current page.
+
+    Returns {"authenticated": bool, "blocked": bool, "job_data_matched": [field_names]}.
+    """
+    results = {"authenticated": False, "blocked": False, "job_data_matched": []}
+
+    for name, sel in css_selectors.get("authenticated", {}).items():
+        try:
+            if await page.query_selector(sel):
+                results["authenticated"] = True
+                break
+        except Exception:
+            pass
+
+    for name, sel in css_selectors.get("blocked", {}).items():
+        try:
+            if await page.query_selector(sel):
+                results["blocked"] = True
+                break
+        except Exception:
+            pass
+
+    for name, sel in css_selectors.get("job_data", {}).items():
+        try:
+            if await page.query_selector(sel):
+                results["job_data_matched"].append(name)
+        except Exception:
+            pass
+
+    return results
+
+
+# Common job page selectors to probe when no profile selectors exist.
+_JOB_SELECTOR_CANDIDATES = {
+    "title": [
+        "h1.job-title", "h1.posting-headline", "h1[data-testid*='title']",
+        ".top-card-layout__title", ".jobsearch-JobInfoHeader-title",
+        "h1.job-details-jobs-unified-top-card__job-title",
+        "[data-automation='job-detail-title']", "h1",
+    ],
+    "company_name": [
+        ".company-name", ".topcard__org-name-link",
+        "[data-testid*='company']", "[data-automation='advertiser-name']",
+        ".jobsearch-InlineCompanyRating a", ".job-details-jobs-unified-top-card__company-name",
+    ],
+    "description": [
+        ".job-description", ".jobsearch-JobComponent-description",
+        "[data-testid*='description']", "[data-automation='jobAdDetails']",
+        ".jobs-description-content", "#job-details",
+    ],
+    "location": [
+        ".job-location", ".topcard__flavor--bullet",
+        "[data-testid*='location']", "[data-automation='job-detail-location']",
+        ".jobsearch-JobInfoHeader-subtitle div",
+        ".job-details-jobs-unified-top-card__bullet",
+    ],
+    "salary": [
+        ".salary-range", ".salaryText", "[data-testid*='salary']",
+        "[data-automation='job-detail-salary']",
+        ".jobsearch-JobMetadataHeader-item",
+    ],
+}
+
+
+async def _discover_job_selectors(page) -> dict:
+    """Probe live DOM for common job page patterns. Returns {field: selector} for matches."""
+    discovered = {}
+    for field, candidates in _JOB_SELECTOR_CANDIDATES.items():
+        for sel in candidates:
+            try:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if text and len(text) > 1:
+                        discovered[field] = sel
+                        break
+            except Exception:
+                pass
+    return discovered
+
+
 # ---------------------------------------------------------------------------
 # Credentials
 # ---------------------------------------------------------------------------
@@ -662,7 +744,7 @@ async def screenshot(tab_id: str, full_page: bool = False) -> str:
 
 
 @server.tool()
-async def scrape_page(url: str) -> str:
+async def scrape_page(url: str, profile: dict | None = None) -> str:
     """Navigate to a URL and return all visible text in one call.
 
     Uses BROWSER_HEADLESS env var (default true). Automatically injects
@@ -670,8 +752,12 @@ async def scrape_page(url: str) -> str:
     returns an error instead of garbage content. Captures a screenshot
     on every scrape (saved to SCREENSHOT_DIR).
 
+    If a scrape profile dict is provided (with css_selectors), uses known
+    selectors for page-state detection and discovers new job_data selectors.
+
     Args:
         url: Full URL including protocol.
+        profile: Optional scrape profile dict with css_selectors.
     """
     from urllib.parse import urlparse
     raw_domain = urlparse(url).hostname or ""
@@ -689,6 +775,8 @@ async def scrape_page(url: str) -> str:
                     logfire.info(f"loaded {len(cookies)} Firefox cookies for {raw_domain}")
             except Exception as e:
                 logfire.warn(f"could not load Firefox cookies for {raw_domain}: {e}")
+
+    css_selectors = (profile or {}).get("css_selectors") or {}
 
     headless = _is_headless()
     engine = get_engine()
@@ -728,10 +816,28 @@ async def scrape_page(url: str) -> str:
                         logfire.warn(f"screenshot failed: {e}")
                         screenshot_name = None
 
-                    # Detect login walls
-                    if _detect_login_wall(content):
+                    # Profile-aware page-state detection
+                    selector_results = None
+                    if css_selectors:
+                        selector_results = await _check_profile_selectors(page, css_selectors)
+                        logfire.info(f"selector check: {selector_results}")
+
+                        if selector_results["blocked"]:
+                            return json.dumps({
+                                "title": await page.title(),
+                                "url": page.url,
+                                "content": "",
+                                "error": "blocked_page_detected",
+                                "message": "Page matched a known blocked-page selector.",
+                                "screenshot": screenshot_name,
+                                "selector_results": selector_results,
+                            })
+
+                    # Detect login walls — skip if profile confirms authenticated
+                    is_authenticated = selector_results["authenticated"] if selector_results else False
+                    if not is_authenticated and _detect_login_wall(content):
                         word_count = len(content.strip().split())
-                        return json.dumps({
+                        result = {
                             "title": await page.title(),
                             "url": page.url,
                             "content": "",
@@ -742,16 +848,30 @@ async def scrape_page(url: str) -> str:
                                 "manual_login.py to seed session cookies for this domain."
                             ),
                             "screenshot": screenshot_name,
-                        })
+                        }
+                        if selector_results:
+                            result["selector_results"] = selector_results
+                        return json.dumps(result)
 
-                return json.dumps(
-                    {
+                    # Discover job selectors if profile has none
+                    discovered_selectors = {}
+                    if not css_selectors.get("job_data"):
+                        discovered_selectors = await _discover_job_selectors(page)
+                        if discovered_selectors:
+                            logfire.info(f"discovered job selectors: {discovered_selectors}")
+
+                    result = {
                         "title": await page.title(),
                         "url": page.url,
                         "content": content,
                         "screenshot": screenshot_name,
                     }
-                )
+                    if selector_results:
+                        result["selector_results"] = selector_results
+                    if discovered_selectors:
+                        result["discovered_selectors"] = discovered_selectors
+
+                return json.dumps(result)
             except Exception as e:
                 return json.dumps({"error": str(e)})
     except BrowserEngineError as exc:

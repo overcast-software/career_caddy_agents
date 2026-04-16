@@ -712,6 +712,26 @@ async def upload_screenshot(api: ApiClient, scrape_id: int, file_path: Path) -> 
     )
 
 
+async def get_scrape_profile(api: ApiClient, hostname: str) -> str:
+    """Fetch the scrape profile for a hostname. Returns profile data or empty."""
+    return await api.get("/api/v1/scrape-profiles/", params={"filter[hostname]": hostname})
+
+
+async def update_scrape_profile(api: ApiClient, profile_id: int, **attrs) -> str:
+    """Update a scrape profile's editable fields (css_selectors, extraction_hints, etc.)."""
+    json_attrs = {}
+    for key, value in attrs.items():
+        json_attrs[key.replace("_", "-")] = value
+    payload = {
+        "data": {
+            "type": "scrape-profile",
+            "id": str(profile_id),
+            "attributes": json_attrs,
+        }
+    }
+    return await api.patch(f"/api/v1/scrape-profiles/{profile_id}/", payload)
+
+
 async def get_questions(
     api: ApiClient,
     id: Optional[int] = None,

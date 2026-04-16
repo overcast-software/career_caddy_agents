@@ -22,7 +22,10 @@ from pathlib import Path
 # Ensure the ai/ root is on sys.path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lib.api_tools import ApiClient, get_scrapes, update_scrape, upload_screenshot
+from lib.api_tools import (
+    ApiClient, get_scrapes, get_scrape_profile, update_scrape,
+    update_scrape_profile, upload_screenshot,
+)
 from lib.browser.engine import configure as configure_engine
 from mcp_servers.browser_server import scrape_page
 
@@ -33,6 +36,30 @@ logging.basicConfig(
 logger = logging.getLogger("hold_poller")
 
 POLL_INTERVAL = int(os.environ.get("HOLD_POLL_INTERVAL", "30"))
+
+
+def _parse_hostname(url: str) -> str:
+    """Extract and normalize hostname from a URL."""
+    from urllib.parse import urlparse
+    from lib.browser.credentials import Credentials
+    raw = urlparse(url).hostname or ""
+    return Credentials.normalize_domain(raw) if raw else ""
+
+
+async def _fetch_profile(api: ApiClient, hostname: str) -> dict | None:
+    """Fetch the scrape profile for a hostname. Returns parsed profile dict or None."""
+    if not hostname:
+        return None
+    raw = await get_scrape_profile(api, hostname)
+    data = json.loads(raw)
+    profiles = data.get("data", [])
+    if not profiles:
+        return None
+    p = profiles[0]
+    return {
+        "id": int(p["id"]),
+        "css_selectors": (p.get("attributes") or {}).get("css-selectors") or {},
+    }
 
 
 async def process_scrape(api: ApiClient, scrape: dict) -> bool:
@@ -48,13 +75,27 @@ async def process_scrape(api: ApiClient, scrape: dict) -> bool:
 
     logger.info("Processing scrape %s: %s", scrape_id, url)
 
+    # Fetch scrape profile for this domain
+    hostname = _parse_hostname(url)
+    profile = await _fetch_profile(api, hostname)
+    if profile:
+        logger.info("Scrape %s: loaded profile id=%s for %s", scrape_id, profile["id"], hostname)
+    else:
+        logger.info("Scrape %s: no profile for %s", scrape_id, hostname)
+
     # Mark as running
     await update_scrape(api, scrape_id, status="running", note="Poller picked up")
 
     try:
-        # Direct scrape — no LLM, just browser
-        result_json = await scrape_page(url)
+        # Direct scrape — no LLM, just browser (profile-aware)
+        result_json = await scrape_page(url, profile=profile)
         result = json.loads(result_json)
+
+        if result.get("error") == "blocked_page_detected":
+            msg = result.get("message", "Blocked page detected")
+            logger.warning("Scrape %s: %s", scrape_id, msg)
+            await update_scrape(api, scrape_id, status="failed", note=msg)
+            return False
 
         if result.get("error") == "login_wall_detected":
             msg = result.get("message", "Login wall detected")
@@ -88,12 +129,49 @@ async def process_scrape(api: ApiClient, scrape: dict) -> bool:
                             note=f"Content delivered ({len(content)} chars)")
         logger.info("Scrape %s: content delivered (%d chars), API will extract", scrape_id, len(content))
 
+        # Write discovered selectors back to profile
+        await _update_profile_from_results(api, profile, result)
+
         return True
 
     except Exception as exc:
         logger.exception("Scrape %s failed", scrape_id)
         await update_scrape(api, scrape_id, status="failed", note=str(exc)[:200])
         return False
+
+
+async def _update_profile_from_results(api: ApiClient, profile: dict | None, result: dict):
+    """Update the scrape profile with selector findings from the browser."""
+    selector_results = result.get("selector_results")
+    discovered = result.get("discovered_selectors")
+
+    if not profile:
+        return
+
+    profile_id = profile["id"]
+    existing = profile.get("css_selectors") or {}
+    updated = dict(existing)
+    changed = False
+
+    # Write newly discovered job_data selectors
+    if discovered and not existing.get("job_data"):
+        updated["job_data"] = discovered
+        changed = True
+        logger.info("Profile %s: writing discovered job_data selectors: %s", profile_id, list(discovered.keys()))
+
+    # Log warnings if existing selectors failed
+    if selector_results and existing.get("job_data") and not selector_results.get("job_data_matched"):
+        logger.warning(
+            "Profile %s: existing job_data selectors matched nothing — site may have changed layout",
+            profile_id,
+        )
+
+    if changed:
+        try:
+            await update_scrape_profile(api, profile_id, css_selectors=updated)
+            logger.info("Profile %s: updated css_selectors", profile_id)
+        except Exception:
+            logger.debug("Failed to update profile %s", profile_id, exc_info=True)
 
 
 async def poll_once(api: ApiClient) -> int:
