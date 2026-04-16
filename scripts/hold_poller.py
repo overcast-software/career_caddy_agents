@@ -22,7 +22,7 @@ from pathlib import Path
 # Ensure the ai/ root is on sys.path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lib.api_tools import ApiClient, get_scrapes, update_scrape
+from lib.api_tools import ApiClient, get_scrapes, update_scrape, upload_screenshot
 from lib.browser.engine import configure as configure_engine
 from mcp_servers.browser_server import scrape_page
 
@@ -43,56 +43,56 @@ async def process_scrape(api: ApiClient, scrape: dict) -> bool:
 
     if not url:
         logger.warning("Scrape %s has no URL, skipping", scrape_id)
-        await update_scrape(api, scrape_id, status="failed")
+        await update_scrape(api, scrape_id, status="failed", note="No URL provided")
         return False
 
     logger.info("Processing scrape %s: %s", scrape_id, url)
 
     # Mark as running
-    await update_scrape(api, scrape_id, status="running")
+    await update_scrape(api, scrape_id, status="running", note="Poller picked up")
 
     try:
-        # Direct scrape — no LLM, just Camoufox
+        # Direct scrape — no LLM, just browser
         result_json = await scrape_page(url)
         result = json.loads(result_json)
 
         if result.get("error") == "login_wall_detected":
             msg = result.get("message", "Login wall detected")
             logger.warning("Scrape %s: %s", scrape_id, msg)
-            await update_scrape(api, scrape_id, status="failed")
+            await update_scrape(api, scrape_id, status="failed", note=msg)
             return False
 
         if result.get("error"):
             logger.error("Scrape %s error: %s", scrape_id, result["error"])
-            await update_scrape(api, scrape_id, status="failed")
+            await update_scrape(api, scrape_id, status="failed", note=result["error"])
             return False
 
         content = result.get("content", "")
         if not content.strip():
             logger.warning("Scrape %s: empty content", scrape_id)
-            await update_scrape(api, scrape_id, status="failed")
+            await update_scrape(api, scrape_id, status="failed", note="Empty content returned")
             return False
 
-        # Rename screenshot to include scrape_id
+        # Upload screenshot to API
         screenshot_name = result.get("screenshot")
         if screenshot_name:
             from mcp_servers.browser_server import SCREENSHOT_DIR
-            old_path = SCREENSHOT_DIR / screenshot_name
-            new_name = f"scrape_{scrape_id}_{screenshot_name}"
-            new_path = SCREENSHOT_DIR / new_name
-            if old_path.exists():
-                old_path.rename(new_path)
-                logger.info("Screenshot: %s", new_path)
+            screenshot_path = SCREENSHOT_DIR / screenshot_name
+            if screenshot_path.exists():
+                await upload_screenshot(api, scrape_id, screenshot_path)
+                screenshot_path.unlink()
+                logger.info("Screenshot uploaded for scrape %s", scrape_id)
 
         # Push content back — the API handles extraction + profile update
-        await update_scrape(api, scrape_id, status="completed", job_content=content)
+        await update_scrape(api, scrape_id, status="completed", job_content=content,
+                            note=f"Content delivered ({len(content)} chars)")
         logger.info("Scrape %s: content delivered (%d chars), API will extract", scrape_id, len(content))
 
         return True
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Scrape %s failed", scrape_id)
-        await update_scrape(api, scrape_id, status="failed")
+        await update_scrape(api, scrape_id, status="failed", note=str(exc)[:200])
         return False
 
 

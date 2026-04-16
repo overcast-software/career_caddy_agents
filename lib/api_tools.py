@@ -7,6 +7,7 @@ with a base_url and a token — the caller decides where the token comes from.
 """
 
 import json
+from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import urljoin
 
@@ -145,6 +146,17 @@ class ApiClient:
                 headers=self._headers,
                 json=payload,
             )
+            return self._ok(resp)
+
+    async def post_file(self, path: str, file_path: Path, field: str = "file") -> str:
+        """POST a file as multipart/form-data."""
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout) as client:
+            with open(file_path, "rb") as f:
+                resp = await client.post(
+                    urljoin(self.base_url, path),
+                    headers={"Authorization": self._headers["Authorization"]},
+                    files={field: (file_path.name, f, "image/png")},
+                )
             return self._ok(resp)
 
 
@@ -664,6 +676,7 @@ async def update_scrape(
     status: Optional[str] = None,
     job_content: Optional[str] = None,
     url: Optional[str] = None,
+    note: Optional[str] = None,
 ) -> str:
     """Update a scrape record's status, content, or URL."""
     attributes = {}
@@ -673,6 +686,8 @@ async def update_scrape(
         attributes["job_content"] = job_content
     if url is not None:
         attributes["url"] = url
+    if note is not None:
+        attributes["note"] = note
 
     if not attributes:
         return json.dumps(
@@ -688,6 +703,13 @@ async def update_scrape(
         }
     }
     return await api.patch(f"/api/v1/scrapes/{scrape_id}/", payload)
+
+
+async def upload_screenshot(api: ApiClient, scrape_id: int, file_path: Path) -> str:
+    """Upload a screenshot PNG to the API for a scrape."""
+    return await api.post_file(
+        f"/api/v1/scrapes/{scrape_id}/screenshots/", file_path
+    )
 
 
 async def get_questions(
