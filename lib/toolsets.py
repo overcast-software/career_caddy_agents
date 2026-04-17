@@ -70,6 +70,8 @@ TOOL_REGISTRY: dict[str, Any] = {
     # Scores
     "score_job_post": api_tools.score_job_post,
     "get_scores": api_tools.get_scores,
+    # Composite
+    "scrape_and_score": api_tools.scrape_and_score,
 }
 
 
@@ -99,6 +101,7 @@ SCOPES: dict[str, set[str]] = {
     },
     "scoring": {
         "get_job_posts", "get_career_data", "score_job_post", "get_scores",
+        "scrape_and_score",
     },
     "application_tracking": {
         "create_job_application", "get_job_applications",

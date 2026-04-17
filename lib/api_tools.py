@@ -6,7 +6,10 @@ Both career_caddy_server.py (local, CC_API_TOKEN) and public_server.py
 with a base_url and a token — the caller decides where the token comes from.
 """
 
+import asyncio
 import json
+import os
+import time
 from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import urljoin
@@ -863,3 +866,178 @@ async def get_scores(
     if per_page is not None:
         params["per_page"] = per_page
     return await api.get("/api/v1/scores/", params=params)
+
+
+# ---------------------------------------------------------------------------
+# Composite tool: scrape_and_score
+# ---------------------------------------------------------------------------
+
+
+_SCRAPE_TERMINAL = {"completed", "failed"}
+
+
+async def _raw_get_scrape(api: ApiClient, scrape_id: int) -> dict:
+    """GET a scrape and return the raw JSON:API body (relationships intact)."""
+    async with httpx.AsyncClient(follow_redirects=True, timeout=api.timeout) as client:
+        resp = await client.get(
+            urljoin(api.base_url, f"/api/v1/scrapes/{scrape_id}/"),
+            headers=api._headers,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _err(message: str, **data) -> str:
+    return json.dumps(
+        APIResponse(success=False, error=message, data=data or None).model_dump(),
+        indent=2,
+    )
+
+
+def _ok(message: str, **data) -> str:
+    payload = {"message": message, **data}
+    return json.dumps(
+        APIResponse(success=True, data=payload, status_code=200).model_dump(),
+        indent=2,
+    )
+
+
+async def scrape_and_score(
+    api: ApiClient,
+    url: str,
+    resume_id: Optional[int] = None,
+    poll_interval: float = 3.0,
+    timeout: float = 60.0,
+) -> str:
+    """Scrape a URL into Career Caddy, wait for completion, then score the resulting
+    job post. Returns a message with the frontend URL to view scores.
+
+    Flow: POST scrape (pending) → poll until completed/failed → POST score →
+    return /job-posts/:id/scores link. Falls back to status=hold if scraping
+    is disabled (501); in that case the hold-poller must be running.
+    """
+    # 1. Create scrape (try pending first)
+    create_resp = json.loads(await create_scrape(api, url))
+    hold_fallback = False
+    if not create_resp.get("success"):
+        if create_resp.get("status_code") == 501:
+            hold_fallback = True
+            create_resp = json.loads(await create_scrape(api, url, status="hold"))
+            if not create_resp.get("success"):
+                return _err(f"Failed to create scrape (hold fallback): {create_resp.get('error')}")
+        else:
+            return _err(f"Failed to create scrape: {create_resp.get('error')}")
+
+    scrape_data = create_resp.get("data", {}).get("data", {})
+    scrape_id = scrape_data.get("id")
+    if scrape_id is None:
+        return _err("Scrape created but no id returned", response=create_resp)
+    scrape_id = int(scrape_id)
+
+    # 2. Poll for terminal status
+    deadline = time.monotonic() + timeout
+    scrape_body: dict = {}
+    last_status: Optional[str] = None
+    while True:
+        try:
+            scrape_body = await _raw_get_scrape(api, scrape_id)
+        except httpx.HTTPError as exc:
+            return _err(f"Error polling scrape {scrape_id}: {exc}", scrape_id=scrape_id)
+
+        attrs = scrape_body.get("data", {}).get("attributes", {}) or {}
+        last_status = attrs.get("status")
+        if last_status in _SCRAPE_TERMINAL:
+            break
+        if time.monotonic() >= deadline:
+            return _err(
+                f"Timed out after {timeout:.0f}s waiting for scrape {scrape_id}; "
+                f"last status={last_status}.",
+                scrape_id=scrape_id,
+                last_status=last_status,
+                hold_fallback=hold_fallback,
+            )
+        await asyncio.sleep(poll_interval)
+
+    if last_status == "failed":
+        return _err(
+            f"Scrape {scrape_id} failed.",
+            scrape_id=scrape_id,
+            last_status=last_status,
+        )
+
+    # 3. Resolve job_post_id from relationships (may trail status flip briefly)
+    def _extract_job_post_id(body: dict) -> Optional[int]:
+        rels = body.get("data", {}).get("relationships", {}) or {}
+        jp = (rels.get("job-post") or {}).get("data")
+        if jp and jp.get("id"):
+            return int(jp["id"])
+        return None
+
+    job_post_id = _extract_job_post_id(scrape_body)
+    link_deadline = time.monotonic() + 15.0
+    while job_post_id is None and time.monotonic() < link_deadline:
+        await asyncio.sleep(poll_interval)
+        try:
+            scrape_body = await _raw_get_scrape(api, scrape_id)
+        except httpx.HTTPError:
+            break
+        job_post_id = _extract_job_post_id(scrape_body)
+
+    if job_post_id is None:
+        return _err(
+            f"Scrape {scrape_id} completed but no job-post was linked yet. "
+            "Try the 'parse' action on the scrape to extract the job post.",
+            scrape_id=scrape_id,
+        )
+
+    # 4. Create the score
+    if resume_id is not None:
+        payload = {
+            "data": {
+                "type": "score",
+                "attributes": {},
+                "relationships": {
+                    "job-post": {"data": {"type": "job-post", "id": str(job_post_id)}},
+                    "resume": {"data": {"type": "resume", "id": str(resume_id)}},
+                },
+            }
+        }
+        score_resp = json.loads(await api.post("/api/v1/scores/", payload))
+    else:
+        score_resp = json.loads(await score_job_post(api, job_post_id))
+
+    if not score_resp.get("success"):
+        return _err(
+            f"Scrape completed but score creation failed: {score_resp.get('error')}",
+            scrape_id=scrape_id,
+            job_post_id=job_post_id,
+        )
+
+    score_data = score_resp.get("data", {}).get("data", {})
+    score_id = int(score_data["id"]) if score_data.get("id") else None
+    score_status = (score_data.get("attributes") or {}).get("status")
+
+    # 5. Build frontend URL + return
+    frontend_base = os.environ.get("CC_FRONTEND_URL", "http://localhost:4200").rstrip("/")
+    scores_url = f"{frontend_base}/job-posts/{job_post_id}/scores"
+
+    message_parts = [
+        f"Scrape {scrape_id} completed; scored job post {job_post_id}.",
+        f"Score is {score_status or 'pending'} (will update as the backend finishes).",
+        f"Open {scores_url} to view results.",
+    ]
+    if hold_fallback:
+        message_parts.insert(
+            0,
+            "Note: scraping runs via hold-queue (the hold-poller must be running).",
+        )
+
+    return _ok(
+        " ".join(message_parts),
+        scrape_id=scrape_id,
+        job_post_id=job_post_id,
+        score_id=score_id,
+        score_status=score_status,
+        scores_url=scores_url,
+        hold_fallback=hold_fallback,
+    )
