@@ -1,7 +1,6 @@
 """Tests for lib.toolsets — CareerCaddyToolset scoping, wrappers, and security."""
 
 import inspect
-import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -14,7 +13,6 @@ from lib.toolsets import (
     SCOPES,
     _make_tool_wrapper,
 )
-from lib.api_tools import ApiClient
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 """Tests for lib.api_tools — ApiClient and tool functions."""
 
 import json
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 import httpx

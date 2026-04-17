@@ -2,7 +2,6 @@
 import logfire
 import os
 import logging
-import json
 from typing import Optional
 from lib.models.job_models import JobPostData
 from agents.agent_factory import get_model, get_model_name, get_agent, register_defaults
@@ -10,7 +9,6 @@ from pydantic import BaseModel, Field
 from pydantic_ai.usage import UsageLimits
 from lib.toolsets import CareerCaddyDeps
 from lib.usage_reporter import report_usage
-import asyncio
 
 
 logging.basicConfig(level=logging.INFO)

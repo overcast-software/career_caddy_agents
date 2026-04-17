@@ -79,18 +79,58 @@ LOGIN_WALL_SIGNALS = [
     "continue to sign in",
 ]
 
+# Single-signal phrases that unambiguously indicate a transient auth/bot-check
+# interstitial. Any one match on a short page is enough to treat the page as
+# unusable rather than letting the extractor hallucinate from near-empty text.
+LOGIN_WALL_STRONG_SIGNALS = [
+    "logging you in", "signing you in", "we're logging",
+    "redirecting", "please wait", "just a moment",
+    "verifying you are human", "checking your browser",
+    "performing security verification", "verifies you are not a bot",
+    "are not a bot", "security service to protect",
+    "ray id:",
+]
+
+# Prefixes / phrases that indicate the page is still loading or bouncing
+# through an interstitial and we should keep waiting rather than return.
+LOADING_PREFIXES = (
+    "loading",
+    "logging you in",
+    "signing you in",
+    "we're logging",
+    "redirecting",
+    "please wait",
+    "just a moment",
+    "performing security verification",
+    "verifying you are human",
+    "checking your browser",
+)
+
 
 def _is_headless() -> bool:
     return get_headless()
 
 
+def _is_still_loading(content: str) -> bool:
+    stripped = content.strip().lower()
+    if not stripped:
+        return True
+    if any(stripped.startswith(p) for p in LOADING_PREFIXES):
+        return True
+    # Short pages containing an interstitial phrase anywhere — still bouncing.
+    if len(stripped.split()) < 40 and any(p in stripped for p in LOADING_PREFIXES):
+        return True
+    return False
+
+
 def _detect_login_wall(content: str) -> bool:
     stripped = content.strip().lower()
     word_count = len(stripped.split())
-    return (
-        word_count < 200
-        and sum(1 for s in LOGIN_WALL_SIGNALS if s in stripped) >= 2
-    )
+    if word_count >= 200:
+        return False
+    if any(s in stripped for s in LOGIN_WALL_STRONG_SIGNALS):
+        return True
+    return sum(1 for s in LOGIN_WALL_SIGNALS if s in stripped) >= 2
 
 
 async def _check_profile_selectors(page, css_selectors: dict) -> dict:
@@ -796,12 +836,11 @@ async def scrape_page(url: str, profile: dict | None = None) -> str:
                     except Exception:
                         pass
                     content = ""
-                    for _ in range(3):
+                    for _ in range(5):
                         content = await page.inner_text("body")
-                        stripped = content.strip().lower()
-                        if stripped and not stripped.startswith("loading"):
+                        if not _is_still_loading(content):
                             break
-                        logfire.info("page still loading, waiting...")
+                        logfire.info("page still loading/redirecting, waiting...")
                         await asyncio.sleep(2)
                     logfire.info("finished loading")
 
