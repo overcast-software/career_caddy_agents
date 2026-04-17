@@ -872,8 +872,21 @@ async def scrape_page(url: str, profile: dict | None = None) -> str:
                                 "selector_results": selector_results,
                             })
 
-                    # Detect login walls — skip if profile confirms authenticated
+                    # Detect login walls — skip if profile confirms authenticated.
+                    # Some sites render the login-wall markup first and swap in real
+                    # content a beat later, so give the page a few more seconds and
+                    # re-read before giving up.
                     is_authenticated = selector_results["authenticated"] if selector_results else False
+                    if not is_authenticated and _detect_login_wall(content):
+                        for attempt in range(3):
+                            logfire.info(
+                                f"login wall signals detected, waiting for late content (attempt {attempt + 1}/3)"
+                            )
+                            await asyncio.sleep(3)
+                            content = await page.inner_text("body")
+                            if not _detect_login_wall(content):
+                                logfire.info("login wall cleared after wait")
+                                break
                     if not is_authenticated and _detect_login_wall(content):
                         word_count = len(content.strip().split())
                         result = {
