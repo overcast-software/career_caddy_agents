@@ -39,6 +39,14 @@ from starlette.routing import Route
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
+from pydantic_ai import (  # noqa: E402
+    Agent,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    PartDeltaEvent,
+    PartStartEvent,
+    TextPartDelta,
+)
 from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart  # noqa: E402
 from lib.toolsets import CareerCaddyDeps  # noqa: E402
 from lib.usage_reporter import report_usage  # noqa: E402
@@ -77,14 +85,27 @@ the relevant docs page for full details.
 Career Caddy is an AI-first job search manager. Career Data is the foundation —
 all AI features (scores, cover letters, summaries, answers) read from it.
 
-**Recommended workflow**: Build [Career Data](/career-data) → Add
-[job posts](/job-posts) → Generate scores/cover letters → Create applications →
-Answer interview questions.
+**Recommended workflow**: Import/build resumes + draft cover letters + write
+Q&A answers → *favorite* the good ones so Career Data picks them up → Add
+[job posts](/job-posts) → Generate scores/cover letters → Create
+applications → Answer interview questions.
 
-- **[Career Data](/career-data)**: Your professional background — work history, skills, education, writing voice, target roles. Every AI feature reads from this. The richer it is, the better AI output gets. [Full docs](/docs/career-data)
+- **[Career Data](/career-data)**: A READ-ONLY aggregated view — NOT a
+  place the user fills in directly. It is automatically assembled from
+  the user's FAVORITED (starred) resumes, cover letters, and Q&A
+  answers. To "improve Career Data" the user must go to the source
+  resources (/resumes, /cover-letters, /answers) and favorite the
+  items they want Caddy to draw from. NEVER tell a user to "go to
+  Career Data and upload a resume" or "fill in your Career Data" —
+  that's not how it works and it will confuse them. Instead, direct
+  them to /resumes to import or build a resume, then favorite it.
+  [Full docs](/docs/career-data)
 - **[Job Posts](/job-posts)**: Stored job listings. The root resource — scores, cover letters, applications, questions, and scrapes all attach to a job post. Add manually or paste a URL to scrape. [Full docs](/docs/job-posts)
 - **[Companies](/companies)**: Employer profiles. Created automatically with job posts. Groups everything related to one employer in one place. [Full docs](/docs/companies)
-- **[Resumes](/resumes)**: Structured resume data with experiences, education, skills, certifications, and projects. Import a PDF/DOCX or build section by section. Supports multiple versions for different role types. Supplements Career Data for AI generation. [Full docs](/docs/resumes)
+- **[Resumes](/resumes)**: Structured resume data with experiences, education, skills, certifications, and projects. Supports multiple versions for different role types. Feeds Career Data when favorited.
+  - **How to create one — IMPORT is the default path.** Almost nobody wants to build a resume from scratch; it's tedious and error-prone. ALWAYS route users to [/resumes/import](/resumes/import) first (upload DOCX — PDF support is pending). The import extracts experiences/skills/education automatically. They can fine-tune after.
+  - `/resumes/new` (build from scratch) exists but is a last-resort fallback for users with no existing resume file anywhere. If a user lands on `/resumes/new`, gently suggest they switch to [/resumes/import](/resumes/import) if they have any existing resume file.
+  - [Full docs](/docs/resumes)
 - **[Scores](/scores)**: AI fit assessment (0-100) of your profile vs a job posting. Evaluates skill overlap, experience level, industry familiarity. 80-100 = strong match, 60-79 = reasonable, <60 = significant gaps. Includes gap analysis. [Full docs](/docs/scores)
 - **[Cover Letters](/cover-letters)**: AI-generated letters in your writing voice using Career Data + job description. Favorite good ones — they feed back as examples for future generation. [Full docs](/docs/cover-letters)
 - **[Summaries](/summaries)**: 2-4 sentence positioning statements tailored to specific job posts. Use as resume opener, cover letter intro, or LinkedIn About. [Full docs](/docs/summaries)
@@ -92,6 +113,24 @@ Answer interview questions.
 - **[Questions](/questions)**: Interview and application prompts. Create at job post, application, company, or global level. AI drafts answers using your Career Data and the job description. [Full docs](/docs/questions)
 - **[Answers](/answers)**: Responses to questions. AI-drafted, hand-written, or combined. Supports multiple versions per question for A/B testing. Favorite answers feed back into Career Data as writing samples. [Full docs](/docs/answers)
 - **[Scrapes](/scrapes)**: Raw webpage captures of job posting URLs. The AI pipeline can auto-scrape from job alert emails. Parsed into structured job post data. [Full docs](/docs/scrapes)
+
+Linked resume resources are NOT editable via chat:
+- Experiences, educations, certifications, projects, descriptions, and
+  skills live UNDER a resume and are structured records, not free-form
+  fields. Editing them from chat would mean reconciling dates, company
+  links, and ordering — the resume form UI handles that correctly.
+- When the user asks to change something INSIDE a resume ("change my
+  title at Robert Half International", "add a bullet to my AWS
+  experience", "fix the end date on my last job"), DO NOT attempt to
+  use `edit_resume` — that tool only edits the resume's top-level
+  label. Instead, navigate the user to the resume page
+  (`/resumes/{{id}}`) with a `navigate` action button and tell them to
+  edit the experience there.
+- If the user says "change my title" on a resume page, "title" could
+  mean the resume's own label (top-level `title` field) OR a job
+  title inside one of the experiences. ASK WHICH before writing
+  anything. Getting this wrong and silently overwriting the wrong
+  field is much worse than asking.
 
 Important rules:
 - Always call find_job_post_by_link before creating a job post to avoid duplicates
@@ -206,24 +245,50 @@ somewhere, navigate — do not dump data.
 ## Action Buttons (Elicitation)
 When you complete an action that has a natural follow-up, offer the user quick
 action buttons by including a JSON block at the END of your response (after all
-text). Use this exact format — the frontend will render it as clickable buttons:
+text). The frontend will render clickable buttons. Each action takes EXACTLY
+ONE of three shapes — pick the shape that matches what the button should DO:
+
+- `{{"label": "Go there", "navigate": "/path"}}` — transitions the frontend
+  directly. Zero LLM turns. USE THIS for "View resumes", "Open settings",
+  "Take me to career data", "See this score", anything whose natural
+  outcome is "the user is now on page X".
+
+- `{{"label": "Mark favorite", "model": {{"type": "resume", "id": 42, "patch": {{"favorite": true}}}}}}` —
+  saves an Ember Data record directly. Zero LLM turns. USE THIS for
+  "Favorite this resume", "Dismiss guidance" (user.onboarding toggle),
+  "Mark reviewed", "Star this answer". Allowed `type` + `patch` keys:
+    - `resume`: favorite, title, name, notes
+    - `cover-letter`: favorite, status
+    - `answer`: favorite
+    - `job-post`: favorite
+    - `user`: onboarding (only; patch nested keys under onboarding)
+  Any other key is silently dropped by the frontend.
+
+- `{{"label": "Tell me more", "message": "..."}}` — sends a new chat
+  message as the user. COSTS AN LLM TURN. Use this only when a button
+  genuinely needs the agent to think again (follow-up question, new
+  scope). Do NOT use this for navigation or simple state changes — the
+  other two shapes are cheaper and instant.
+
+Full JSON envelope:
 
 ```json
-{{"elicitation": true, "actions": [{{"label": "Button text", "message": "What to send as chat message"}}, ...]}}
+{{"elicitation": true, "actions": [{{"label": "...", "navigate": "/..."}}, ...]}}
 ```
 
-Examples of when to offer buttons:
-- After creating a job post: offer to score it or create an application
-- After scoring: offer to view the score details
-- When the user has no resumes: offer to navigate to the create form
-- After finding a job post: offer to view it, score it, or apply
-- After creating a scrape: offer to view the scrape page (e.g. "View scrape" → navigates to /scrapes/ID)
+Examples:
+- After creating a job post with id 42: `[{{"label": "View job post", "navigate": "/job-posts/42"}}, {{"label": "Score it", "message": "score this job post"}}]`
+- After surfacing a resume:
+  `[{{"label": "Open resume", "navigate": "/resumes/N"}}, {{"label": "Favorite", "model": {{"type": "resume", "id": N, "patch": {{"favorite": true}}}}}}]`
+- User said "stop giving me advice":
+  `[{{"label": "Turn off wizard", "model": {{"type": "user", "id": ME, "patch": {{"onboarding": {{"wizard_enabled": false}}}}}}}}, {{"label": "Take me to settings", "navigate": "/settings/profile/edit"}}]`
 
 Rules:
-- Maximum 3 actions per elicitation
-- Each action's "message" should be a natural user message that you can act on
-- Only offer actions that make sense in context — do not add buttons to every response
-- The "label" should be short (2-5 words)
+- Maximum 3 actions per elicitation.
+- Only offer actions that make sense in context — do NOT add buttons to every response.
+- Label: short (2-5 words), imperative.
+- Prefer `navigate` and `model` over `message`. A button that explains
+  where to go is worse than a button that takes them there.
 
 ## Page-Aware Data Access
 When the user asks about "this page", "what's here", "what do I have", or anything
@@ -392,6 +457,54 @@ Rules for this tool:
   guidance outside the tool. That is the sub-agent's job.
 """
 
+
+
+_PROMISE_RE = re.compile(
+    r"\b("
+    r"i(['’]?\s?)ll\s+(check|look|create|find|fetch|go|see|grab|pull|get|gather|collect|retrieve|prepare)"
+    r"|let me\s+(check|look|see|find|pull|grab|fetch|get|retrieve)"
+    r"|going to\s+(check|create|look|fetch|find|retrieve)"
+    r"|i will\s+(check|create|look|find|fetch|get|retrieve)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Tool-call retry policy: if the agent's text reply says "I'll X" but no
+# tool call landed this turn, we re-prime it once. Cap at ONE retry so we
+# never loop.
+_MAX_FOLLOWUP_RETRIES = 1
+
+_FOLLOWUP_PRIMING = (
+    "You just told the user you'd perform an action (e.g. \"I'll check...\", "
+    "\"I'll create...\", \"Let me look that up\") but did not call any tool. "
+    "Either call the correct tool now to fulfill that promise, or tell the "
+    "user clearly that you can't and why. Do NOT re-announce the intention — "
+    "either ACT or EXPLAIN. Keep the follow-up short."
+)
+
+
+def _response_has_tool_call(messages) -> bool:
+    """True if any ToolCallPart appears in the run's messages."""
+    for msg in messages:
+        for part in getattr(msg, "parts", []):
+            if getattr(part, "tool_name", None) is not None:
+                return True
+    return False
+
+
+def _is_unfulfilled_promise(full_text: str, messages) -> bool:
+    """Pattern match: text sounds like a tool-call promise, but no tool
+    was called this turn. Used to decide whether to auto-retry once.
+
+    False-positive risk is acceptable because the retry prompt is safe
+    (agent may reasonably decide to explain instead of call); false
+    negatives just reproduce today's status quo.
+    """
+    if _response_has_tool_call(messages):
+        return False
+    if not full_text:
+        return False
+    return bool(_PROMISE_RE.search(full_text))
 
 
 _ONBOARDING_LABELS = {
@@ -587,68 +700,205 @@ async def chat(request: Request):
             elif role == "assistant":
                 messages.append(ModelResponse(parts=[TextPart(content=content)]))
 
+        _TOOL_RELOAD_MAP = {
+            "create_answer": "answer",
+            "update_answer": "answer",
+            "create_job_application": "job-application",
+            "update_job_application": "job-application",
+            "create_job_post_with_company_check": "job-post",
+            "update_job_post": "job-post",
+            "create_company": "company",
+            "create_scrape": "scrape",
+            "update_scrape": "scrape",
+            "score_job_post": "score",
+        }
+        reloaded: set[str] = set()
+        full_text = ""
+        total_request_tokens = 0
+        total_response_tokens = 0
+        total_total_tokens = 0
+        total_requests = 0
+        # Full transcript incl. passed-in history — used as `message_history`
+        # when we retry, so the model sees its own promise.
+        last_all_messages = None
+        # Just THIS turn's new messages — used to decide if a tool was
+        # called. Keeps detection unaffected by tool calls from earlier
+        # turns in the passed-in history.
+        last_new_messages: list = []
+
         try:
-            async with agent.run_stream(
-                augmented_message,
-                deps=deps,
-                message_history=messages if messages else None,
-            ) as result:
-                full_text = ""
-                async for chunk in result.stream_text(delta=True):
-                    full_text += chunk
-                    event = json.dumps({"type": "text", "content": chunk})
-                    yield f"data: {event}\n\n"
+            async def _stream_once(prompt, history):
+                """Run one agent turn via agent.iter(), surfacing both text
+                and tool-call events to the frontend.
 
-                usage = result.usage()
+                We switched from run_stream().stream_text() to iter() so the
+                SSE can carry explicit `tool_call_start` / `tool_call_end`
+                events alongside `text` deltas (inspired by pydantic-ai's
+                AG-UI integration). The frontend shows tool activity in a
+                staff-only timeline so the user can see what the agent is
+                actually doing rather than waiting silently while tools fire.
+                """
+                nonlocal full_text, total_request_tokens, total_response_tokens
+                nonlocal total_total_tokens, total_requests
+                nonlocal last_all_messages, last_new_messages
+                # Tool-call-id → tool_name map so we can correlate
+                # FunctionToolResultEvent (which sometimes omits tool_name)
+                # back to the tool that produced it.
+                tool_name_by_id: dict[str, str] = {}
+
+                async with agent.iter(
+                    prompt, deps=deps, message_history=history,
+                ) as run:
+                    async for node in run:
+                        if Agent.is_model_request_node(node):
+                            async with node.stream(run.ctx) as req_stream:
+                                async for event in req_stream:
+                                    if isinstance(event, PartStartEvent):
+                                        # Start-of-part events carry the
+                                        # opening slice of whatever part
+                                        # just began. For TextPart that's
+                                        # the first word(s); skipping it
+                                        # chops the response mid-phrase.
+                                        # For ToolCallPart it's the tool
+                                        # name (we use it for correlation
+                                        # when FunctionToolCallEvent lacks
+                                        # a tool_name).
+                                        part = event.part
+                                        initial = getattr(part, "content", None)
+                                        if isinstance(initial, str) and initial:
+                                            full_text += initial
+                                            yield (
+                                                f"data: {json.dumps({'type': 'text', 'content': initial})}\n\n"
+                                            )
+                                        tool_name = getattr(part, "tool_name", None)
+                                        tool_call_id = getattr(part, "tool_call_id", None)
+                                        if tool_name and tool_call_id:
+                                            tool_name_by_id[tool_call_id] = tool_name
+                                    elif isinstance(event, PartDeltaEvent) and isinstance(
+                                        event.delta, TextPartDelta
+                                    ):
+                                        chunk = event.delta.content_delta
+                                        if chunk:
+                                            full_text += chunk
+                                            yield (
+                                                f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
+                                            )
+                        elif Agent.is_call_tools_node(node):
+                            async with node.stream(run.ctx) as tool_stream:
+                                async for event in tool_stream:
+                                    if isinstance(event, FunctionToolCallEvent):
+                                        part = event.part
+                                        tool_call_id = getattr(part, "tool_call_id", "")
+                                        tool_name = getattr(part, "tool_name", "")
+                                        if tool_call_id and tool_name:
+                                            tool_name_by_id[tool_call_id] = tool_name
+                                        # `part.args` may be a dict or a
+                                        # JSON string depending on the model;
+                                        # normalize to a dict for the client.
+                                        args = getattr(part, "args", None)
+                                        if isinstance(args, str):
+                                            try:
+                                                args = json.loads(args) if args else {}
+                                            except json.JSONDecodeError:
+                                                args = {"_raw": args}
+                                        yield (
+                                            f"data: {json.dumps({'type': 'tool_call_start', 'tool_call_id': tool_call_id, 'tool_name': tool_name, 'args': args})}\n\n"
+                                        )
+                                    elif isinstance(event, FunctionToolResultEvent):
+                                        tool_call_id = getattr(event, "tool_call_id", "")
+                                        tool_name = tool_name_by_id.get(tool_call_id, "")
+                                        result_obj = getattr(event, "result", None)
+                                        content = getattr(result_obj, "content", "") if result_obj else ""
+                                        # Truncate long tool outputs before
+                                        # sending over SSE — staff doesn't need
+                                        # the full payload for feedback.
+                                        if isinstance(content, str) and len(content) > 500:
+                                            content = content[:500] + "... (truncated)"
+                                        yield (
+                                            f"data: {json.dumps({'type': 'tool_call_end', 'tool_call_id': tool_call_id, 'tool_name': tool_name, 'content': content})}\n\n"
+                                        )
+                                        if tool_name in _TOOL_RELOAD_MAP:
+                                            resource = _TOOL_RELOAD_MAP[tool_name]
+                                            if resource not in reloaded:
+                                                reloaded.add(resource)
+                                                yield (
+                                                    f"data: {json.dumps({'type': 'reload', 'resource': resource})}\n\n"
+                                                )
+                    # After the async-for exits, run.result holds the final
+                    # AgentRunResult. Grab usage + messages from it.
+                    final = run.result
+                    if final is None:
+                        return
+                    usage = final.usage()
+                    total_request_tokens += usage.request_tokens or 0
+                    total_response_tokens += usage.response_tokens or 0
+                    total_total_tokens += usage.total_tokens or 0
+                    total_requests += usage.requests or 0
+                    last_all_messages = final.all_messages()
+                    if hasattr(final, "new_messages"):
+                        last_new_messages = final.new_messages()
+                    else:
+                        last_new_messages = last_all_messages
+
+            # First turn.
+            async for event in _stream_once(
+                augmented_message, messages if messages else None
+            ):
+                yield event
+
+            # Follow-up retry when the model emitted an unfulfilled promise
+            # ("I'll check...") without actually calling a tool. Capped at
+            # _MAX_FOLLOWUP_RETRIES so we never loop.
+            retries = 0
+            while (
+                retries < _MAX_FOLLOWUP_RETRIES
+                and _is_unfulfilled_promise(full_text, last_new_messages)
+            ):
+                retries += 1
                 logger.info(
-                    "Chat usage: request_tokens=%s response_tokens=%s total=%s requests=%s",
-                    usage.request_tokens, usage.response_tokens,
-                    usage.total_tokens, usage.requests,
+                    "Detected unfulfilled promise (retry %s/%s); re-priming agent",
+                    retries, _MAX_FOLLOWUP_RETRIES,
                 )
-                # Emit reload events for resources mutated by tool calls
-                _TOOL_RELOAD_MAP = {
-                    "create_answer": "answer",
-                    "update_answer": "answer",
-                    "create_job_application": "job-application",
-                    "update_job_application": "job-application",
-                    "create_job_post_with_company_check": "job-post",
-                    "update_job_post": "job-post",
-                    "create_company": "company",
-                    "create_scrape": "scrape",
-                    "update_scrape": "scrape",
-                    "score_job_post": "score",
-                }
-                reloaded = set()
-                for msg in result.all_messages():
-                    for part in getattr(msg, "parts", []):
-                        tool_name = getattr(part, "tool_name", None)
-                        if tool_name and tool_name in _TOOL_RELOAD_MAP:
-                            resource = _TOOL_RELOAD_MAP[tool_name]
-                            if resource not in reloaded:
-                                reloaded.add(resource)
-                                reload_event = json.dumps({"type": "reload", "resource": resource})
-                                yield f"data: {reload_event}\n\n"
+                async for event in _stream_once(
+                    _FOLLOWUP_PRIMING, last_all_messages
+                ):
+                    yield event
 
-                done_event = json.dumps({
-                    "type": "done",
-                    "content": full_text,
-                    "conversation_id": conversation_id,
-                    "usage": {
-                        "request_tokens": usage.request_tokens or 0,
-                        "response_tokens": usage.response_tokens or 0,
-                        "total_tokens": usage.total_tokens or 0,
-                    },
-                })
-                yield f"data: {done_event}\n\n"
+            logger.info(
+                "Chat usage (incl. retries): request_tokens=%s response_tokens=%s total=%s requests=%s",
+                total_request_tokens, total_response_tokens,
+                total_total_tokens, total_requests,
+            )
 
-                asyncio.create_task(report_usage(
-                    api_token=token,
-                    agent_name="career_caddy_chat",
-                    model_name=DEFAULT_MODEL,
-                    usage=usage,
-                    trigger="chat",
-                    base_url=API_BASE_URL,
-                ))
+            done_event = json.dumps({
+                "type": "done",
+                "content": full_text,
+                "conversation_id": conversation_id,
+                "usage": {
+                    "request_tokens": total_request_tokens,
+                    "response_tokens": total_response_tokens,
+                    "total_tokens": total_total_tokens,
+                },
+            })
+            yield f"data: {done_event}\n\n"
+
+            # pydantic-ai RequestUsage has a `.requests` attr the usage
+            # reporter expects; build a lightweight shim.
+            from types import SimpleNamespace
+
+            asyncio.create_task(report_usage(
+                api_token=token,
+                agent_name="career_caddy_chat",
+                model_name=DEFAULT_MODEL,
+                usage=SimpleNamespace(
+                    request_tokens=total_request_tokens,
+                    response_tokens=total_response_tokens,
+                    total_tokens=total_total_tokens,
+                    requests=total_requests,
+                ),
+                trigger="chat",
+                base_url=API_BASE_URL,
+            ))
 
         except Exception as e:
             logger.exception("Chat agent error")

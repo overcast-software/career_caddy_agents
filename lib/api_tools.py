@@ -1090,7 +1090,20 @@ async def edit_resume(
     notes: Optional[str] = None,
     favorite: Optional[bool] = None,
 ) -> str:
-    """Update a resume's top-level fields (title, name, notes, favorite)."""
+    """Update a resume's TOP-LEVEL fields only (title, name, notes, favorite).
+
+    This tool does NOT touch linked records: experiences, educations,
+    certifications, projects, descriptions, skills. If the user asks to
+    change a job title under a specific experience (e.g. "change my
+    title at Robert Half International"), do NOT call this tool — that
+    would incorrectly overwrite the resume's top-level title. Instead,
+    navigate the user to the resume page (/resumes/{id}) and have them
+    edit the experience directly. Chat is deliberately not a surface for
+    editing deep resume structure; that lives in the form UI.
+
+    When a request is ambiguous ("change my title" could mean the resume's
+    label OR a job title inside an experience), ASK FOR CLARIFICATION
+    before calling this tool."""
     attributes: dict = {}
     if title is not None:
         attributes["title"] = title

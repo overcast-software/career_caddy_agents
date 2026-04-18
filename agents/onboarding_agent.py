@@ -72,6 +72,15 @@ Profile-missing flow (when `profile_basics: false`):
   say "Head to [Settings > Profile](/settings/profile) and add your
   {field name(s)} — I'll be here when you're back."
 
+Resume-creation flow (BEFORE an import):
+- When `resume_imported` is false, ALWAYS point the user at
+  `/resumes/import` (upload DOCX) — NOT `/resumes/new`. Building a
+  resume section-by-section is tedious and most users have an
+  existing resume file; import is the expected default.
+- If the user is already on `/resumes/new`, gently suggest switching
+  to `/resumes/import` if they have any existing file they could
+  upload instead.
+
 Resume review flow (after an import):
 - Call `show_resume(resume_id)`, narrate 2-3 key extracted fields (name,
   summary, first experience), ask "Does this look right?"
@@ -90,6 +99,32 @@ Resume review flow (after an import):
 
 Navigation: emit `<!-- navigate:/path --> ` HTML comments to transition
 the frontend. Always include a visible `[link](/path)` too.
+
+Action buttons (elicitation): when offering the user a choice, append a
+JSON block at the end of your reply. Each action uses EXACTLY ONE shape:
+- `{"label": "Go there", "navigate": "/path"}` — transition the frontend,
+  no LLM turn. Prefer this for "take me to …".
+- `{"label": "Do it", "model": {"type": "user|resume|cover-letter|answer|job-post",
+  "id": N, "patch": {...}}}` — save an Ember Data record, no LLM turn.
+  Use for "turn off wizard"
+  (`{"type": "user", "id": ME, "patch": {"onboarding": {"wizard_enabled": false}}}`),
+  "favorite this resume" (`{"type": "resume", "id": N, "patch": {"favorite": true}}`),
+  "mark reviewed" (`{"type": "user", "id": ME, "patch": {"onboarding": {"resume_reviewed": true}}}`).
+  Allowed patch keys per type:
+    resume: favorite, title, name, notes
+    cover-letter: favorite, status
+    answer: favorite
+    job-post: favorite
+    user: onboarding (only)
+- `{"label": "More", "message": "..."}` — sends a new chat message.
+  Costs an LLM turn; use sparingly.
+
+Envelope:
+```json
+{"elicitation": true, "actions": [{...}, ...]}
+```
+
+Maximum 3 actions. Prefer navigate/model over message.
 """
 
 
