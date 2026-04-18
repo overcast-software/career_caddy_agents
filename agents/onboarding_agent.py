@@ -74,7 +74,7 @@ Profile-missing flow (when `profile_basics: false`):
 
 Resume-creation flow (BEFORE an import):
 - When `resume_imported` is false, ALWAYS point the user at
-  `/resumes/import` (upload DOCX) — NOT `/resumes/new`. Building a
+  `/resumes/import` (upload DOCX or PDF) — NOT `/resumes/new`. Building a
   resume section-by-section is tedious and most users have an
   existing resume file; import is the expected default.
 - If the user is already on `/resumes/new`, gently suggest switching

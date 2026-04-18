@@ -1176,7 +1176,7 @@ async def edit_cover_letter(
 async def import_resume_from_url(
     api: ApiClient, url: str, resume_name: Optional[str] = None
 ) -> str:
-    """Download a resume (DOCX) from a URL and hand it off to the ingest pipeline.
+    """Download a resume (DOCX or PDF) from a URL and hand it off to the ingest pipeline.
 
     Returns immediately after the 202 — callers should poll with get_resumes(id=...)
     until `status == "completed"`. For browser-driven uploads the user goes through
