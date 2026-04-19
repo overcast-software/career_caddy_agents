@@ -382,9 +382,13 @@ async def get_scrapes(
     sort: Optional[str] = None,
     page: Optional[int] = None,
     per_page: Optional[int] = None,
+    status: Optional[str] = None,
 ) -> str:
-    """Fetch scrape records. Pass id to retrieve a single scrape; omit for a paginated list."""
-    return await api_tools.get_scrapes(_api(), id, sort, page, per_page)
+    """Fetch scrape records. Pass id to retrieve a single scrape; omit for a paginated list.
+
+    Filter by status (e.g. 'failed', 'completed', 'hold') and sort with e.g. '-id'.
+    """
+    return await api_tools.get_scrapes(_api(), id, sort, page, per_page, status=status)
 
 
 @server.tool()
@@ -399,6 +403,73 @@ async def update_scrape(
     Common status transitions: hold -> pending, hold -> completed (with job_content).
     """
     return await api_tools.update_scrape(_api(), scrape_id, status, job_content, url)
+
+
+@server.tool()
+async def list_scrape_screenshots(scrape_id: int) -> str:
+    """List screenshot filenames captured for a scrape. Staff-only.
+
+    Returns JSON with a list of filenames that can be passed to
+    fetch_scrape_screenshot to retrieve the PNG bytes.
+    """
+    return await api_tools.list_screenshots(_api(), scrape_id)
+
+
+@server.tool()
+async def fetch_scrape_screenshot(scrape_id: int, filename: str) -> str:
+    """Download a scrape screenshot as a base64-encoded PNG. Staff-only.
+
+    The caller should base64-decode the result to get raw PNG bytes, e.g. to
+    pass into a vision model as BinaryContent(media_type="image/png").
+    """
+    import base64
+    data = await api_tools.fetch_screenshot_bytes(_api(), scrape_id, filename)
+    return json.dumps({
+        "success": True,
+        "scrape_id": scrape_id,
+        "filename": filename,
+        "media_type": "image/png",
+        "data_base64": base64.b64encode(data).decode("ascii"),
+        "size_bytes": len(data),
+    })
+
+
+@server.tool()
+async def get_scrape_profile(hostname: str) -> str:
+    """Fetch the scrape profile for a hostname. Returns the JSON:API payload."""
+    return await api_tools.get_scrape_profile(_api(), hostname)
+
+
+@server.tool()
+async def update_scrape_profile(
+    profile_id: int,
+    css_selectors: Optional[dict] = None,
+    extraction_hints: Optional[str] = None,
+    page_structure: Optional[str] = None,
+    preferred_tier: Optional[str] = None,
+    enabled: Optional[bool] = None,
+) -> str:
+    """Update a ScrapeProfile's editable fields.
+
+    `css_selectors` is the JSON blob holding all per-host scrape tuning
+    (job_data, ready_selector, interaction_hints, obstacle_click_selector,
+    analyzer_notes, etc.). Pass only the fields you want to update — others
+    are left untouched.
+    """
+    attrs: dict = {}
+    if css_selectors is not None:
+        attrs["css_selectors"] = css_selectors
+    if extraction_hints is not None:
+        attrs["extraction_hints"] = extraction_hints
+    if page_structure is not None:
+        attrs["page_structure"] = page_structure
+    if preferred_tier is not None:
+        attrs["preferred_tier"] = preferred_tier
+    if enabled is not None:
+        attrs["enabled"] = enabled
+    if not attrs:
+        return json.dumps({"success": False, "error": "No fields provided to update"})
+    return await api_tools.update_scrape_profile(_api(), profile_id, **attrs)
 
 
 # ---------------------------------------------------------------------------

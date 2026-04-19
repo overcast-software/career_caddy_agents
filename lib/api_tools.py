@@ -749,6 +749,26 @@ async def upload_screenshot(api: ApiClient, scrape_id: int, file_path: Path) -> 
     )
 
 
+async def list_screenshots(api: ApiClient, scrape_id: int) -> str:
+    """List screenshot filenames for a scrape. Staff-only endpoint."""
+    return await api.get(f"/api/v1/scrapes/{scrape_id}/screenshots/")
+
+
+async def fetch_screenshot_bytes(api: ApiClient, scrape_id: int, filename: str) -> bytes:
+    """Download a screenshot PNG's raw bytes. Staff-only endpoint.
+
+    Returns raw PNG bytes on success; raises on HTTP error. Used by the MCP
+    tool wrapper to base64-encode for transport to MCP clients.
+    """
+    async with httpx.AsyncClient(follow_redirects=True, timeout=api.timeout, trust_env=False) as client:
+        resp = await client.get(
+            urljoin(api.base_url, f"/api/v1/scrapes/{scrape_id}/screenshots/{filename}"),
+            headers=api._headers,
+        )
+    resp.raise_for_status()
+    return resp.content
+
+
 async def get_scrape_profile(api: ApiClient, hostname: str) -> str:
     """Fetch the scrape profile for a hostname. Returns profile data or empty."""
     return await api.get("/api/v1/scrape-profiles/", params={"filter[hostname]": hostname})
