@@ -125,7 +125,7 @@ class ApiClient:
         return json.dumps(result.model_dump(), indent=2)
 
     async def get(self, path: str, params: dict | None = None) -> str:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
             resp = await client.get(
                 urljoin(self.base_url, path),
                 headers=self._headers,
@@ -139,7 +139,7 @@ class ApiClient:
         Returns the raw body on 2xx; on error returns a JSON error envelope
         matching the APIResponse shape so callers can branch the same way.
         """
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
             resp = await client.get(
                 urljoin(self.base_url, path),
                 headers=self._headers,
@@ -158,7 +158,7 @@ class ApiClient:
         )
 
     async def post(self, path: str, payload: dict) -> str:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
             resp = await client.post(
                 urljoin(self.base_url, path),
                 headers=self._headers,
@@ -167,7 +167,7 @@ class ApiClient:
             return self._ok(resp)
 
     async def patch(self, path: str, payload: dict) -> str:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
             resp = await client.patch(
                 urljoin(self.base_url, path),
                 headers=self._headers,
@@ -177,7 +177,7 @@ class ApiClient:
 
     async def post_file(self, path: str, file_path: Path, field: str = "file") -> str:
         """POST a file as multipart/form-data."""
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
             with open(file_path, "rb") as f:
                 resp = await client.post(
                     urljoin(self.base_url, path),
@@ -298,8 +298,14 @@ async def create_job_post_with_company_check(
     company_industry: Optional[str] = None,
     company_size: Optional[str] = None,
     company_location: Optional[str] = None,
+    source: str = "chat",
 ) -> str:
-    """Create a job post, creating the company first if it doesn't exist."""
+    """Create a job post, creating the company first if it doesn't exist.
+
+    `source` tags provenance on the JobPost — defaults to 'chat' since this
+    helper is primarily called from the career_caddy_agent tool. Backend
+    uses the field for the sankey report's source-attribution view.
+    """
     job_url = url or link
     if not company_name:
         return json.dumps(
@@ -390,6 +396,7 @@ async def create_job_post_with_company_check(
             posted_date=posted_date,
         )
         attributes = job_data.model_dump(exclude={"company_id"}, exclude_none=True)
+        attributes["source"] = source
         payload = {
             "data": {
                 "type": "job-post",
