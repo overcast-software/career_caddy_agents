@@ -15,7 +15,7 @@ class TestPublicServerTools:
         self.tool_names = {t.name for t in self.tools}
 
     def test_tool_count(self):
-        assert len(self.tools) == 20
+        assert len(self.tools) == 24
 
     def test_has_all_expected_tools(self):
         expected = {
@@ -26,6 +26,8 @@ class TestPublicServerTools:
             "get_applications_for_job_post", "update_job_application",
             "get_career_data", "get_current_user",
             "create_scrape", "get_scrapes", "update_scrape",
+            "list_scrape_screenshots", "fetch_scrape_screenshot",
+            "get_scrape_profile", "update_scrape_profile",
             "score_job_post", "get_scores",
         }
         assert self.tool_names == expected
