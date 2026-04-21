@@ -691,8 +691,9 @@ async def get_scrapes(
     page: Optional[int] = None,
     per_page: Optional[int] = None,
     status: Optional[str] = None,
+    has_score: Optional[bool] = None,
 ) -> str:
-    """Fetch scrape records. Pass id for a single scrape; omit for a paginated list. Use sort='-id' for most recent first, per_page=1 for just the latest. Filter by status with status='hold'."""
+    """Fetch scrape records. Pass id for a single scrape; omit for a paginated list. Use sort='-id' for most recent first, per_page=1 for just the latest. Filter by status with status='hold'. Pass has_score=False to scope to scrapes whose linked JobPost has no Score yet (drives the auto-score daemon)."""
     if id is not None:
         return await api.get(f"/api/v1/scrapes/{id}/")
     params = {}
@@ -704,6 +705,8 @@ async def get_scrapes(
         params["per_page"] = per_page
     if status is not None:
         params["filter[status]"] = status
+    if has_score is not None:
+        params["filter[has_score]"] = "true" if has_score else "false"
     return await api.get("/api/v1/scrapes/", params=params)
 
 

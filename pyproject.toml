@@ -30,6 +30,7 @@ caddy-pipeline = "agents.job_email_to_caddy:run"
 caddy-public   = "mcp_servers.public_server:main"
 caddy-chat     = "mcp_servers.chat_server:main"
 caddy-poller  = "scripts.hold_poller:main_sync"
+caddy-score    = "scripts.score_poller:run"
 caddy-fetch-browser = "camoufox.__main__:main"
 caddy-fetch-chromium = "scripts.fetch_chromium:main"
 
