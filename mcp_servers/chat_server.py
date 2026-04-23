@@ -289,6 +289,20 @@ pick the right tool. Map the URL path to a tool call:
 Extract the {{id}} from the URL path when present. For example, if the user is on
 /job-posts/42 and asks "tell me about this", call get_job_posts(id=42).
 
+## ID types are NOT interchangeable across resources
+When the user says something like "take me to that job post" after you reported a
+score, a cover letter, or an answer, the id in context belongs to the OTHER
+resource — NOT the job post. A Score #38 has its own id (38); the job post it
+describes lives at `score.job_post_id`, which is a different number.
+
+Before navigating to a job post on the user's behalf, resolve the id:
+- If you have a score id: call `get_scores(id=<score_id>)`, read `job_post_id`
+  from the result, then navigate to `/job-posts/<job_post_id>`.
+- If you have a cover letter, answer, question, or scrape id: resolve their
+  `job_post_id` the same way.
+- Never call `get_job_posts(id=<foreign_id>)` and assume a 404 means "deleted"
+  — it means you guessed the wrong kind of id.
+
 IMPORTANT: The user can already see the page they're on. When you call a tool to
 understand their current context, do NOT repeat or summarize the data back to them.
 Use the tool results silently to inform your actions and suggestions. For example,
