@@ -164,6 +164,60 @@ Resolution order: role-specific env var → `CADDY_DEFAULT_MODEL` → hardcoded 
 
 The hold poller (`scripts/hold_poller.py`) skips the browser_scraper LLM entirely — it calls `scrape_page()` directly as a Python function, then hands content to the job extractor.
 
+## Scrape Graph (Phase 1b skeleton)
+
+The scrape+extract pipeline is being migrated to an explicit
+pydantic-graph state machine. ai/ owns the runtime; api/ exposes thin
+persistence endpoints the graph nodes POST to.
+
+**Status**: Phase 1b skeleton merged. Feature flag defaults to off so
+nothing in production touches the graph yet. Phase 1c lands the
+frontend d3/mermaid visualization; Phase 1d wires browser_server to
+actually dispatch the graph.
+
+**Callers**: these entry points all feed the same extract sub-graph
+once Phase 1d ships. The graph itself has no knowledge of who called:
+- Hold-poller (via browser_server) — runs the full scrape + extract
+  sub-graph with an active Playwright page.
+- Browser-extension bookmarklet → paste form — enters at
+  `StartExtract` (no Playwright needed, text already posted).
+- Chat ingest — same as paste, enters at `StartExtract`.
+- cc_auto email pipeline — same, enters at `StartExtract` with
+  `source="email"`. cc_auto is a caller, not a participant; it runs
+  as its own process and never imports scrape_graph directly.
+
+**Feature flag**: `SCRAPE_GRAPH_MODE = off | shadow | primary`
+- `off` (default) — legacy pipeline runs; graph code is imported but
+  never executed.
+- `shadow` — legacy runs; graph runs after on the same scrape with
+  `PersistJobPost` suppressed. Used to verify parity before cutover.
+- `primary` — graph is authoritative; legacy runs only as fallback
+  when the graph terminates in `ExtractFail` / `ObstacleFail`.
+
+**Per-tier model overrides**:
+- `SCRAPE_GRAPH_TIER1_MODEL` (default `openai:gpt-4o-mini`)
+- `SCRAPE_GRAPH_TIER2_MODEL` (default `anthropic:claude-haiku-4-5`)
+- `SCRAPE_GRAPH_TIER3_MODEL` (default `anthropic:claude-sonnet-4-6`)
+- `SCRAPE_GRAPH_ENABLE_TIER3=1` to allow escalation into Tier 3;
+  otherwise the graph terminates at `ExtractFail` after Tier 2.
+
+**Visualization**:
+- `GET /api/v1/admin/graph-structure/` — static {nodes, edges} for
+  a d3 force-layout.
+- `GET /api/v1/admin/graph-mermaid/` — mermaid stateDiagram-v2
+  source, renderable via mermaid.js or mermaid.live.
+- `GET /api/v1/scrapes/:id/graph-trace/` — ordered transitions for a
+  single scrape; walks `source_scrape` chain so a tracker URL + its
+  canonical child render as one path.
+- `GET /api/v1/admin/graph-aggregate/?since=7d` — per-edge counts +
+  success rates for the eval loop.
+- `python manage.py dump_graph_traces --since 7d --format jsonl`
+  emits training data for offline analysis.
+
+**Canonical node registry**: `ai/lib/scrape_graph/graph.py`. The static
+snapshot in `api/job_hunting/api/views/graph.py` must stay in sync;
+Phase 1d will export from the ai side to make that automatic.
+
 ## Tests
 
 ```bash
