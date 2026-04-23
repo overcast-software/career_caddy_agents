@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic_graph import BaseNode, End, GraphRunContext
 
-from .state import ScrapeGraphState, TierAttempt
+from .state import GraphMode, ScrapeGraphState, TierAttempt, get_mode
 from .tracing import trace_node
 
 logger = logging.getLogger(__name__)
@@ -230,6 +230,12 @@ class PersistJobPost(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no
     ) -> Union[UpdateProfile, ExtractFail]:
         started = time.time()
         state = ctx.state
+        # Shadow mode: record the trace transition but skip the persist
+        # POST so we don't clobber legacy data during parity testing.
+        if get_mode() is GraphMode.SHADOW:
+            logger.info("PersistJobPost[shadow]: suppressed for scrape %s", state.scrape_id)
+            trace_node(state, "PersistJobPost", "UpdateProfile", started, {"suppressed": "shadow"})
+            return UpdateProfile()
         try:
             resp = httpx.post(
                 f"{_api_base()}/api/v1/scrapes/{state.scrape_id}/persist-extraction/",
@@ -256,6 +262,9 @@ class UpdateProfile(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
     ) -> ResolveApplyUrl:
         started = time.time()
         state = ctx.state
+        if get_mode() is GraphMode.SHADOW:
+            trace_node(state, "UpdateProfile", "ResolveApplyUrl", started, {"suppressed": "shadow"})
+            return ResolveApplyUrl()
         host = (urlparse(state.canonical_url or state.submitted_url or "").hostname or "").lower()
         if host.startswith("www."):
             host = host[4:]
@@ -277,8 +286,102 @@ class UpdateProfile(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
                 )
             except Exception:
                 logger.debug("UpdateProfile: post failed", exc_info=True)
+            _write_selector_candidates(host, state)
         trace_node(state, "UpdateProfile", "ResolveApplyUrl", started)
         return ResolveApplyUrl()
+
+
+_READY_PROBATION = 2
+_OBSTACLE_PROBATION = 2
+
+
+def _write_selector_candidates(host: str, state: ScrapeGraphState) -> None:
+    """Apply the probation-gated selector writes the legacy poller used
+    to do in hold_poller._update_profile_from_results. Reads the
+    current profile, diffs against the scrape's candidates, and PATCHes
+    via the api's scrape-profiles endpoint.
+
+    Shadow-mode callers are already gated out before reaching this
+    function; we run unconditionally here.
+    """
+    discovered = state.discovered_selectors
+    cand_ready = state.candidate_ready_selector
+    cand_obstacle = state.candidate_obstacle_click_selector
+    if not (discovered or cand_ready or cand_obstacle):
+        return
+    try:
+        resp = httpx.get(
+            f"{_api_base()}/api/v1/scrape-profiles/",
+            params={"filter[hostname]": host},
+            headers=_api_headers(),
+            timeout=10.0,
+        )
+        payload = resp.json() if resp.status_code == 200 else {}
+        rows = payload.get("data") or []
+        if not rows:
+            return
+        row = rows[0]
+        profile_id = row.get("id")
+        attrs = row.get("attributes") or {}
+        existing = attrs.get("css-selectors") or attrs.get("css_selectors") or {}
+    except Exception:
+        logger.debug("UpdateProfile: profile fetch failed", exc_info=True)
+        return
+
+    updated = dict(existing)
+    changed = False
+
+    if discovered and not existing.get("job_data"):
+        updated["job_data"] = discovered
+        changed = True
+
+    if _apply_probation(updated, cand_ready, "_ready_selector_candidate",
+                       "ready_selector", _READY_PROBATION, existing):
+        changed = True
+    if _apply_probation(updated, cand_obstacle, "_obstacle_click_candidate",
+                       "obstacle_click_selector", _OBSTACLE_PROBATION, existing):
+        changed = True
+
+    if not (changed and profile_id):
+        return
+    try:
+        httpx.patch(
+            f"{_api_base()}/api/v1/scrape-profiles/{profile_id}/",
+            json={
+                "data": {
+                    "type": "scrape-profile",
+                    "id": str(profile_id),
+                    "attributes": {"css-selectors": updated},
+                }
+            },
+            headers={**_api_headers(), "Content-Type": "application/vnd.api+json"},
+            timeout=10.0,
+        )
+    except Exception:
+        logger.debug("UpdateProfile: PATCH profile failed", exc_info=True)
+
+
+def _apply_probation(
+    updated: dict, candidate: str | None, candidate_key: str,
+    graduated_key: str, threshold: int, existing: dict,
+) -> bool:
+    """Ported from hold_poller. Candidate must match `threshold` consecutive
+    scrapes before it's promoted from `candidate_key` to `graduated_key`."""
+    if not candidate or existing.get(graduated_key):
+        return False
+    prev = existing.get(candidate_key) or {}
+    prev_sel = prev.get("selector") if isinstance(prev, dict) else None
+    prev_count = prev.get("matches", 0) if isinstance(prev, dict) else 0
+    if prev_sel == candidate:
+        matches = prev_count + 1
+        if matches >= threshold:
+            updated[graduated_key] = candidate
+            updated.pop(candidate_key, None)
+        else:
+            updated[candidate_key] = {"selector": candidate, "matches": matches}
+    else:
+        updated[candidate_key] = {"selector": candidate, "matches": 1}
+    return True
 
 
 @dataclass
@@ -288,9 +391,16 @@ class ResolveApplyUrl(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[n
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
     ) -> End[dict]:
+        from .nodes_scrape import _patch_scrape_status
         started = time.time()
         state = ctx.state
         state.outcome = "success"
+        note = (
+            f"extracted job_post {state.job_post_id}"
+            if state.job_post_id
+            else f"extracted ({len(state.job_content or '')} chars)"
+        )
+        _patch_scrape_status(state.scrape_id, "completed", note=note)
         trace_node(state, "ResolveApplyUrl", "End", started)
         return End({
             "outcome": "success",
@@ -304,10 +414,12 @@ class ExtractFail(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-re
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
     ) -> End[dict]:
+        from .nodes_scrape import _patch_scrape_status
         started = time.time()
         state = ctx.state
         state.outcome = "failure"
         state.failure_reason = state.failure_reason or "extraction"
+        _patch_scrape_status(state.scrape_id, "failed", note=state.failure_reason)
         trace_node(state, "ExtractFail", "End", started)
         return End({
             "outcome": "failure",

@@ -86,6 +86,32 @@ class ResidentBrowser:
             except Exception as exc:
                 logger.warning("Resident: preseed failed for %s: %s", d, exc)
 
+    async def save_sessions(self) -> int:
+        """Write current cookies back to SessionStore, one file per seeded
+        domain. Called on shutdown so manually-solved logins persist across
+        poller restarts. Returns the number of domains whose sessions were
+        written.
+        """
+        if self._context is None or not self._seeded_domains:
+            return 0
+        try:
+            all_cookies = await self._context.cookies()
+        except Exception as exc:
+            logger.warning("Resident: cookies() failed, skipping save: %s", exc)
+            return 0
+        saved = 0
+        for domain in self._seeded_domains:
+            matches = [
+                c for c in all_cookies
+                if _cookie_matches_domain(c.get("domain") or "", domain)
+            ]
+            if not matches:
+                logger.info("Resident: no cookies to save for %s", domain)
+                continue
+            self._session_store.save(domain, matches)
+            saved += 1
+        return saved
+
     async def close(self):
         if self._context is not None:
             try:
@@ -95,3 +121,16 @@ class ResidentBrowser:
             self._context = None
         self._pages.clear()
         self._seeded_domains.clear()
+
+
+def _cookie_matches_domain(cookie_domain: str, target: str) -> bool:
+    """Match a Playwright cookie's domain attribute against our canonical
+    target domain (e.g. 'linkedin.com'). Accepts '.linkedin.com',
+    'www.linkedin.com', 'linkedin.com' — all three should save under the
+    target.
+    """
+    if not cookie_domain or not target:
+        return False
+    cd = cookie_domain.lstrip(".").lower()
+    tgt = target.lower()
+    return cd == tgt or cd.endswith("." + tgt)

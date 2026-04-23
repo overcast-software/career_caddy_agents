@@ -183,10 +183,12 @@ class ObstacleFail(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-r
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
     ) -> End[dict]:
+        from .nodes_scrape import _patch_scrape_status
         started = time.time()
         state = ctx.state
         state.outcome = "failure"
         state.failure_reason = state.failure_reason or "login_wall"
+        _patch_scrape_status(state.scrape_id, "failed", note=state.failure_reason)
         trace_node(state, "ObstacleFail", "End", started)
         return End({
             "outcome": "failure",

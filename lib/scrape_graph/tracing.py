@@ -80,7 +80,7 @@ def _post_transition(
         },
     }
     try:
-        httpx.post(
+        resp = httpx.post(
             f"{base}/api/v1/scrapes/{scrape_id}/graph-transition/",
             headers={
                 "Authorization": f"Bearer {token}",
@@ -89,5 +89,20 @@ def _post_transition(
             json=body,
             timeout=5.0,
         )
-    except Exception:
-        logger.debug("graph-transition POST failed scrape_id=%s", scrape_id, exc_info=True)
+    except Exception as exc:
+        # Surface network/timeout failures — with shadow mode shipping,
+        # a silent drop of graph transitions makes the per-scrape trace
+        # page empty for no visible reason. Keep best-effort semantics
+        # (don't re-raise), but log at warning so the poller's stdout
+        # shows the problem.
+        logger.warning(
+            "graph-transition POST failed scrape_id=%s node=%s: %s",
+            scrape_id, node, exc,
+        )
+        return
+    if resp.status_code >= 400:
+        body_preview = resp.text[:200] if resp.text else ""
+        logger.warning(
+            "graph-transition POST %s for scrape_id=%s node=%s: %s",
+            resp.status_code, scrape_id, node, body_preview,
+        )

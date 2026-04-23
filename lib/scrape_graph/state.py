@@ -28,12 +28,16 @@ class GraphMode(str, Enum):
 
 
 def get_mode() -> GraphMode:
-    """Read SCRAPE_GRAPH_MODE from env, default off."""
-    raw = (os.environ.get("SCRAPE_GRAPH_MODE") or "off").strip().lower()
+    """Read SCRAPE_GRAPH_MODE from env. Defaults to PRIMARY post-cutover
+    — the poller runs the pydantic-graph pipeline for every scrape.
+    Set =off= as a kill-switch to fall back to the legacy imperative
+    scrape_page path (still wired in hold_poller._process_scrape_legacy
+    while we soak the primary rollout)."""
+    raw = (os.environ.get("SCRAPE_GRAPH_MODE") or "primary").strip().lower()
     try:
         return GraphMode(raw)
     except ValueError:
-        return GraphMode.OFF
+        return GraphMode.PRIMARY
 
 
 @dataclass
@@ -112,6 +116,7 @@ class ScrapeGraphState:
     screenshot_name: Optional[str] = None
     candidate_ready_selector: Optional[str] = None
     candidate_obstacle_click_selector: Optional[str] = None
+    discovered_selectors: Optional[dict] = None  # e.g. {"title": "h1", "company": ".company"}
     obstacle_history: list[ObstacleAttempt] = field(default_factory=list)
 
     # Extract-side
