@@ -33,6 +33,7 @@ caddy-poller  = "scripts.hold_poller:main_sync"
 caddy-score    = "scripts.score_poller:run"
 caddy-fetch-browser = "camoufox.__main__:main"
 caddy-fetch-chromium = "scripts.fetch_chromium:main"
+caddy-export-graph = "scripts.export_graph_structure:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agents", "mcp_servers", "lib", "scripts"]

@@ -6,8 +6,6 @@ endpoint is live.
 """
 from __future__ import annotations
 
-import pytest
-
 from lib.scrape_graph import (
     GraphMode,
     ScrapeGraphState,
@@ -65,9 +63,11 @@ def test_urls_differ_tracker_to_different_destination():
 # ----------------------------------------------------------------------
 
 
-def test_mode_defaults_off(monkeypatch):
+def test_mode_defaults_primary(monkeypatch):
+    """Post-cutover default is PRIMARY — the pydantic-graph pipeline
+    runs for every scrape unless an operator explicitly opts out."""
     monkeypatch.delenv("SCRAPE_GRAPH_MODE", raising=False)
-    assert get_mode() is GraphMode.OFF
+    assert get_mode() is GraphMode.PRIMARY
 
 
 def test_mode_reads_env(monkeypatch):
@@ -75,9 +75,14 @@ def test_mode_reads_env(monkeypatch):
     assert get_mode() is GraphMode.SHADOW
 
 
-def test_mode_invalid_falls_back_to_off(monkeypatch):
-    monkeypatch.setenv("SCRAPE_GRAPH_MODE", "nope")
+def test_mode_off_kill_switch(monkeypatch):
+    monkeypatch.setenv("SCRAPE_GRAPH_MODE", "off")
     assert get_mode() is GraphMode.OFF
+
+
+def test_mode_invalid_falls_back_to_primary(monkeypatch):
+    monkeypatch.setenv("SCRAPE_GRAPH_MODE", "nope")
+    assert get_mode() is GraphMode.PRIMARY
 
 
 # ----------------------------------------------------------------------
@@ -107,14 +112,6 @@ def test_state_payload_serializable():
 # ----------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Phase 1b skeleton: cross-module forward refs prevent pydantic-graph "
-        "from resolving all Union return annotations at registration time. "
-        "Phase 1d lands the executable graph; this smoke test will pass then."
-    ),
-    strict=False,
-)
 def test_build_scrape_graph_smoke():
     from lib.scrape_graph.graph import build_scrape_graph, build_extract_graph
 

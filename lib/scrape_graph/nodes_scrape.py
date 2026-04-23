@@ -18,7 +18,7 @@ from typing import Union
 import httpx
 from pydantic_graph import BaseNode, End, GraphRunContext
 
-from .state import ScrapeGraphState
+from .state import GraphMode, ScrapeGraphState, get_mode
 from .tracing import trace_node
 from .url_canonicalize import canonicalize_url, urls_differ
 
@@ -239,6 +239,10 @@ class DuplicateShortCircuit(BaseNode[ScrapeGraphState, None, dict]):  # type: ig
         started = time.time()
         state = ctx.state
         state.outcome = "duplicate"
+        _patch_scrape_status(
+            state.scrape_id, "completed",
+            note=f"duplicate: job_post {state.job_post_id}",
+        )
         trace_node(state, "DuplicateShortCircuit", "End", started)
         return End({
             "outcome": "duplicate",
@@ -316,15 +320,94 @@ class Capture(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
                 state.html = await page.content()
             except Exception as exc:
                 state.failure_reason = f"capture_failed: {exc}"
+
+            await _screenshot_and_upload(page, state)
+            await _discover_selectors(page, state)
         trace_node(state, "Capture", "PersistScrape", started)
         return PersistScrape()
+
+
+async def _screenshot_and_upload(page, state: ScrapeGraphState) -> None:
+    """Take a full-page screenshot, upload to the api's screenshots
+    endpoint, and record the filename on state. Matches the legacy
+    poller's upload path so the /scrapes/:id/screenshots/ viewer keeps
+    working after the primary cutover."""
+    from datetime import datetime
+    from urllib.parse import urlparse
+    try:
+        from mcp_servers.browser_server import SCREENSHOT_DIR
+    except Exception:
+        logger.debug("Capture: SCREENSHOT_DIR unavailable, skipping screenshot", exc_info=True)
+        return
+    host = (urlparse(state.canonical_url or state.submitted_url or "").hostname or "unknown").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"{host}_{ts}.png"
+    path = SCREENSHOT_DIR / name
+    try:
+        await page.screenshot(path=str(path), full_page=True)
+    except Exception as exc:
+        logger.warning("Capture: screenshot failed: %s", exc)
+        return
+    try:
+        with open(path, "rb") as f:
+            resp = httpx.post(
+                f"{_api_base()}/api/v1/scrapes/{state.scrape_id}/screenshots/",
+                files={"file": (name, f, "image/png")},
+                headers=_api_headers(),
+                timeout=30.0,
+            )
+        if resp.status_code < 400:
+            state.screenshot_name = name
+        else:
+            logger.warning(
+                "Capture: screenshot upload %s: %s", resp.status_code, resp.text[:200]
+            )
+    except Exception as exc:
+        logger.warning("Capture: screenshot upload exception: %s", exc)
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+async def _discover_selectors(page, state: ScrapeGraphState) -> None:
+    """Run the legacy browser-server selector discovery so profile
+    probation gates (UpdateProfile node) have candidates to graduate
+    on repeat hits."""
+    profile_selectors = (state.profile or {}) if isinstance(state.profile, dict) else {}
+    try:
+        if not profile_selectors.get("job_data"):
+            from mcp_servers.browser_server import _discover_job_selectors
+            discovered = await _discover_job_selectors(page)
+            if discovered:
+                state.discovered_selectors = discovered
+    except Exception:
+        logger.debug("Capture: selector discovery failed", exc_info=True)
+    try:
+        if not profile_selectors.get("ready_selector"):
+            from mcp_servers.browser_server import _JOB_SELECTOR_CANDIDATES
+            for sel in _JOB_SELECTOR_CANDIDATES.get("title", []):
+                if not any(c in sel for c in (".", "#", "[", ":")):
+                    continue
+                try:
+                    el = await page.query_selector(sel)
+                    if el and (await el.inner_text()).strip():
+                        state.candidate_ready_selector = sel
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        logger.debug("Capture: ready-selector probing failed", exc_info=True)
 
 
 @dataclass
 class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ):  # return annotation lazy-set from nodes_extract
+    ) -> "StartExtract":  # noqa: F821 — resolved via graph.py namespace
         from . import nodes_extract
         started = time.time()
         state = ctx.state
@@ -339,6 +422,9 @@ class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
                             "job_content": state.job_content,
                             "html": state.html,
                             "status": "extracting",
+                            "note": (
+                                f"Content delivered ({len(state.job_content or '')} chars)"
+                            ),
                         },
                     }
                 },
@@ -349,6 +435,32 @@ class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
             logger.warning("PersistScrape: patch failed", exc_info=True)
         trace_node(state, "PersistScrape", "StartExtract", started)
         return nodes_extract.StartExtract()
+
+
+def _patch_scrape_status(scrape_id: int, status: str, note: str | None = None) -> None:
+    """Helper used by terminal nodes to close out the scrape row with
+    the frontend-visible status the poller-polling UI watches for
+    ({completed, failed})."""
+    if not scrape_id or get_mode() is GraphMode.SHADOW:
+        return
+    attributes = {"status": status}
+    if note is not None:
+        attributes["note"] = note
+    try:
+        httpx.patch(
+            f"{_api_base()}/api/v1/scrapes/{scrape_id}/",
+            json={
+                "data": {
+                    "type": "scrape",
+                    "id": str(scrape_id),
+                    "attributes": attributes,
+                }
+            },
+            headers={**_api_headers(), "Content-Type": "application/json"},
+            timeout=15.0,
+        )
+    except Exception:
+        logger.warning("terminal scrape PATCH failed scrape_id=%s", scrape_id, exc_info=True)
 
 
 __all__ = [
