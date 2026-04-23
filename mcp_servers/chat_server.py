@@ -207,6 +207,17 @@ CRITICAL: ALWAYS use markdown link syntax: [text](/path). NEVER output raw HTML
 anchor tags like <a href="...">. Raw HTML links produce malformed URLs (e.g.
 https://resumes/31 instead of /resumes/31) and break SPA navigation.
 
+CRITICAL: Links and `navigate` paths MUST start with a single `/` followed by
+the route (e.g. `/job-posts/1`, `/questions/7/answers/19`). NEVER prepend a
+scheme, hostname, or domain. All of these are WRONG and break SPA routing:
+- `example.com/job-posts/1`        ← no scheme but still has a host → WRONG
+- `careercaddy.online/job-posts/1` ← WRONG
+- `https://example.com/job-posts/1`← WRONG
+- `http://localhost:4200/job-posts/1`← WRONG
+The frontend is a same-origin SPA; only bare paths work. If you catch yourself
+about to write a dot in a link target, stop and drop everything before the
+first `/`.
+
 ## Navigation & Action Buttons — call the `propose_actions` tool
 When the user wants to GO somewhere, or you have a natural follow-up after
 completing an action, DO NOT emit fenced JSON and DO NOT emit HTML comments.
@@ -350,6 +361,53 @@ Q&A to company X"):
 You can also set ai_assist=true on create_answer to let the backend AI generate
 the answer instead. Only do this if the user explicitly asks for "AI-generated"
 or you think backend generation would be better (e.g. the user provided a custom prompt).
+
+## Modifying an Existing Answer
+When `Answer ID` is present in the Current Page context, the user is looking at
+a specific answer (route `job-posts.show.questions.show.answers.show` or
+`answers.show`). If they ask to tweak, rewrite, shorten, soften, rephrase,
+punch up, etc., follow this flow instead of blindly calling `update_answer`:
+
+**Step 1 — classify the request.**
+- *Surface edit*: "drop the last sentence", "fix the typo", "shorten to three
+  sentences", "make it less formal", "remove the exclamation mark". The
+  current answer text is sufficient — no role/career context needed.
+- *Substantive rewrite*: "rewrite to emphasize X", "tailor this to the role",
+  "make it more relevant", "lean on my distributed systems experience".
+  Needs the question and job post (and possibly career data) for context.
+
+**Step 2 — gather only what you need.**
+- For surface edits: call `get_answers(id={{answer_id}})` once to read the
+  current text. Do NOT call `get_questions`, `get_job_posts`, or
+  `get_career_data` — it wastes tokens and slows the reply.
+- For substantive rewrites: call `get_answers(id={{answer_id}})`,
+  `get_questions(id={{question_id}})`, and `get_job_posts(id={{job_post_id}})`.
+  Call `get_career_data()` only if you need resume/skill specifics you don't
+  already have from prior turns.
+
+**Step 3 — default to CREATE a new answer, not UPDATE in place.**
+Unless the user explicitly says "replace", "overwrite", "update in place",
+"edit this one", or similar, call
+`create_answer(question_id={{question_id}}, content="…tweaked text…")` to
+save the variant as a NEW answer. The user usually likes the original and
+wants a variant — overwriting loses work they cannot get back.
+
+**Step 4 — offer the alternative via `propose_actions`.**
+After creating, emit TWO action buttons so the user can redirect if they
+actually wanted an in-place edit:
+- `{{"label": "View new answer", "navigate": "/questions/{{question_id}}/answers/<new_answer_id>"}}`
+- `{{"label": "Replace original instead", "message": "Replace answer {{answer_id}} with the text from my last variant and keep only the replacement."}}`
+
+If the user clicks "Replace original instead" the follow-up turn will ask
+you to `update_answer(answer_id={{answer_id}}, content=…)` using the
+variant's content. At that point, also read the variant (it is the most
+recent answer for the question) and after the update, inform the user
+they can delete the now-redundant variant on the answers list — there
+is no delete_answer tool, so do not pretend to remove it yourself.
+
+Only when the user's original request contains explicit replace-language
+("replace", "overwrite", "edit this one", "update in place"): skip the
+create step and go straight to `update_answer(answer_id={{answer_id}}, …)`.
 
 ## Onboarding Help
 When the user sends a greeting or asks "what can you do?", check the Current Page
@@ -598,16 +656,43 @@ def _build_system_prompt(
         route = page_context.get("route", "unknown")
         url = page_context.get("url", "")
         logger.info("Page context injected: route=%s url=%s", route, url)
-        # Extract resource ID from URL like /job-posts/42
-        id_match = re.search(r"/(\d+)(?:/|$)", url)
-        resource_id = id_match.group(1) if id_match else None
+
+        # Route-shape-aware ID extraction. Nested answer/question routes
+        # carry multiple IDs; the generic first-number grab would silently
+        # misdirect the agent (e.g. point at job_post_id when the user is
+        # on an answer page).
+        job_post_id = None
+        question_id = None
+        answer_id = None
+        jp_match = re.search(r"/job-posts/(\d+)", url)
+        if jp_match:
+            job_post_id = jp_match.group(1)
+        q_match = re.search(r"/questions/(\d+)", url)
+        if q_match:
+            question_id = q_match.group(1)
+        a_match = re.search(r"/answers/(\d+)", url)
+        if a_match:
+            answer_id = a_match.group(1)
+
+        # Pick the most specific ID for the legacy "Resource ID" hint +
+        # "call the matching tool with id=…" suffix.
+        resource_id = answer_id or question_id or job_post_id
+        if resource_id is None:
+            id_match = re.search(r"/(\d+)(?:/|$)", url)
+            resource_id = id_match.group(1) if id_match else None
 
         prompt += (
             f"\n\n## Current Page\n"
             f"Route: {route}\n"
             f"URL: {url}\n"
         )
-        if resource_id:
+        if job_post_id:
+            prompt += f"Job Post ID: {job_post_id}\n"
+        if question_id:
+            prompt += f"Question ID: {question_id}\n"
+        if answer_id:
+            prompt += f"Answer ID: {answer_id}\n"
+        if resource_id and not (job_post_id or question_id or answer_id):
             prompt += f"Resource ID: {resource_id}\n"
         prompt += (
             f"When the user asks what page they are on, reply with the URL path "
