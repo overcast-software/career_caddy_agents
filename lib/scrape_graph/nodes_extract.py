@@ -285,7 +285,12 @@ class UpdateProfile(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
                     timeout=10.0,
                 )
             except Exception:
-                logger.debug("UpdateProfile: post failed", exc_info=True)
+                # Learning loop — losing this silently means the profile's
+                # success_rate stat stops updating. Warn so it's visible.
+                logger.warning(
+                    "UpdateProfile: update-from-outcome POST failed host=%s scrape_id=%s",
+                    host, state.scrape_id, exc_info=True,
+                )
             _write_selector_candidates(host, state)
         trace_node(state, "UpdateProfile", "ResolveApplyUrl", started)
         return ResolveApplyUrl()
@@ -325,7 +330,12 @@ def _write_selector_candidates(host: str, state: ScrapeGraphState) -> None:
         attrs = row.get("attributes") or {}
         existing = attrs.get("css-selectors") or attrs.get("css_selectors") or {}
     except Exception:
-        logger.debug("UpdateProfile: profile fetch failed", exc_info=True)
+        # If we can't read the current profile we can't safely diff-and-patch.
+        # Warn: this is the path by which new selector signals get lost.
+        logger.warning(
+            "UpdateProfile: profile fetch failed host=%s",
+            host, exc_info=True,
+        )
         return
 
     updated = dict(existing)
@@ -358,7 +368,12 @@ def _write_selector_candidates(host: str, state: ScrapeGraphState) -> None:
             timeout=10.0,
         )
     except Exception:
-        logger.debug("UpdateProfile: PATCH profile failed", exc_info=True)
+        # Final write-back of graduated selectors. If this fails silently
+        # the probation gate resets next run and selectors never stick.
+        logger.warning(
+            "UpdateProfile: PATCH profile failed profile_id=%s",
+            profile_id, exc_info=True,
+        )
 
 
 def _apply_probation(

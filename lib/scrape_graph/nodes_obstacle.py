@@ -79,7 +79,12 @@ class DetectObstacle(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no
             text = await page.inner_text("body")
             walled = bool(_detect_login_wall(text))
         except Exception:
-            pass
+            # Changes routing — if detection itself fails we fall through to
+            # Capture. Loud so we notice when a host's DOM breaks our reader.
+            logger.warning(
+                "DetectObstacle: login-wall read failed scrape_id=%s",
+                state.scrape_id, exc_info=True,
+            )
         if not walled:
             trace_node(state, "DetectObstacle", "Capture", started)
             return Capture()
@@ -108,11 +113,22 @@ class ObstacleRememberMe(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
         if page:
             try:
                 from mcp_servers.browser_server import _try_rememberme_reauth
+                # _try_rememberme_reauth expects profile_selector: str | None,
+                # so extract the graduated obstacle_click_selector rather than
+                # passing the whole profile dict.
+                profile = state.profile or {}
+                selector = profile.get("obstacle_click_selector") if isinstance(profile, dict) else None
                 succeeded = bool(
-                    await _try_rememberme_reauth(page, (state.profile or {}))
+                    await _try_rememberme_reauth(
+                        page, profile_selector=selector if isinstance(selector, str) else None,
+                    )
                 )
             except Exception:
-                logger.debug("ObstacleRememberMe failed", exc_info=True)
+                # Changes routing to ObstacleWaitRetry. Worth a warning.
+                logger.warning(
+                    "ObstacleRememberMe failed scrape_id=%s",
+                    state.scrape_id, exc_info=True,
+                )
         state.obstacle_history.append(
             ObstacleAttempt(node="ObstacleRememberMe", succeeded=succeeded)
         )
@@ -155,17 +171,54 @@ class ObstacleAgent(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
         state = ctx.state
         succeeded = False
         selector: str | None = None
+        agent_error: str | None = None
         page = getattr(state, "_browser_page", None)
         if page:
             try:
                 from agents.obstacle_agent import run_obstacle_agent
-                result = await run_obstacle_agent(page, state.profile or {})
+                # run_obstacle_agent wants (page, hints: str, page_text: str).
+                # Pulling hints from the profile's interaction_hints field (if
+                # set); page_text is read fresh so the agent sees the state
+                # after any RememberMe/WaitRetry clicks. Contract:
+                #   {"resolved": bool, "actions": [selector, ...], "note": str}
+                try:
+                    page_text = await page.inner_text("body")
+                except Exception:
+                    page_text = ""
+                hints_raw = (state.profile or {}).get("interaction_hints")
+                hints = hints_raw if isinstance(hints_raw, str) else ""
+                result = await run_obstacle_agent(
+                    page, hints=hints, page_text=page_text,
+                )
                 if isinstance(result, dict):
-                    selector = result.get("selector")
-                    succeeded = bool(result.get("cleared"))
+                    actions = result.get("actions") or []
+                    selector = actions[-1] if actions else None
+                    # The agent's "resolved" only reflects whether a click
+                    # landed, not whether the obstacle actually cleared.
+                    # Verify with _detect_login_wall over the post-click
+                    # page text — if the wall is gone, we succeeded.
+                    if bool(result.get("resolved")):
+                        try:
+                            fresh_text = await page.inner_text("body")
+                        except Exception:
+                            fresh_text = page_text
+                        try:
+                            from mcp_servers.browser_server import _detect_login_wall
+                            succeeded = not _detect_login_wall(fresh_text)
+                        except Exception:
+                            # If the detector itself fails, fall back to the
+                            # agent's own signal rather than claiming success.
+                            succeeded = False
                 state.candidate_obstacle_click_selector = selector
-            except Exception:
-                logger.debug("ObstacleAgent failed", exc_info=True)
+            except Exception as exc:
+                # Loud on purpose: this was the silent TypeError that caused
+                # scrape 164 to fall straight through ObstacleAgent → ObstacleFail
+                # in 20 ms without the LLM ever running.
+                agent_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "ObstacleAgent failed scrape_id=%s: %s",
+                    state.scrape_id, agent_error, exc_info=True,
+                )
         state.obstacle_history.append(
             ObstacleAttempt(
                 node="ObstacleAgent",
@@ -174,7 +227,10 @@ class ObstacleAgent(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
             )
         )
         nxt = "DetectObstacle" if succeeded else "ObstacleFail"
-        trace_node(state, "ObstacleAgent", nxt, started)
+        payload = {"selector_tried": selector, "succeeded": succeeded}
+        if agent_error:
+            payload["error"] = agent_error
+        trace_node(state, "ObstacleAgent", nxt, started, payload=payload)
         return DetectObstacle() if succeeded else ObstacleFail()
 
 

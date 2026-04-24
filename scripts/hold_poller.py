@@ -462,6 +462,21 @@ async def main():
         logger.error("CC_API_BASE_URL and CC_API_TOKEN are required")
         sys.exit(1)
 
+    # Loud startup banner — so surprises like
+    #   SCRAPE_GRAPH_MODE=shadow via a forgotten .env.local override
+    # or a wrong base_url are visible before a single scrape runs. Warning
+    # level so it shows under default logging without LOG_LEVEL tweaks.
+    try:
+        from lib.scrape_graph import get_mode as _get_graph_mode
+        graph_mode = _get_graph_mode().value
+    except Exception:
+        graph_mode = "unknown"
+    logger.warning(
+        "poller boot: base_url=%s engine=%s headless=%s attended=%s graph_mode=%s poll_interval=%ds",
+        base_url, args.engine, headless, bool(args.attended),
+        graph_mode, POLL_INTERVAL,
+    )
+
     api = ApiClient(base_url=base_url, token=token)
 
     # Pre-flight: verify the token is accepted before we spin up a browser.
