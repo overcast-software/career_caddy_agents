@@ -399,6 +399,83 @@ def _apply_probation(
     return True
 
 
+def _demote_graduated_selector(
+    host: str, graduated_key: str, *, reason: str,
+) -> None:
+    """Terminal failure handler: roll a graduated selector back to candidate.
+
+    Used by ObstacleFail (and ExtractFail for ready_selector) when a
+    previously-graduated selector apparently stopped working — the DOM
+    drifted, the site redesigned, whatever. Demoting back to candidate
+    with matches=0 means the next run will either re-graduate (if the
+    selector STILL matches, we had a transient) or graduate a replacement
+    (if a new candidate shows up). Saves us from being permanently
+    trapped on a stale selector.
+
+    Silent-fail: the goal is learning-loop hygiene, not a hard dependency.
+    """
+    if not host or not graduated_key:
+        return
+    try:
+        resp = httpx.get(
+            f"{_api_base()}/api/v1/scrape-profiles/",
+            params={"filter[hostname]": host},
+            headers=_api_headers(),
+            timeout=10.0,
+        )
+        payload = resp.json() if resp.status_code == 200 else {}
+        rows = payload.get("data") or []
+        if not rows:
+            return
+        row = rows[0]
+        profile_id = row.get("id")
+        attrs = row.get("attributes") or {}
+        existing = attrs.get("css-selectors") or attrs.get("css_selectors") or {}
+    except Exception:
+        logger.warning(
+            "Demote %s: profile fetch failed host=%s", graduated_key,
+            host, exc_info=True,
+        )
+        return
+
+    stale_selector = existing.get(graduated_key)
+    if not stale_selector:
+        return  # nothing to demote
+
+    updated = dict(existing)
+    updated.pop(graduated_key, None)
+    # Return selector to candidate pool with a fresh count so it has to
+    # re-prove itself over the normal probation threshold. Key by the
+    # canonical candidate name — "obstacle_click_selector" → "_obstacle_click_candidate".
+    candidate_key = f"_{graduated_key.rsplit('_selector', 1)[0]}_candidate"
+    updated[candidate_key] = {"selector": stale_selector, "matches": 0}
+
+    if not profile_id:
+        return
+    try:
+        httpx.patch(
+            f"{_api_base()}/api/v1/scrape-profiles/{profile_id}/",
+            json={
+                "data": {
+                    "type": "scrape-profile",
+                    "id": str(profile_id),
+                    "attributes": {"css-selectors": updated},
+                }
+            },
+            headers={**_api_headers(), "Content-Type": "application/vnd.api+json"},
+            timeout=10.0,
+        )
+        logger.info(
+            "Demoted %s on %s (reason=%s): %s → candidate pool",
+            graduated_key, host, reason, stale_selector,
+        )
+    except Exception:
+        logger.warning(
+            "Demote %s: PATCH failed profile_id=%s", graduated_key,
+            profile_id, exc_info=True,
+        )
+
+
 @dataclass
 class ResolveApplyUrl(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     """Phase 1b: no-op. Phase 2 PROJ lands the real resolver here."""

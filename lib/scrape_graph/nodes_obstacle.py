@@ -176,27 +176,37 @@ class ObstacleAgent(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
         if page:
             try:
                 from agents.obstacle_agent import run_obstacle_agent
-                # run_obstacle_agent wants (page, hints: str, page_text: str).
-                # Pulling hints from the profile's interaction_hints field (if
-                # set); page_text is read fresh so the agent sees the state
-                # after any RememberMe/WaitRetry clicks. Contract:
-                #   {"resolved": bool, "actions": [selector, ...], "note": str}
+                # Pre-fetch text and a viewport screenshot. The screenshot
+                # is best-effort — if Playwright can't take one (detached
+                # page, stale frame) we fall back to text-only and let
+                # the LLM reason from that. Contract:
+                #   {"resolved": bool, "actions": [selector, ...],
+                #    "verified": bool, "note": str}
                 try:
                     page_text = await page.inner_text("body")
                 except Exception:
                     page_text = ""
+                try:
+                    screenshot_bytes = await page.screenshot(full_page=False)
+                except Exception:
+                    screenshot_bytes = None
                 hints_raw = (state.profile or {}).get("interaction_hints")
                 hints = hints_raw if isinstance(hints_raw, str) else ""
                 result = await run_obstacle_agent(
-                    page, hints=hints, page_text=page_text,
+                    page,
+                    hints=hints,
+                    page_text=page_text,
+                    screenshot_bytes=screenshot_bytes,
                 )
                 if isinstance(result, dict):
                     actions = result.get("actions") or []
                     selector = actions[-1] if actions else None
-                    # The agent's "resolved" only reflects whether a click
-                    # landed, not whether the obstacle actually cleared.
-                    # Verify with _detect_login_wall over the post-click
-                    # page text — if the wall is gone, we succeeded.
+                    # Agent now verifies internally via its own
+                    # verify_resolved() tool. result["resolved"] already
+                    # encodes (at-least-one-click) AND (last-verification-
+                    # True). Re-check from the caller side as belt-and-
+                    # suspenders — if the agent's verification raced a
+                    # transient intermediate state we still catch it.
                     if bool(result.get("resolved")):
                         try:
                             fresh_text = await page.inner_text("body")
@@ -206,9 +216,9 @@ class ObstacleAgent(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
                             from mcp_servers.browser_server import _detect_login_wall
                             succeeded = not _detect_login_wall(fresh_text)
                         except Exception:
-                            # If the detector itself fails, fall back to the
-                            # agent's own signal rather than claiming success.
-                            succeeded = False
+                            # Trust the agent's own verification if the
+                            # caller-side detector fails outright.
+                            succeeded = bool(result.get("verified"))
                 state.candidate_obstacle_click_selector = selector
             except Exception as exc:
                 # Loud on purpose: this was the silent TypeError that caused
@@ -244,6 +254,27 @@ class ObstacleFail(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-r
         state = ctx.state
         state.outcome = "failure"
         state.failure_reason = state.failure_reason or "login_wall"
+
+        # Learning-loop closing touch: if this host had a graduated
+        # obstacle_click_selector AND we still couldn't clear the wall,
+        # the selector has drifted. Demote it back to candidate so the
+        # next run gets a fresh shot via RememberMe's heuristic list or
+        # the agent.
+        try:
+            from urllib.parse import urlparse
+            from .nodes_extract import _demote_graduated_selector
+            host = urlparse(state.canonical_url or state.submitted_url or "").hostname or ""
+            if host:
+                _demote_graduated_selector(
+                    host, "obstacle_click_selector",
+                    reason="obstacle_fail",
+                )
+        except Exception:
+            logger.warning(
+                "ObstacleFail: selector demotion failed scrape_id=%s",
+                state.scrape_id, exc_info=True,
+            )
+
         _patch_scrape_status(state.scrape_id, "failed", note=state.failure_reason)
         trace_node(state, "ObstacleFail", "End", started)
         return End({
