@@ -107,6 +107,7 @@ class ScrapeGraphState:
     # URL resolution
     final_url: Optional[str] = None
     canonical_url: Optional[str] = None
+    rewritten_url: Optional[str] = None  # set by Navigate when profile.url_rewrites fires
     did_redirect: bool = False
 
     # Scrape-side

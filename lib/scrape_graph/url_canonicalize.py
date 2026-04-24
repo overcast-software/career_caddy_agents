@@ -76,3 +76,39 @@ def urls_differ(submitted: str, landed: str) -> bool:
     and compared after the tracker-param strip.
     """
     return canonicalize_url(submitted) != canonicalize_url(landed)
+
+
+def apply_url_rewrites(url: str, rules: list | None) -> str:
+    """Apply host-specific regex rewrites from a ScrapeProfile.
+
+    `rules` is the profile's `url_rewrites` field — a list of
+    `{"match": <regex>, "rewrite": <replacement>}` dicts. The first
+    rule whose `match` regex matches the URL wins; `re.sub` semantics
+    apply, so backrefs like `\\1` work in `rewrite`.
+
+    Invalid regexes are skipped silently (never crash the graph on a
+    bad profile). A rule that doesn't alter the URL is treated as a
+    no-op and the next rule is tried.
+
+    Motivating case: Indeed tracker URLs of the form
+    `indeed.com/?vjk=<jk>` land on the logged-in homepage instead of
+    the job page. Rewriting to `indeed.com/viewjob?jk=<jk>` before
+    Navigate fixes that at the source — no content-quality gate
+    needed.
+    """
+    if not url or not rules:
+        return url
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        pattern = rule.get("match")
+        replacement = rule.get("rewrite")
+        if not pattern or replacement is None:
+            continue
+        try:
+            new_url, n = re.subn(pattern, replacement, url)
+        except re.error:
+            continue
+        if n > 0 and new_url != url:
+            return new_url
+    return url

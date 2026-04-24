@@ -103,6 +103,10 @@ class EvaluateExtraction(BaseNode[ScrapeGraphState, None, dict]):
     pass
 
 
+class ValidateExtraction(BaseNode[ScrapeGraphState, None, dict]):
+    pass
+
+
 class PersistJobPost(BaseNode[ScrapeGraphState, None, dict]):
     pass
 
@@ -190,7 +194,7 @@ class Tier3Sonnet(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-re
 class EvaluateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> Union[PersistJobPost, Tier2Haiku, Tier3Sonnet, ExtractFail]:
+    ) -> Union[ValidateExtraction, Tier2Haiku, Tier3Sonnet, ExtractFail]:
         started = time.time()
         state = ctx.state
         parsed = state.parsed or {}
@@ -211,8 +215,8 @@ class EvaluateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
         tier3_enabled = os.environ.get("SCRAPE_GRAPH_ENABLE_TIER3") == "1"
 
         if passed:
-            trace_node(state, "EvaluateExtraction", "PersistJobPost", started)
-            return PersistJobPost()
+            trace_node(state, "EvaluateExtraction", "ValidateExtraction", started)
+            return ValidateExtraction()
         if last_tier in ("tier0", "tier1"):
             trace_node(state, "EvaluateExtraction", "Tier2Haiku", started)
             return Tier2Haiku()
@@ -221,6 +225,75 @@ class EvaluateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
             return Tier3Sonnet()
         trace_node(state, "EvaluateExtraction", "ExtractFail", started)
         return ExtractFail()
+
+
+# Loading-shell fingerprints — substrings that, when several appear in
+# the visible page text, signal a never-hydrated SPA shell rather than
+# real content. Anything below the source-word-count floor is rejected
+# outright; these catch pages that are long but empty (cookie notices,
+# CSS errors, Salesforce Lightning / Workday / Oracle Cloud bootstraps).
+_LOADING_SHELL_PHRASES = (
+    "sorry to interrupt",
+    "css error",
+    "cookieenabled",
+    "enable cookies",
+    "please enable javascript",
+    "this page requires javascript",
+    "wd-body-loading",  # Workday
+)
+_LOADING_SHELL_MIN_HITS = 2
+
+_SOURCE_MIN_WORDS = 40
+
+
+@dataclass
+class ValidateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
+    """Content-quality gate between EvaluateExtraction-passed and PersistJobPost.
+
+    EvaluateExtraction only asks "does the LLM output *look* like job
+    data?" — that check was fooled by a Salesforce loading shell
+    (scrape 172) where the LLM hallucinated a plausible job from
+    `Loading…Sorry to interrupt` text. This node adds invariants the
+    LLM can't judge: is the *source* material big enough to contain a
+    real posting? Does it match known SPA-shell fingerprints?
+
+    Failing here routes to ExtractFail so PR 35's debug-artifact
+    invariant fires — we get a screenshot + DOM snapshot on the
+    scrape row instead of silently poisoning the ScrapeProfile
+    learning loop with a fake success.
+    """
+
+    async def run(
+        self, ctx: GraphRunContext[ScrapeGraphState, None]
+    ) -> Union[PersistJobPost, ExtractFail]:
+        started = time.time()
+        state = ctx.state
+        source = (state.job_content or "").strip()
+        reasons: list[str] = []
+
+        if len(source.split()) < _SOURCE_MIN_WORDS:
+            reasons.append("source_too_short")
+
+        lowered = source.lower()
+        hits = sum(1 for p in _LOADING_SHELL_PHRASES if p in lowered)
+        if hits >= _LOADING_SHELL_MIN_HITS:
+            reasons.append("loading_shell_fingerprint")
+
+        state.evaluation = {
+            **(state.evaluation or {}),
+            "validate_passed": not reasons,
+            "validate_reasons": reasons,
+        }
+
+        if reasons:
+            state.failure_reason = f"validate_failed: {','.join(reasons)}"
+            trace_node(
+                state, "ValidateExtraction", "ExtractFail", started,
+                {"reasons": reasons, "source_words": len(source.split())},
+            )
+            return ExtractFail()
+        trace_node(state, "ValidateExtraction", "PersistJobPost", started)
+        return PersistJobPost()
 
 
 @dataclass

@@ -12,7 +12,7 @@ from lib.scrape_graph import (
     canonicalize_url,
     get_mode,
 )
-from lib.scrape_graph.url_canonicalize import urls_differ
+from lib.scrape_graph.url_canonicalize import apply_url_rewrites, urls_differ
 
 
 # ----------------------------------------------------------------------
@@ -56,6 +56,44 @@ def test_urls_differ_tracker_to_different_destination():
     tracker = "https://www.linkedin.com/comm/jobs/view/1?trackingId=abc"
     landed = "https://boards.greenhouse.io/acme/jobs/42"
     assert urls_differ(tracker, landed) is True
+
+
+# ----------------------------------------------------------------------
+# Profile-driven URL rewrites
+# ----------------------------------------------------------------------
+
+
+def test_url_rewrite_indeed_vjk_to_viewjob():
+    """Real case: Indeed `?vjk=X` tracker lands on the homepage
+    instead of the job. Rewriting to `/viewjob?jk=X` fixes scrape 175.
+    """
+    rules = [
+        {
+            "match": r"^https?://(?:www\.)?indeed\.com/\?[^#]*\bvjk=([A-Za-z0-9]+)",
+            "rewrite": r"https://www.indeed.com/viewjob?jk=\1",
+        }
+    ]
+    url = "https://www.indeed.com/?advn=4035278867423431&vjk=d6b7eeeee82aeb6b"
+    assert apply_url_rewrites(url, rules) == "https://www.indeed.com/viewjob?jk=d6b7eeeee82aeb6b"
+
+
+def test_url_rewrite_no_match_returns_input_unchanged():
+    rules = [{"match": r"does-not-match", "rewrite": "/other"}]
+    assert apply_url_rewrites("https://x.com/job/1", rules) == "https://x.com/job/1"
+
+
+def test_url_rewrite_skips_invalid_regex():
+    rules = [
+        {"match": "[unclosed", "rewrite": "wont-fire"},
+        {"match": r"https://x\.com/a", "rewrite": "https://x.com/b"},
+    ]
+    assert apply_url_rewrites("https://x.com/a", rules) == "https://x.com/b"
+
+
+def test_url_rewrite_none_and_empty():
+    assert apply_url_rewrites("https://x.com/a", None) == "https://x.com/a"
+    assert apply_url_rewrites("https://x.com/a", []) == "https://x.com/a"
+    assert apply_url_rewrites("", [{"match": ".*", "rewrite": "x"}]) == ""
 
 
 # ----------------------------------------------------------------------

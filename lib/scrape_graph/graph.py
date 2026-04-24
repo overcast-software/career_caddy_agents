@@ -22,6 +22,7 @@ from .nodes_extract import (
     Tier2Haiku,
     Tier3Sonnet,
     UpdateProfile,
+    ValidateExtraction,
 )
 from .nodes_obstacle import (
     DetectObstacle,
@@ -53,8 +54,8 @@ __all_nodes__ = (
     DuplicateShortCircuit, WaitReadySelector, SettleWait, ExpandTruncations,
     Capture, PersistScrape, DetectObstacle, ObstacleRememberMe,
     ObstacleWaitRetry, ObstacleAgent, ObstacleFail, StartExtract, Tier0CSS,
-    Tier1Mini, Tier2Haiku, Tier3Sonnet, EvaluateExtraction, PersistJobPost,
-    UpdateProfile, ResolveApplyUrl, ExtractFail,
+    Tier1Mini, Tier2Haiku, Tier3Sonnet, EvaluateExtraction, ValidateExtraction,
+    PersistJobPost, UpdateProfile, ResolveApplyUrl, ExtractFail,
 )
 
 
@@ -68,13 +69,13 @@ _SCRAPE_NODES = [
     DetectObstacle, ObstacleRememberMe, ObstacleWaitRetry, ObstacleAgent,
     ObstacleFail, Capture, PersistScrape,
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
-    EvaluateExtraction, PersistJobPost, UpdateProfile, ResolveApplyUrl,
-    ExtractFail,
+    EvaluateExtraction, ValidateExtraction, PersistJobPost, UpdateProfile,
+    ResolveApplyUrl, ExtractFail,
 ]
 _EXTRACT_NODES = [
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
-    EvaluateExtraction, PersistJobPost, UpdateProfile, ResolveApplyUrl,
-    ExtractFail,
+    EvaluateExtraction, ValidateExtraction, PersistJobPost, UpdateProfile,
+    ResolveApplyUrl, ExtractFail,
 ]
 
 _SCRAPE_GRAPH = Graph(nodes=_SCRAPE_NODES, state_type=ScrapeGraphState)
@@ -277,9 +278,20 @@ NODE_META: dict[str, dict[str, str]] = {
     "EvaluateExtraction": {
         "group": "extract", "label": "Evaluate extraction",
         "description": (
-            "Quality gate on the parsed output: checks for title, company, "
-            "and thin-description. Pass → PersistJobPost; fail → next tier "
-            "or ExtractFail."
+            "LLM-output quality gate: checks for title, company, and "
+            "thin-description. Pass → ValidateExtraction; fail → next "
+            "tier or ExtractFail."
+        ),
+    },
+    "ValidateExtraction": {
+        "group": "extract", "label": "Validate extraction",
+        "description": (
+            "Content-quality gate between EvaluateExtraction-passed and "
+            "PersistJobPost. Enforces source-text minimum word count and "
+            "loading-shell fingerprints (Salesforce Lightning, Workday, "
+            "cookie/JS notices). Catches LLM hallucinations off a never-"
+            "hydrated SPA bootstrap. Fail → ExtractFail so the debug-"
+            "artifact invariant fires."
         ),
     },
     "PersistJobPost": {

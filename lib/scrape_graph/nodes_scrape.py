@@ -20,7 +20,7 @@ from pydantic_graph import BaseNode, End, GraphRunContext
 
 from .state import GraphMode, ScrapeGraphState, get_mode
 from .tracing import trace_node
-from .url_canonicalize import canonicalize_url, urls_differ
+from .url_canonicalize import apply_url_rewrites, canonicalize_url, urls_differ
 
 logger = logging.getLogger(__name__)
 
@@ -136,9 +136,20 @@ class Navigate(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef
         started = time.time()
         state = ctx.state
         page = getattr(state, "_browser_page", None)
+        # Host-specific rewrites happen BEFORE navigation so we land on
+        # the job page directly. Profile was just loaded by LoadProfile.
+        # state.profile may be the full profile (dict) or just the
+        # css_selectors (legacy callers); accept either shape.
+        target_url = state.submitted_url
+        rewrites = None
+        if isinstance(state.profile, dict):
+            rewrites = state.profile.get("url_rewrites")
+        target_url = apply_url_rewrites(target_url, rewrites)
+        if target_url != state.submitted_url:
+            state.rewritten_url = target_url
         if page is not None:
             try:
-                await page.goto(state.submitted_url, wait_until="load", timeout=60_000)
+                await page.goto(target_url, wait_until="load", timeout=60_000)
                 state.final_url = page.url
             except Exception as exc:
                 state.failure_reason = f"navigate_failed: {exc}"

@@ -400,6 +400,15 @@ def _parse_args() -> argparse.Namespace:
         help="Launch a single headed browser with per-domain tabs. Solve captchas "
              "once in the open tabs; state persists across scrapes. Implies --headed.",
     )
+    parser.add_argument(
+        "--attended-delay", type=int, nargs="?", const=5, default=0, metavar="N",
+        help="Seconds to wait after the browser launches before preseeding "
+             "tabs (attended mode only). Gives you a chance to move the "
+             "first Camoufox window to a dedicated workspace before the "
+             "~10 preseed tabs spawn. Omit the flag for no delay; pass "
+             "--attended-delay (no value) for 5 seconds; pass a number "
+             "to override. No-op when --attended is off.",
+    )
     return parser.parse_args()
 
 
@@ -517,6 +526,19 @@ async def main():
             async with launch_browser(get_engine(), headless=False) as browser:
                 _RESIDENT = ResidentBrowser(browser)
                 preseed = _attended_preseed_domains()
+                # Give the user a chance to move the first Camoufox window
+                # (or set up compositor rules, move monitors, whatever)
+                # before the preseed burst spawns another ~10 windows. Opt-in
+                # via --attended-delay N; silent when N<=0.
+                if args.attended_delay and args.attended_delay > 0:
+                    for remaining in range(args.attended_delay, 0, -1):
+                        sys.stderr.write(
+                            f"\rattended: preseed in {remaining}s "
+                            f"({len(preseed)} tabs)... "
+                        )
+                        sys.stderr.flush()
+                        await asyncio.sleep(1)
+                    sys.stderr.write("\n")
                 logger.info("Attended: preseeding tabs for %s", preseed)
                 await _RESIDENT.preseed(preseed)
                 logger.info(
