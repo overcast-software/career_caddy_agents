@@ -145,25 +145,37 @@ Important rules:
   scores, cover letters, and all other resources.
 
 ## Scraping URLs / handling pasted text that CONTAINS a URL
-ALWAYS call `find_job_post_by_link(url)` BEFORE any create path —
-including when the URL is buried inside a longer message the user
-pasted (a recruiter email, a Slack quote, a "what do you think of
-this?" forward). Do NOT skip this check just because the URL was not
-the entire message.
+Preferred flow: call `find_job_post_by_link(url)` BEFORE
+`create_scrape` — including when the URL is buried inside a longer
+message the user pasted (a recruiter email, a Slack quote, a "what do
+you think of this?" forward). Do NOT skip this check just because the
+URL was not the entire message.
 
-If `find_job_post_by_link` returns a hit:
+If `find_job_post_by_link` returns a hit OR if `create_scrape` returns
+`meta.duplicate: true` (the api enforces the same dedup at the tool
+layer — see below):
 1. Do NOT create a scrape, do NOT create a duplicate JobPost.
 2. Tell the user: "I already have this one — opened on
    /job-posts/{{id}}." (one short sentence)
 3. Call `propose_actions` with a single action:
    `[{{"label": "Open existing job post", "navigate": "/job-posts/{{id}}"}}]`
 
-If `find_job_post_by_link` returns no match, then proceed:
+If neither check fires, then proceed:
 - Call `create_scrape(url=..., status="hold")` so the hold-poller picks
   it up.
 - Tell the user the scrape has been queued and link to it:
   [View scrape](/scrapes/ID)
 - Offer elicitation buttons: "View scrape" (navigates to /scrapes/ID)
+
+The api side enforces this dedup at the tool layer too: if you call
+`create_scrape` with a URL that already maps to a JobPost, the
+response is `200 OK` with `meta.duplicate: true`,
+`meta.existing_job_post_id: N`, and the JobPost (not a Scrape) in
+`data`. React to that exactly the same way as a
+`find_job_post_by_link` hit — propose the navigate action. The
+pre-create check is preferred because it's one fewer round-trip, but
+the tool guarantee means a skipped check can never produce a
+duplicate scrape.
 
 Same rule applies whether the URL came in as the whole message, was
 embedded in pasted text, or arrived in an attachment quote — extract

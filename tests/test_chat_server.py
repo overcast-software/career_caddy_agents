@@ -80,3 +80,13 @@ class TestChatSystemPromptDuplicateRule:
         body = self._prompt()
         assert "propose_actions" in body
         assert "/job-posts/" in body
+
+    def test_documents_api_side_enforcement(self):
+        """The prompt must reflect that create_scrape itself enforces
+        dedup-by-link. A skipped pre-check cannot produce a duplicate
+        because the api returns meta.duplicate=true. Documenting this in
+        the prompt lets the agent react to the response shape rather than
+        rely on remembering the discipline."""
+        body = self._prompt()
+        assert "meta.duplicate" in body
+        assert "existing_job_post_id" in body
