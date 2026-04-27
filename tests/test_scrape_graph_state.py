@@ -7,10 +7,8 @@ endpoint is live.
 from __future__ import annotations
 
 from lib.scrape_graph import (
-    GraphMode,
     ScrapeGraphState,
     canonicalize_url,
-    get_mode,
 )
 from lib.scrape_graph.url_canonicalize import apply_url_rewrites, urls_differ
 
@@ -94,33 +92,6 @@ def test_url_rewrite_none_and_empty():
     assert apply_url_rewrites("https://x.com/a", None) == "https://x.com/a"
     assert apply_url_rewrites("https://x.com/a", []) == "https://x.com/a"
     assert apply_url_rewrites("", [{"match": ".*", "rewrite": "x"}]) == ""
-
-
-# ----------------------------------------------------------------------
-# Mode reading
-# ----------------------------------------------------------------------
-
-
-def test_mode_defaults_primary(monkeypatch):
-    """Post-cutover default is PRIMARY — the pydantic-graph pipeline
-    runs for every scrape unless an operator explicitly opts out."""
-    monkeypatch.delenv("SCRAPE_GRAPH_MODE", raising=False)
-    assert get_mode() is GraphMode.PRIMARY
-
-
-def test_mode_reads_env(monkeypatch):
-    monkeypatch.setenv("SCRAPE_GRAPH_MODE", "shadow")
-    assert get_mode() is GraphMode.SHADOW
-
-
-def test_mode_off_kill_switch(monkeypatch):
-    monkeypatch.setenv("SCRAPE_GRAPH_MODE", "off")
-    assert get_mode() is GraphMode.OFF
-
-
-def test_mode_invalid_falls_back_to_primary(monkeypatch):
-    monkeypatch.setenv("SCRAPE_GRAPH_MODE", "nope")
-    assert get_mode() is GraphMode.PRIMARY
 
 
 # ----------------------------------------------------------------------

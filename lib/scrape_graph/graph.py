@@ -298,9 +298,7 @@ NODE_META: dict[str, dict[str, str]] = {
         "group": "extract", "label": "Persist job post",
         "description": (
             "POSTs parsed data to /api/v1/scrapes/:id/persist-extraction/ "
-            "which handles dedup, stub-upgrade, and posted_date fallback. "
-            "Suppressed in SCRAPE_GRAPH_MODE=shadow so parity testing "
-            "never clobbers legacy data."
+            "which handles dedup, stub-upgrade, and posted_date fallback."
         ),
     },
     "UpdateProfile": {

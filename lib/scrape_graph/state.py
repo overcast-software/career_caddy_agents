@@ -6,38 +6,8 @@ tracing payload and d3 trace UI.
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, Optional
-
-
-class GraphMode(str, Enum):
-    """Feature-flag modes for the scrape-graph runtime.
-
-    - OFF: legacy pipeline runs unchanged; graph code never executes.
-    - SHADOW: legacy runs; graph runs afterwards on the same input but
-      does NOT persist a JobPost. Used to verify parity before cutover.
-    - PRIMARY: graph is authoritative; legacy runs only as fallback
-      when the graph terminates in ExtractFail or ObstacleFail.
-    """
-
-    OFF = "off"
-    SHADOW = "shadow"
-    PRIMARY = "primary"
-
-
-def get_mode() -> GraphMode:
-    """Read SCRAPE_GRAPH_MODE from env. Defaults to PRIMARY post-cutover
-    — the poller runs the pydantic-graph pipeline for every scrape.
-    Set =off= as a kill-switch to fall back to the legacy imperative
-    scrape_page path (still wired in hold_poller._process_scrape_legacy
-    while we soak the primary rollout)."""
-    raw = (os.environ.get("SCRAPE_GRAPH_MODE") or "primary").strip().lower()
-    try:
-        return GraphMode(raw)
-    except ValueError:
-        return GraphMode.PRIMARY
 
 
 @dataclass

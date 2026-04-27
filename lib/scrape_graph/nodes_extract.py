@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic_graph import BaseNode, End, GraphRunContext
 
-from .state import GraphMode, ScrapeGraphState, TierAttempt, get_mode
+from .state import ScrapeGraphState, TierAttempt
 from .tracing import trace_node
 
 logger = logging.getLogger(__name__)
@@ -303,12 +303,6 @@ class PersistJobPost(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no
     ) -> Union[UpdateProfile, ExtractFail]:
         started = time.time()
         state = ctx.state
-        # Shadow mode: record the trace transition but skip the persist
-        # POST so we don't clobber legacy data during parity testing.
-        if get_mode() is GraphMode.SHADOW:
-            logger.info("PersistJobPost[shadow]: suppressed for scrape %s", state.scrape_id)
-            trace_node(state, "PersistJobPost", "UpdateProfile", started, {"suppressed": "shadow"})
-            return UpdateProfile()
         try:
             resp = httpx.post(
                 f"{_api_base()}/api/v1/scrapes/{state.scrape_id}/persist-extraction/",
@@ -335,9 +329,6 @@ class UpdateProfile(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
     ) -> ResolveApplyUrl:
         started = time.time()
         state = ctx.state
-        if get_mode() is GraphMode.SHADOW:
-            trace_node(state, "UpdateProfile", "ResolveApplyUrl", started, {"suppressed": "shadow"})
-            return ResolveApplyUrl()
         host = (urlparse(state.canonical_url or state.submitted_url or "").hostname or "").lower()
         if host.startswith("www."):
             host = host[4:]
@@ -374,13 +365,9 @@ _OBSTACLE_PROBATION = 2
 
 
 def _write_selector_candidates(host: str, state: ScrapeGraphState) -> None:
-    """Apply the probation-gated selector writes the legacy poller used
-    to do in hold_poller._update_profile_from_results. Reads the
-    current profile, diffs against the scrape's candidates, and PATCHes
-    via the api's scrape-profiles endpoint.
-
-    Shadow-mode callers are already gated out before reaching this
-    function; we run unconditionally here.
+    """Apply the probation-gated selector writes. Reads the current
+    profile, diffs against the scrape's candidates, and PATCHes via the
+    api's scrape-profiles endpoint.
     """
     discovered = state.discovered_selectors
     cand_ready = state.candidate_ready_selector

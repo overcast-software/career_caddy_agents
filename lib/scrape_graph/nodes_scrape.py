@@ -18,7 +18,7 @@ from typing import Union
 import httpx
 from pydantic_graph import BaseNode, End, GraphRunContext
 
-from .state import GraphMode, ScrapeGraphState, get_mode
+from .state import ScrapeGraphState
 from .tracing import trace_node
 from .url_canonicalize import apply_url_rewrites, canonicalize_url, urls_differ
 
@@ -452,7 +452,7 @@ def _patch_scrape_status(scrape_id: int, status: str, note: str | None = None) -
     """Helper used by terminal nodes to close out the scrape row with
     the frontend-visible status the poller-polling UI watches for
     ({completed, failed})."""
-    if not scrape_id or get_mode() is GraphMode.SHADOW:
+    if not scrape_id:
         return
     attributes = {"status": status}
     if note is not None:

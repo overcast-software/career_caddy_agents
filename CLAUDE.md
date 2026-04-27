@@ -186,14 +186,6 @@ once Phase 1d ships. The graph itself has no knowledge of who called:
   `source="email"`. cc_auto is a caller, not a participant; it runs
   as its own process and never imports scrape_graph directly.
 
-**Feature flag**: `SCRAPE_GRAPH_MODE = off | shadow | primary`
-- `off` (default) — legacy pipeline runs; graph code is imported but
-  never executed.
-- `shadow` — legacy runs; graph runs after on the same scrape with
-  `PersistJobPost` suppressed. Used to verify parity before cutover.
-- `primary` — graph is authoritative; legacy runs only as fallback
-  when the graph terminates in `ExtractFail` / `ObstacleFail`.
-
 **Per-tier model overrides**:
 - `SCRAPE_GRAPH_TIER1_MODEL` (default `openai:gpt-4o-mini`)
 - `SCRAPE_GRAPH_TIER2_MODEL` (default `anthropic:claude-haiku-4-5`)

@@ -24,7 +24,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib.api_tools import (
     ApiClient, get_scrapes, get_scrape_profile, update_scrape,
-    update_scrape_profile, upload_screenshot,
 )
 from lib.browser.engine import (
     configure as configure_engine,
@@ -33,7 +32,6 @@ from lib.browser.engine import (
 )
 from lib.browser.resident import ResidentBrowser
 from lib.url_unwrap import unwrap_url
-from mcp_servers.browser_server import scrape_page, scrape_page_attended
 
 # Module-level resident browser; set by the attended main() before the poll loop.
 _RESIDENT: ResidentBrowser | None = None
@@ -80,15 +78,10 @@ async def _fetch_profile(api: ApiClient, hostname: str) -> dict | None:
 async def process_scrape(api: ApiClient, scrape: dict) -> bool:
     """Process a single hold scrape through the pydantic-graph pipeline.
 
-    Primary-mode cutover: the poller no longer calls scrape_page /
-    _scrape_on_page imperatively. It opens a Playwright page, builds a
-    ScrapeGraphState, and hands control to run_scrape_graph. Each graph
-    node writes its own trace + owns its side effects (PATCH scrape,
-    upload screenshot, push profile selectors, create JobPost). The
-    poller is now a thin dispatcher that just feeds URLs in.
-
-    Shadow/off modes fall back to the legacy path below — a kill-switch
-    for emergencies. We'll prune that branch once primary has soaked.
+    The poller is a thin dispatcher: it opens a Playwright page, builds
+    a ScrapeGraphState, and hands control to run_scrape_graph. Each
+    graph node writes its own trace + owns its side effects (PATCH
+    scrape, upload screenshot, push profile selectors, create JobPost).
     """
     scrape_id = int(scrape["id"])
     attrs = scrape.get("attributes", {})
@@ -114,18 +107,13 @@ async def process_scrape(api: ApiClient, scrape: dict) -> bool:
         logger.info("Scrape %s: no profile for %s", scrape_id, hostname)
 
     await update_scrape(api, scrape_id, status="running", note="Poller picked up")
-
-    from lib.scrape_graph import GraphMode, get_mode
-    if get_mode() is GraphMode.OFF:
-        return await _process_scrape_legacy(api, scrape_id, url, hostname, profile)
-
-    return await _process_scrape_primary(api, scrape_id, url, hostname, profile)
+    return await _run_graph(api, scrape_id, url, hostname, profile)
 
 
-async def _process_scrape_primary(
+async def _run_graph(
     api: ApiClient, scrape_id: int, url: str, hostname: str, profile: dict | None,
 ) -> bool:
-    """Primary-mode dispatch: run pydantic-graph against a live page."""
+    """Run the pydantic-graph against a live Playwright page."""
     from lib.scrape_graph import ScrapeGraphState
     from lib.scrape_graph.runner import run_scrape_graph
 
@@ -194,173 +182,6 @@ def _is_headless() -> bool:
     """Respect the engine's configured headless flag."""
     from lib.browser.engine import get_headless
     return bool(get_headless())
-
-
-async def _process_scrape_legacy(
-    api: ApiClient, scrape_id: int, url: str, hostname: str, profile: dict | None,
-) -> bool:
-    """Kill-switch path: legacy imperative scrape. Active only when
-    SCRAPE_GRAPH_MODE=off. Prune once primary has soaked."""
-    try:
-        if _RESIDENT is not None:
-            result_json = await scrape_page_attended(_RESIDENT, url, profile=profile)
-        else:
-            result_json = await scrape_page(url, profile=profile)
-        result = json.loads(result_json)
-
-        if result.get("error") == "blocked_page_detected":
-            msg = result.get("message", "Blocked page detected")
-            logger.warning("Scrape %s: %s", scrape_id, msg)
-            await update_scrape(api, scrape_id, status="failed", note=msg)
-            return False
-
-        if result.get("error") == "login_wall_detected":
-            msg = result.get("message", "Login wall detected")
-            logger.warning("Scrape %s: %s", scrape_id, msg)
-            await update_scrape(api, scrape_id, status="failed", note=msg)
-            return False
-
-        if result.get("error"):
-            logger.error("Scrape %s error: %s", scrape_id, result["error"])
-            await update_scrape(api, scrape_id, status="failed", note=result["error"])
-            return False
-
-        content = result.get("content", "")
-        if not content.strip():
-            logger.warning("Scrape %s: empty content", scrape_id)
-            await update_scrape(api, scrape_id, status="failed", note="Empty content returned")
-            return False
-
-        screenshot_name = result.get("screenshot")
-        if screenshot_name:
-            from mcp_servers.browser_server import SCREENSHOT_DIR
-            screenshot_path = SCREENSHOT_DIR / screenshot_name
-            if screenshot_path.exists():
-                await upload_screenshot(api, scrape_id, screenshot_path)
-                screenshot_path.unlink()
-                logger.info("Screenshot uploaded for scrape %s", scrape_id)
-
-        await update_scrape(api, scrape_id, status="completed", job_content=content,
-                            note=f"Content delivered ({len(content)} chars)")
-        logger.info("Scrape %s: content delivered (%d chars), API will extract", scrape_id, len(content))
-
-        await _update_profile_from_results(api, profile, result)
-
-        if _RESIDENT is not None:
-            try:
-                await _RESIDENT.save_sessions()
-            except Exception:
-                logger.debug("save_sessions after scrape %s failed", scrape_id, exc_info=True)
-
-        return True
-
-    except Exception as exc:
-        logger.exception("Scrape %s failed", scrape_id)
-        await update_scrape(api, scrape_id, status="failed", note=str(exc)[:200])
-        return False
-
-
-READY_SELECTOR_PROBATION_THRESHOLD = 2
-OBSTACLE_CLICK_PROBATION_THRESHOLD = 2
-
-
-def _apply_probation_gate(
-    existing: dict, updated: dict, candidate: str | None,
-    candidate_key: str, graduated_key: str, threshold: int,
-    profile_id: int, label: str,
-) -> bool:
-    """Run a generic probation gate: candidate must match N consecutive times
-    before it's promoted from `candidate_key` to `graduated_key`.
-
-    Mutates `updated` in place; returns True if anything changed.
-    """
-    if not candidate or existing.get(graduated_key):
-        return False
-    prev = existing.get(candidate_key) or {}
-    prev_sel = prev.get("selector") if isinstance(prev, dict) else None
-    prev_count = prev.get("matches", 0) if isinstance(prev, dict) else 0
-
-    if prev_sel == candidate:
-        matches = prev_count + 1
-        if matches >= threshold:
-            updated[graduated_key] = candidate
-            updated.pop(candidate_key, None)
-            logger.info(
-                "Profile %s: promoting %s after %d matches: %s",
-                profile_id, label, matches, candidate,
-            )
-        else:
-            updated[candidate_key] = {"selector": candidate, "matches": matches}
-            logger.info(
-                "Profile %s: %s candidate %s at %d/%d matches",
-                profile_id, label, candidate, matches, threshold,
-            )
-    else:
-        updated[candidate_key] = {"selector": candidate, "matches": 1}
-        logger.info(
-            "Profile %s: new %s candidate %s (was %s)",
-            profile_id, label, candidate, prev_sel,
-        )
-    return True
-
-
-async def _update_profile_from_results(api: ApiClient, profile: dict | None, result: dict):
-    """Update the scrape profile with selector findings from the browser."""
-    selector_results = result.get("selector_results")
-    discovered = result.get("discovered_selectors")
-    candidate_ready = result.get("candidate_ready_selector")
-    obstacle_click_winning = result.get("obstacle_click_winning")
-
-    if not profile:
-        return
-
-    profile_id = profile["id"]
-    existing = profile.get("css_selectors") or {}
-    updated = dict(existing)
-    changed = False
-
-    # Write newly discovered job_data selectors
-    if discovered and not existing.get("job_data"):
-        updated["job_data"] = discovered
-        changed = True
-        logger.info("Profile %s: writing discovered job_data selectors: %s", profile_id, list(discovered.keys()))
-
-    # Probation gate for ready_selector (selector used to signal SPA page
-    # content is fully rendered).
-    if _apply_probation_gate(
-        existing, updated, candidate_ready,
-        candidate_key="_ready_selector_candidate",
-        graduated_key="ready_selector",
-        threshold=READY_SELECTOR_PROBATION_THRESHOLD,
-        profile_id=profile_id, label="ready_selector",
-    ):
-        changed = True
-
-    # Probation gate for obstacle_click_selector (selector the obstacle agent
-    # learned clears a site-specific login/account-chooser interstitial). Once
-    # promoted, _try_rememberme_reauth tries it first and skips the LLM.
-    if _apply_probation_gate(
-        existing, updated, obstacle_click_winning,
-        candidate_key="_obstacle_click_candidate",
-        graduated_key="obstacle_click_selector",
-        threshold=OBSTACLE_CLICK_PROBATION_THRESHOLD,
-        profile_id=profile_id, label="obstacle_click_selector",
-    ):
-        changed = True
-
-    # Log warnings if existing selectors failed
-    if selector_results and existing.get("job_data") and not selector_results.get("job_data_matched"):
-        logger.warning(
-            "Profile %s: existing job_data selectors matched nothing — site may have changed layout",
-            profile_id,
-        )
-
-    if changed:
-        try:
-            await update_scrape_profile(api, profile_id, css_selectors=updated)
-            logger.info("Profile %s: updated css_selectors", profile_id)
-        except Exception:
-            logger.debug("Failed to update profile %s", profile_id, exc_info=True)
 
 
 async def poll_once(api: ApiClient) -> int:
@@ -471,19 +292,12 @@ async def main():
         logger.error("CC_API_BASE_URL and CC_API_TOKEN are required")
         sys.exit(1)
 
-    # Loud startup banner — so surprises like
-    #   SCRAPE_GRAPH_MODE=shadow via a forgotten .env.local override
-    # or a wrong base_url are visible before a single scrape runs. Warning
-    # level so it shows under default logging without LOG_LEVEL tweaks.
-    try:
-        from lib.scrape_graph import get_mode as _get_graph_mode
-        graph_mode = _get_graph_mode().value
-    except Exception:
-        graph_mode = "unknown"
+    # Loud startup banner — so a wrong base_url is visible before a
+    # single scrape runs. Warning level so it shows under default
+    # logging without LOG_LEVEL tweaks.
     logger.warning(
-        "poller boot: base_url=%s engine=%s headless=%s attended=%s graph_mode=%s poll_interval=%ds",
-        base_url, args.engine, headless, bool(args.attended),
-        graph_mode, POLL_INTERVAL,
+        "poller boot: base_url=%s engine=%s headless=%s attended=%s poll_interval=%ds",
+        base_url, args.engine, headless, bool(args.attended), POLL_INTERVAL,
     )
 
     api = ApiClient(base_url=base_url, token=token)
