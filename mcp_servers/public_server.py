@@ -419,6 +419,33 @@ async def list_scrape_screenshots(scrape_id: int) -> str:
 
 
 @server.tool()
+async def get_scrape_graph_trace(scrape_id: int) -> str:
+    """Fetch the pydantic-graph node trace for a scrape. Owner-or-staff.
+
+    Returns ordered transitions: scrape_id, graph_node, graph_payload,
+    note, created_at — plus meta.chain walking the source_scrape
+    parents so a tracker URL + its canonical child render as one path.
+    Use this to diagnose why a scrape ended in `failed` / `error` /
+    `ExtractFail` / `ObstacleFail` — the terminating node + its
+    payload usually has the reason.
+    """
+    return await api_tools.get_scrape_graph_trace(_api(), scrape_id)
+
+
+@server.tool()
+async def get_scrape_statuses(scrape_id: int) -> str:
+    """Fetch the full status history for a scrape. Owner-or-staff.
+
+    Returns every ScrapeStatus row (not just rows with a graph_node),
+    in JSON:API resource shape. Includes exception text and other
+    internal-only diagnostic detail in `note` / `graph_payload`. Use
+    when get_scrape_graph_trace returns nothing (pre-graph or
+    pre-cutover scrapes) to recover whatever the legacy poller wrote.
+    """
+    return await api_tools.get_scrape_statuses(_api(), scrape_id)
+
+
+@server.tool()
 async def fetch_scrape_screenshot(scrape_id: int, filename: str) -> str:
     """Download a scrape screenshot as a base64-encoded PNG. Staff-only.
 

@@ -757,6 +757,22 @@ async def list_screenshots(api: ApiClient, scrape_id: int) -> str:
     return await api.get(f"/api/v1/scrapes/{scrape_id}/screenshots/")
 
 
+async def get_scrape_graph_trace(api: ApiClient, scrape_id: int) -> str:
+    """Fetch the pydantic-graph node trace for a scrape. Owner-or-staff
+    gated endpoint. Returns ordered transitions (graph_node + payload +
+    note + timestamp) and meta.chain walking the source_scrape parents
+    so a tracker URL and its canonical child render as one path."""
+    return await api.get(f"/api/v1/scrapes/{scrape_id}/graph-trace/")
+
+
+async def get_scrape_statuses(api: ApiClient, scrape_id: int) -> str:
+    """Fetch the full ScrapeStatus history for a scrape — every row, not
+    just rows with a graph_node set. Owner-or-staff gated; the rows
+    can carry exception text and internal-only diagnostic detail in
+    `note` and `graph_payload`."""
+    return await api.get(f"/api/v1/scrapes/{scrape_id}/scrape-statuses/")
+
+
 async def fetch_screenshot_bytes(api: ApiClient, scrape_id: int, filename: str) -> bytes:
     """Download a screenshot PNG's raw bytes. Staff-only endpoint.
 
