@@ -166,34 +166,52 @@ async def _try_expand_truncations(page) -> int:
     return clicked
 
 
-async def _try_rememberme_reauth(page, profile_selector: str | None = None) -> bool:
-    """Click a LinkedIn-style 'Continue as <name>' button if present.
+async def _try_rememberme_reauth(
+    page,
+    profile_candidates: list[str] | None = None,
+    graduated_selector: str | None = None,
+) -> bool:
+    """Click a remembered-account tile if present.
 
-    Returns True if a click landed and navigation settled. The caller should
-    re-read page content afterward and re-check the login wall.
+    All site-specific selector knowledge is now in ScrapeProfile —
+    callers pass `profile_candidates` (the host's seeded list, e.g.
+    linkedin.com's "Login as <name>" tile + "Continue as <name>"
+    button) and `graduated_selector` (the single selector promoted by
+    the probation gate after the obstacle agent resolved the same
+    obstacle N times in a row).
 
-    `profile_selector`, when provided, is tried first — it's the graduated
-    obstacle-click selector written back by the probation gate after the
-    obstacle agent resolved the same obstacle N times in a row.
+    Returns True if a click landed and navigation settled. The caller
+    should re-read page content afterward and re-check the login wall.
+
+    Trust contract: the operator picked these selectors specifically
+    for their site's rememberme surface, so we do NOT gate on visible
+    text or aria-label content — first match wins. False matches are
+    fixed by editing the profile, not by adding text guards here.
+
+    A host with no profile data (no candidates, no graduated) gets a
+    fast False and the caller falls through to ObstacleWaitRetry /
+    ObstacleAgent.
     """
     candidates = [
-        *([profile_selector] if profile_selector else []),
-        "button[data-tracking-control-name*='rememberme']",
-        "a[data-tracking-control-name*='rememberme']",
-        "button.btn__primary--large",
-        "button:has-text('Continue as')",
-        "a:has-text('Continue as')",
-        "button:has-text('Continue')",
+        *([graduated_selector] if graduated_selector else []),
+        *(profile_candidates or []),
     ]
     for sel in candidates:
         try:
             el = await page.query_selector(sel)
             if not el:
                 continue
-            text = (await el.inner_text()).strip().lower()
-            if "continue" not in text:
-                continue
-            logfire.info(f"rememberme: clicking {sel!r} ({text!r})")
+            label = ""
+            try:
+                label = (await el.get_attribute("aria-label") or "").strip()
+            except Exception:
+                pass
+            if not label:
+                try:
+                    label = (await el.inner_text()).strip().splitlines()[0]
+                except Exception:
+                    label = ""
+            logfire.info(f"rememberme: clicking {sel!r} ({label!r})")
             await el.click(timeout=5_000)
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=15_000)
@@ -971,8 +989,13 @@ async def _scrape_on_page(page, url: str, norm_domain: str, css_selectors: dict)
             is_authenticated = selector_results["authenticated"] if selector_results else False
             if not is_authenticated and _detect_login_wall(content):
                 graduated = css_selectors.get("obstacle_click_selector")
-                if "continue as" in content.lower() or graduated:
-                    if await _try_rememberme_reauth(page, profile_selector=graduated):
+                rememberme_candidates = css_selectors.get("rememberme_candidates") or []
+                if graduated or rememberme_candidates:
+                    if await _try_rememberme_reauth(
+                        page,
+                        profile_candidates=rememberme_candidates,
+                        graduated_selector=graduated,
+                    ):
                         content = await page.inner_text("body")
                         if not _detect_login_wall(content):
                             logfire.info("login wall cleared via rememberme click")

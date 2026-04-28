@@ -113,14 +113,25 @@ class ObstacleRememberMe(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
         if page:
             try:
                 from mcp_servers.browser_server import _try_rememberme_reauth
-                # _try_rememberme_reauth expects profile_selector: str | None,
-                # so extract the graduated obstacle_click_selector rather than
-                # passing the whole profile dict.
+                # All site-specific selector knowledge lives in
+                # ScrapeProfile.css_selectors. Pass both the seeded
+                # rememberme_candidates list and the probation-graduated
+                # obstacle_click_selector so the helper can iterate
+                # graduated-first then candidates.
                 profile = state.profile or {}
-                selector = profile.get("obstacle_click_selector") if isinstance(profile, dict) else None
+                graduated = (
+                    profile.get("obstacle_click_selector")
+                    if isinstance(profile, dict) else None
+                )
+                candidates = (
+                    profile.get("rememberme_candidates")
+                    if isinstance(profile, dict) else None
+                )
                 succeeded = bool(
                     await _try_rememberme_reauth(
-                        page, profile_selector=selector if isinstance(selector, str) else None,
+                        page,
+                        profile_candidates=candidates if isinstance(candidates, list) else None,
+                        graduated_selector=graduated if isinstance(graduated, str) else None,
                     )
                 )
             except Exception:
