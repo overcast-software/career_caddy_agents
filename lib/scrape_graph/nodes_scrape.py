@@ -100,6 +100,25 @@ class StartScrape(BaseNode[ScrapeGraphState, None, dict]):
         return LoadProfile()
 
 
+def _flatten_profile_attrs(attrs: dict) -> dict:
+    """Lift `css_selectors` keys to the top of the profile dict.
+
+    The api ScrapeProfile stores per-host knobs (rememberme_candidates,
+    interaction_hints, ready_selector, ...) inside the `css_selectors`
+    JSONB blob, but graph nodes read them directly off `state.profile`
+    (e.g. `state.profile.get("rememberme_candidates")`). Flatten on
+    load so every reader sees one dict; same-named top-level fields
+    win on collision (none today).
+    """
+    if not isinstance(attrs, dict):
+        return {}
+    css = attrs.pop("css_selectors", None) or {}
+    if isinstance(css, dict):
+        for k, v in css.items():
+            attrs.setdefault(k, v)
+    return attrs
+
+
 @dataclass
 class LoadProfile(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
@@ -121,7 +140,8 @@ class LoadProfile(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-re
             payload = resp.json() if resp.status_code == 200 else {}
             rows = payload.get("data") or []
             if rows:
-                state.profile = (rows[0] or {}).get("attributes")
+                attrs = (rows[0] or {}).get("attributes") or {}
+                state.profile = _flatten_profile_attrs(attrs)
         except Exception:
             logger.debug("LoadProfile: profile fetch failed", exc_info=True)
         trace_node(state, "LoadProfile", "Navigate", started)

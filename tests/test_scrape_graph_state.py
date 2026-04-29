@@ -10,6 +10,7 @@ from lib.scrape_graph import (
     ScrapeGraphState,
     canonicalize_url,
 )
+from lib.scrape_graph.nodes_scrape import _flatten_profile_attrs
 from lib.scrape_graph.url_canonicalize import apply_url_rewrites, urls_differ
 
 
@@ -97,6 +98,54 @@ def test_url_rewrite_none_and_empty():
 # ----------------------------------------------------------------------
 # State dataclass
 # ----------------------------------------------------------------------
+
+
+def test_flatten_profile_attrs_lifts_css_selectors():
+    """LoadProfile's flatten lifts css_selectors keys to the top of profile.
+
+    Regression: scrape 202 hit the linkedin account-chooser, but
+    ObstacleRememberMe routed straight to ObstacleWaitRetry with
+    duration_ms=0 because the node read profile["rememberme_candidates"]
+    while LoadProfile stored the api attributes verbatim — leaving
+    rememberme_candidates nested under css_selectors. Flatten on load
+    so every reader sees one dict.
+    """
+    attrs = {
+        "hostname": "linkedin.com",
+        "css_selectors": {
+            "rememberme_candidates": ["button.member-profile__details"],
+            "ready_selector": ".jobs-details",
+        },
+        "apply_resolver_config": {"apply_link_selectors": ["a.jobs-apply-link"]},
+        "extraction_hints": "...",
+    }
+    flat = _flatten_profile_attrs(attrs)
+    assert flat["rememberme_candidates"] == ["button.member-profile__details"]
+    assert flat["ready_selector"] == ".jobs-details"
+    assert flat["apply_resolver_config"] == {"apply_link_selectors": ["a.jobs-apply-link"]}
+    assert "css_selectors" not in flat
+
+
+def test_flatten_profile_attrs_top_level_wins_on_collision():
+    """Top-level fields take precedence over a same-named css_selectors entry."""
+    attrs = {
+        "extraction_hints": "top-level",
+        "css_selectors": {"extraction_hints": "nested"},
+    }
+    flat = _flatten_profile_attrs(attrs)
+    assert flat["extraction_hints"] == "top-level"
+
+
+def test_flatten_profile_attrs_no_css_selectors():
+    """Profiles without a css_selectors blob pass through unchanged."""
+    attrs = {"hostname": "indeed.com", "url_rewrites": [{"match": "x", "rewrite": "y"}]}
+    flat = _flatten_profile_attrs(dict(attrs))
+    assert flat == attrs
+
+
+def test_flatten_profile_attrs_handles_non_dict():
+    assert _flatten_profile_attrs(None) == {}  # type: ignore[arg-type]
+    assert _flatten_profile_attrs("garbage") == {}  # type: ignore[arg-type]
 
 
 def test_state_defaults():
