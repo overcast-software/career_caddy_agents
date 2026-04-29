@@ -14,6 +14,7 @@ from lib.api_tools import (
     TOOL_SHAPES,
     _relationships_to_counts,
     _respond,
+    _slim_payload,
     _slim_record,
 )
 
@@ -239,6 +240,86 @@ class TestSlimRecord:
         }
         _slim_record(record, relationships="inline")
         assert record["relationships"]["scores"]["data"] == [{"id": "1"}]
+
+
+class TestSlimPayload:
+    def _list_payload(self):
+        return {
+            "data": [
+                {
+                    "type": "job-post",
+                    "id": "1",
+                    "attributes": {
+                        "title": "Dev",
+                        "description": "x" * 500,
+                        "posting_status": "open",
+                        "created_at": "2026-04-01",
+                    },
+                    "relationships": {
+                        "company": {"data": {"type": "company", "id": "10"}},
+                        "scores": {"data": [{"id": "100"}, {"id": "101"}]},
+                    },
+                }
+            ],
+            "included": [{"type": "company", "id": "10", "attributes": {"name": "Acme"}}],
+        }
+
+    def test_list_attrs_filter(self):
+        payload = self._list_payload()
+        shape = {
+            "kind": "list",
+            "list_attrs": ["title", "posting_status", "created_at"],
+            "relationships": "counts",
+        }
+        _slim_payload(payload, shape=shape)
+        attrs = payload["data"][0]["attributes"]
+        assert "description" not in attrs
+        assert attrs["title"] == "Dev"
+
+    def test_list_relationships_become_counts(self):
+        payload = self._list_payload()
+        shape = {"kind": "list", "list_attrs": None, "relationships": "counts"}
+        _slim_payload(payload, shape=shape)
+        rels = payload["data"][0]["relationships"]
+        assert rels["company"] == "10"   # belongsTo → id
+        assert rels["scores"] == 2       # hasMany → count
+
+    def test_drops_included_block(self):
+        payload = self._list_payload()
+        shape = {"kind": "list", "list_attrs": None, "relationships": "counts"}
+        _slim_payload(payload, shape=shape)
+        assert "included" not in payload
+
+    def test_passthrough_kind_is_noop(self):
+        payload = self._list_payload()
+        shape = {"kind": "passthrough"}
+        _slim_payload(payload, shape=shape)
+        # Description still there.
+        assert "description" in payload["data"][0]["attributes"]
+        # Included still there.
+        assert "included" in payload
+
+    def test_single_record_uses_single_attrs(self):
+        payload = {
+            "data": {
+                "type": "job-post",
+                "id": "1",
+                "attributes": {
+                    "title": "Dev",
+                    "description": "x" * 500,
+                    "posting_status": "open",
+                },
+            }
+        }
+        shape = {
+            "kind": "list_or_single",
+            "list_attrs": ["title"],
+            "single_attrs": None,
+            "relationships": "counts",
+        }
+        _slim_payload(payload, shape=shape, is_single=True)
+        # Single mode: keep all attrs.
+        assert "description" in payload["data"]["attributes"]
 
 
 class TestToolShapesAudit:

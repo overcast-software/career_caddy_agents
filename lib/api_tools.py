@@ -161,35 +161,30 @@ TOOL_SHAPES: dict[str, dict[str, Any]] = {
     "search_companies": {
         "kind": "list",
         "list_attrs": ["name"],
-        "relationships": "omit",
+        "relationships": "counts",
     },
     "get_job_posts": {
         "kind": "list_or_single",
-        "list_attrs": [
-            "title", "posting_status", "created_at", "duplicate_of_id",
-            "company",
-        ],
+        # Company shows up via relationships=counts (belongsTo → id).
+        "list_attrs": ["title", "posting_status", "created_at", "duplicate_of_id"],
         "single_attrs": None,
         "relationships": "counts",
     },
     "search_job_posts": {
         "kind": "list",
-        "list_attrs": [
-            "title", "posting_status", "created_at", "duplicate_of_id",
-            "company",
-        ],
-        "relationships": "omit",
+        "list_attrs": ["title", "posting_status", "created_at", "duplicate_of_id"],
+        "relationships": "counts",
     },
     "get_job_applications": {
         "kind": "list_or_single",
-        "list_attrs": ["status", "reason_code", "applied_at", "job_post_id"],
+        "list_attrs": ["status", "reason_code", "applied_at"],
         "single_attrs": None,
         "relationships": "counts",
     },
     "get_applications_for_job_post": {
         "kind": "list",
         "list_attrs": ["status", "reason_code", "applied_at"],
-        "relationships": "omit",
+        "relationships": "counts",
     },
     "get_scrapes": {
         "kind": "list_or_single",
@@ -199,25 +194,27 @@ TOOL_SHAPES: dict[str, dict[str, Any]] = {
     },
     "get_scores": {
         "kind": "list_or_single",
-        "list_attrs": ["score", "created_at", "job_post_id"],
+        # `top_score` etc. are belongsTo on score; relationships=counts
+        # surfaces job_post id.
+        "list_attrs": ["score", "status", "created_at"],
         "single_attrs": None,
         "relationships": "counts",
     },
     "get_resumes": {
         "kind": "list_or_single",
-        "list_attrs": ["name", "created_at"],
+        "list_attrs": ["name", "title", "created_at", "favorite"],
         "single_attrs": None,
         "relationships": "counts",
     },
     "get_questions": {
         "kind": "list_or_single",
-        "list_attrs": ["text_excerpt", "job_post_id"],
+        "list_attrs": ["content", "created_at"],
         "single_attrs": None,
         "relationships": "counts",
     },
     "get_answers": {
         "kind": "list_or_single",
-        "list_attrs": ["text_excerpt", "question_id"],
+        "list_attrs": ["content", "created_at", "favorite"],
         "single_attrs": None,
         "relationships": "counts",
     },
@@ -340,6 +337,62 @@ def _relationships_to_counts(record: dict) -> dict:
         else:
             rels[name] = None
     return record
+
+
+async def _shaped_get(
+    api: "ApiClient",
+    path: str,
+    *,
+    shape: dict,
+    params: Optional[dict] = None,
+    is_single: Optional[bool] = None,
+) -> str:
+    """Fetch + slim + serialize. Tool one-liner glue."""
+    payload, error, status = await api.get_data(path, params=params)
+    if error is not None:
+        return _respond(None, error=error, status_code=status)
+    _slim_payload(payload, shape=shape, is_single=is_single)
+    return _respond(payload)
+
+
+def _slim_payload(payload: Optional[dict], *, shape: dict,
+                  is_single: Optional[bool] = None) -> Optional[dict]:
+    """Apply a TOOL_SHAPES row to a JSON:API response payload.
+
+    - kind="passthrough": return payload unchanged.
+    - payload.data is a list: treat each record with shape["list_attrs"].
+    - payload.data is a dict: treat as single record with shape["single_attrs"]
+      (falling back to shape["attrs"] if not set).
+
+    Mutates and returns the payload so callers can chain into _respond.
+    Tools that branch list vs single by url (.../id/ vs .../) can pass
+    `is_single` explicitly; the default reads off payload.data's type.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    if shape.get("kind") == "passthrough":
+        return payload
+
+    rels_mode = shape.get("relationships", "counts")
+    data = payload.get("data")
+
+    if is_single is None:
+        is_single = isinstance(data, dict)
+
+    if isinstance(data, list):
+        list_attrs = shape.get("list_attrs", shape.get("attrs"))
+        for record in data:
+            if isinstance(record, dict):
+                _slim_record(record, attrs=list_attrs, relationships=rels_mode)
+    elif isinstance(data, dict):
+        single_attrs = shape.get("single_attrs", shape.get("attrs"))
+        _slim_record(data, attrs=single_attrs, relationships=rels_mode)
+
+    # JSON:API compound docs sometimes inflate response with `included`.
+    # We don't surface relationship arrays anyway, so drop included to
+    # avoid leaking record bodies the agent never asked for.
+    payload.pop("included", None)
+    return payload
 
 
 def _slim_record(record: dict, *,
@@ -557,14 +610,19 @@ async def search_companies(
         params["filter[query]"] = query
     if page_size is not None:
         params["page[size]"] = page_size
-    return await api.get("/api/v1/companies/", params=params)
+    return await _shaped_get(
+        api, "/api/v1/companies/", shape=TOOL_SHAPES["search_companies"], params=params,
+    )
 
 
 async def get_companies(api: ApiClient, id: Optional[int] = None) -> str:
     """Fetch companies. Pass id to retrieve a single company; omit for the full list."""
+    shape = TOOL_SHAPES["get_companies"]
     if id is not None:
-        return await api.get(f"/api/v1/companies/{id}/")
-    return await api.get("/api/v1/companies/")
+        return await _shaped_get(
+            api, f"/api/v1/companies/{id}/", shape=shape, is_single=True,
+        )
+    return await _shaped_get(api, "/api/v1/companies/", shape=shape, is_single=False)
 
 
 async def find_job_post_by_link(api: ApiClient, link: str) -> str:
@@ -713,7 +771,9 @@ async def search_job_posts(
         params["sort"] = sort
     if page_size is not None:
         params["page[size]"] = page_size
-    return await api.get("/api/v1/job-posts/", params=params)
+    return await _shaped_get(
+        api, "/api/v1/job-posts/", shape=TOOL_SHAPES["search_job_posts"], params=params,
+    )
 
 
 async def get_job_posts(
@@ -725,8 +785,11 @@ async def get_job_posts(
     per_page: Optional[int] = None,
 ) -> str:
     """Fetch job posts. Pass id for a single post; omit for a paginated list."""
+    shape = TOOL_SHAPES["get_job_posts"]
     if id is not None:
-        return await api.get(f"/api/v1/job-posts/{id}/")
+        return await _shaped_get(
+            api, f"/api/v1/job-posts/{id}/", shape=shape, is_single=True,
+        )
     params = {}
     if sort is not None:
         params["sort"] = sort
@@ -736,7 +799,9 @@ async def get_job_posts(
         params["page"] = page
     if per_page is not None:
         params["per_page"] = per_page
-    return await api.get("/api/v1/job-posts/", params=params)
+    return await _shaped_get(
+        api, "/api/v1/job-posts/", shape=shape, params=params, is_single=False,
+    )
 
 
 async def update_job_post(
@@ -832,9 +897,12 @@ async def get_job_applications(
     per_page: Optional[int] = None,
 ) -> str:
     """Fetch job applications. Pass id for a single application; omit for a list."""
+    shape = TOOL_SHAPES["get_job_applications"]
     if id is not None:
-        return await api.get(f"/api/v1/job-applications/{id}/")
-    params = {}
+        return await _shaped_get(
+            api, f"/api/v1/job-applications/{id}/", shape=shape, is_single=True,
+        )
+    params: dict = {}
     if sort is not None:
         params["sort"] = sort
     if order is not None:
@@ -843,12 +911,18 @@ async def get_job_applications(
         params["page"] = page
     if per_page is not None:
         params["per_page"] = per_page
-    return await api.get("/api/v1/job-applications/", params=params)
+    return await _shaped_get(
+        api, "/api/v1/job-applications/", shape=shape, params=params, is_single=False,
+    )
 
 
 async def get_applications_for_job_post(api: ApiClient, job_post_id: int) -> str:
     """Fetch all job applications linked to a specific job post."""
-    return await api.get(f"/api/v1/job-posts/{job_post_id}/job-applications/")
+    return await _shaped_get(
+        api,
+        f"/api/v1/job-posts/{job_post_id}/job-applications/",
+        shape=TOOL_SHAPES["get_applications_for_job_post"],
+    )
 
 
 async def update_job_application(
@@ -902,16 +976,21 @@ async def get_resumes(
     Use this tool to count or list ALL resumes — do not infer resume counts
     from career data, which may only include favorites.
     """
+    shape = TOOL_SHAPES["get_resumes"]
     if id is not None:
-        return await api.get(f"/api/v1/resumes/{id}/")
-    params = {}
+        return await _shaped_get(
+            api, f"/api/v1/resumes/{id}/", shape=shape, is_single=True,
+        )
+    params: dict = {}
     if favorite is not None:
         params["favorite"] = str(favorite).lower()
     if page is not None:
         params["page"] = page
     if per_page is not None:
         params["per_page"] = per_page
-    return await api.get("/api/v1/resumes/", params=params)
+    return await _shaped_get(
+        api, "/api/v1/resumes/", shape=shape, params=params, is_single=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -957,9 +1036,12 @@ async def get_scrapes(
     has_score: Optional[bool] = None,
 ) -> str:
     """Fetch scrape records. Pass id for a single scrape; omit for a paginated list. Use sort='-id' for most recent first, per_page=1 for just the latest. Filter by status with status='hold'. Pass has_score=False to scope to scrapes whose linked JobPost has no Score yet (drives the auto-score daemon)."""
+    shape = TOOL_SHAPES["get_scrapes"]
     if id is not None:
-        return await api.get(f"/api/v1/scrapes/{id}/")
-    params = {}
+        return await _shaped_get(
+            api, f"/api/v1/scrapes/{id}/", shape=shape, is_single=True,
+        )
+    params: dict = {}
     if sort is not None:
         params["sort"] = sort
     if page is not None:
@@ -970,7 +1052,9 @@ async def get_scrapes(
         params["filter[status]"] = status
     if has_score is not None:
         params["filter[has_score]"] = "true" if has_score else "false"
-    return await api.get("/api/v1/scrapes/", params=params)
+    return await _shaped_get(
+        api, "/api/v1/scrapes/", shape=shape, params=params, is_single=False,
+    )
 
 
 async def update_scrape(
@@ -1077,9 +1161,12 @@ async def get_questions(
     per_page: Optional[int] = None,
 ) -> str:
     """Fetch interview questions. Pass id for a single question; omit for a paginated list. Filter by company_id or job_post_id."""
+    shape = TOOL_SHAPES["get_questions"]
     if id is not None:
-        return await api.get(f"/api/v1/questions/{id}/")
-    params = {}
+        return await _shaped_get(
+            api, f"/api/v1/questions/{id}/", shape=shape, is_single=True,
+        )
+    params: dict = {}
     if company_id is not None:
         params["filter[company_id]"] = company_id
     if job_post_id is not None:
@@ -1088,7 +1175,9 @@ async def get_questions(
         params["page"] = page
     if per_page is not None:
         params["per_page"] = per_page
-    return await api.get("/api/v1/questions/", params=params)
+    return await _shaped_get(
+        api, "/api/v1/questions/", shape=shape, params=params, is_single=False,
+    )
 
 
 async def create_question(
@@ -1132,9 +1221,12 @@ async def get_answers(
     per_page: Optional[int] = None,
 ) -> str:
     """Fetch answers to interview questions. Pass id for a single answer; omit for a paginated list. Filter by question_id or favorite status."""
+    shape = TOOL_SHAPES["get_answers"]
     if id is not None:
-        return await api.get(f"/api/v1/answers/{id}/")
-    params = {}
+        return await _shaped_get(
+            api, f"/api/v1/answers/{id}/", shape=shape, is_single=True,
+        )
+    params: dict = {}
     if question_id is not None:
         params["filter[question_id]"] = question_id
     if favorite is not None:
@@ -1143,7 +1235,9 @@ async def get_answers(
         params["page"] = page
     if per_page is not None:
         params["per_page"] = per_page
-    return await api.get("/api/v1/answers/", params=params)
+    return await _shaped_get(
+        api, "/api/v1/answers/", shape=shape, params=params, is_single=False,
+    )
 
 
 async def create_answer(
@@ -1218,16 +1312,21 @@ async def get_scores(
     per_page: Optional[int] = None,
 ) -> str:
     """Fetch scores. Pass id for a single score, or filter by job_post_id."""
+    shape = TOOL_SHAPES["get_scores"]
     if id is not None:
-        return await api.get(f"/api/v1/scores/{id}/")
-    params = {}
+        return await _shaped_get(
+            api, f"/api/v1/scores/{id}/", shape=shape, is_single=True,
+        )
+    params: dict = {}
     if job_post_id is not None:
         params["filter[job_post_id]"] = job_post_id
     if page is not None:
         params["page"] = page
     if per_page is not None:
         params["per_page"] = per_page
-    return await api.get("/api/v1/scores/", params=params)
+    return await _shaped_get(
+        api, "/api/v1/scores/", shape=shape, params=params, is_single=False,
+    )
 
 
 # ---------------------------------------------------------------------------
