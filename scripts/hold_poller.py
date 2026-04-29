@@ -12,8 +12,9 @@ Usage:
 
 import argparse
 import asyncio
-import json
 import logging
+
+import yaml
 import os
 import signal
 import sys
@@ -63,8 +64,9 @@ async def _fetch_profile(api: ApiClient, hostname: str) -> dict | None:
     if not hostname:
         return None
     raw = await get_scrape_profile(api, hostname)
-    wrapper = json.loads(raw)
-    body = wrapper.get("data") or {}
+    body = yaml.safe_load(raw)
+    if not isinstance(body, dict) or body.get("error"):
+        return None
     profiles = body.get("data", [])
     if not profiles:
         return None
@@ -203,13 +205,13 @@ def _is_headless() -> bool:
 async def poll_once(api: ApiClient) -> int:
     """Poll for hold scrapes and process them. Returns count processed."""
     raw = await get_scrapes(api, status="hold", sort="id")
-    data = json.loads(raw)
+    data = yaml.safe_load(raw)
 
-    if not data.get("success"):
-        logger.error("API error: %s", data.get("error"))
+    if not isinstance(data, dict) or data.get("error"):
+        logger.error("API error: %s", (data or {}).get("error") if isinstance(data, dict) else raw[:200])
         return 0
 
-    scrapes = data.get("data", {}).get("data", [])
+    scrapes = data.get("data", []) or []
     if not scrapes:
         return 0
 
@@ -273,14 +275,14 @@ async def _preflight_auth(api: ApiClient) -> bool:
         logger.error("Pre-flight request raised: %s", exc)
         return False
     try:
-        body = json.loads(raw)
+        body = yaml.safe_load(raw)
     except Exception:
-        logger.error("Pre-flight returned non-JSON: %s", raw[:200])
+        logger.error("Pre-flight returned unparseable response: %s", raw[:200])
         return False
-    if body.get("success"):
-        return True
-    logger.error("Pre-flight failed: %s", body.get("error") or body)
-    return False
+    if isinstance(body, dict) and body.get("error"):
+        logger.error("Pre-flight failed: %s", body.get("error"))
+        return False
+    return True
 
 
 async def _run_poll_loop(api: ApiClient, running_flag):

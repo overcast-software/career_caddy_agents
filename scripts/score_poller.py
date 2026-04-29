@@ -23,10 +23,11 @@ has list access across users; the server enforces per-user
 
 import argparse
 import asyncio
-import json
 import logging
 import os
 import sys
+
+import yaml
 from datetime import datetime
 from pathlib import Path
 
@@ -83,16 +84,16 @@ async def _collect_candidates(api: ApiClient, limit: int) -> list[int]:
             sort="-scraped_at",
             per_page=limit * 2,
         )
-        resp = json.loads(raw)
+        resp = yaml.safe_load(raw)
     except Exception as exc:
         logger.error("Scrape query failed: %s", exc)
         return []
 
-    if not resp.get("success"):
-        logger.warning("Scrape query unsuccessful: %s", resp.get("error"))
+    if not isinstance(resp, dict) or resp.get("error"):
+        logger.warning("Scrape query unsuccessful: %s", (resp or {}).get("error") if isinstance(resp, dict) else raw[:200])
         return []
 
-    rows = (resp.get("data") or {}).get("data") or []
+    rows = resp.get("data") or []
     out: list[int] = []
     seen: set[int] = set()
     for row in rows:
@@ -109,15 +110,15 @@ async def _collect_candidates(api: ApiClient, limit: int) -> list[int]:
 async def _score_one(api: ApiClient, job_post_id: int) -> bool:
     try:
         raw = await score_job_post(api, job_post_id)
-        resp = json.loads(raw)
+        resp = yaml.safe_load(raw)
     except Exception:
         logger.exception("Scoring raised for job_post %s", job_post_id)
         return False
-    if not resp.get("success"):
+    if not isinstance(resp, dict) or resp.get("error"):
         logger.warning(
             "Scoring failed for job_post %s: %s",
             job_post_id,
-            resp.get("error"),
+            (resp or {}).get("error") if isinstance(resp, dict) else raw[:200],
         )
         return False
     logger.info("  scored job_post %s", job_post_id)
