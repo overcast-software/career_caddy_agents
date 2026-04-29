@@ -64,10 +64,12 @@ __all_nodes__ = (
 # module's globals. Building inside a function would hide cross-module
 # names behind LOAD_GLOBAL and break the lookup.
 _SCRAPE_NODES = [
-    StartScrape, LoadProfile, Navigate, ResolveFinalUrl, CheckLinkDedup,
-    DuplicateShortCircuit, WaitReadySelector, SettleWait, ExpandTruncations,
+    StartScrape, LoadProfile, Navigate,
     DetectObstacle, ObstacleRememberMe, ObstacleWaitRetry, ObstacleAgent,
-    ObstacleFail, Capture, PersistScrape,
+    ObstacleFail,
+    ResolveFinalUrl, CheckLinkDedup,
+    DuplicateShortCircuit, WaitReadySelector, SettleWait, ExpandTruncations,
+    Capture, PersistScrape,
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
     EvaluateExtraction, ValidateExtraction, PersistJobPost, UpdateProfile,
     ResolveApplyUrl, ExtractFail,
@@ -128,8 +130,9 @@ NODE_META: dict[str, dict[str, str]] = {
         "group": "scrape", "label": "Navigate",
         "description": (
             "Drives the browser to the submitted URL and records the "
-            "landed final_url. Navigation failure stamps failure_reason "
-            "but still advances (later nodes see empty content)."
+            "landed final_url. Hands off to DetectObstacle so login "
+            "walls / account choosers get cleared before any URL "
+            "canonicalization or content waits run."
         ),
     },
     "ResolveFinalUrl": {
@@ -176,7 +179,9 @@ NODE_META: dict[str, dict[str, str]] = {
         "group": "scrape", "label": "Expand truncations",
         "description": (
             "Clicks 'Show more' / 'Read more' affordances so the captured "
-            "content isn't a stub. Best-effort — failures don't block."
+            "content isn't a stub. Best-effort — failures don't block. "
+            "Hands directly to Capture (obstacles are now caught upstream "
+            "after Navigate)."
         ),
     },
     "Capture": {
@@ -199,8 +204,9 @@ NODE_META: dict[str, dict[str, str]] = {
     "DetectObstacle": {
         "group": "obstacle", "label": "Detect obstacle",
         "description": (
-            "Scans the page body for login-wall signals. Clean → Capture; "
-            "walled → routes to the obstacle handler with available retries "
+            "Scans the page body for login-wall signals immediately "
+            "after Navigate. Clean → ResolveFinalUrl; walled → routes "
+            "to the obstacle handler with available retries "
             "(RememberMe → WaitRetry → Agent → Fail)."
         ),
     },

@@ -18,7 +18,7 @@ from .state import ObstacleAttempt, ScrapeGraphState
 from .tracing import trace_node
 
 if TYPE_CHECKING:
-    from .nodes_scrape import Capture
+    from .nodes_scrape import ResolveFinalUrl
 
 logger = logging.getLogger(__name__)
 
@@ -64,30 +64,31 @@ class DetectObstacle(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no
         ObstacleWaitRetry,
         ObstacleAgent,
         ObstacleFail,
-        "Capture",
+        "ResolveFinalUrl",
     ]:
-        from .nodes_scrape import Capture
+        from .nodes_scrape import ResolveFinalUrl
         started = time.time()
         state = ctx.state
         page = getattr(state, "_browser_page", None)
         if page is None:
-            trace_node(state, "DetectObstacle", "Capture", started)
-            return Capture()
+            trace_node(state, "DetectObstacle", "ResolveFinalUrl", started)
+            return ResolveFinalUrl()
         walled = False
         try:
             from mcp_servers.browser_server import _detect_login_wall
             text = await page.inner_text("body")
             walled = bool(_detect_login_wall(text))
         except Exception:
-            # Changes routing — if detection itself fails we fall through to
-            # Capture. Loud so we notice when a host's DOM breaks our reader.
+            # Changes routing — if detection itself fails we fall through
+            # to ResolveFinalUrl so the scrape can still attempt content
+            # capture. Loud so we notice when a host's DOM breaks our reader.
             logger.warning(
                 "DetectObstacle: login-wall read failed scrape_id=%s",
                 state.scrape_id, exc_info=True,
             )
         if not walled:
-            trace_node(state, "DetectObstacle", "Capture", started)
-            return Capture()
+            trace_node(state, "DetectObstacle", "ResolveFinalUrl", started)
+            return ResolveFinalUrl()
         if _obstacle_count(state, "ObstacleRememberMe") < _MAX_REMEMBER_ATTEMPTS:
             trace_node(state, "DetectObstacle", "ObstacleRememberMe", started)
             return ObstacleRememberMe()

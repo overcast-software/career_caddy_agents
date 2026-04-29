@@ -132,7 +132,7 @@ class LoadProfile(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-re
 class Navigate(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> ResolveFinalUrl:
+    ) -> "DetectObstacle":  # noqa: F821 — forward ref, resolved via local import below
         started = time.time()
         state = ctx.state
         page = getattr(state, "_browser_page", None)
@@ -159,8 +159,9 @@ class Navigate(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef
                 state.final_url = page.url
             except Exception as exc:
                 state.failure_reason = f"navigate_failed: {exc}"
-        trace_node(state, "Navigate", "ResolveFinalUrl", started)
-        return ResolveFinalUrl()
+        from . import nodes_obstacle
+        trace_node(state, "Navigate", "DetectObstacle", started)
+        return nodes_obstacle.DetectObstacle()
 
 
 @dataclass
@@ -309,8 +310,7 @@ class SettleWait(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-red
 class ExpandTruncations(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> "DetectObstacle":  # noqa: F821  — forward ref, resolved via local import below
-        from . import nodes_obstacle
+    ) -> "Capture":  # noqa: F821  — forward ref, resolved at module scope
         started = time.time()
         page = getattr(ctx.state, "_browser_page", None)
         if page:
@@ -319,8 +319,8 @@ class ExpandTruncations(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore
                 await _try_expand_truncations(page)
             except Exception:
                 logger.debug("ExpandTruncations failed", exc_info=True)
-        trace_node(ctx.state, "ExpandTruncations", "DetectObstacle", started)
-        return nodes_obstacle.DetectObstacle()
+        trace_node(ctx.state, "ExpandTruncations", "Capture", started)
+        return Capture()
 
 
 @dataclass
