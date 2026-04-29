@@ -60,7 +60,7 @@ class _FakeState:
 class TestCaptureDebugArtifact:
     @pytest.mark.asyncio
     async def test_screenshot_uploaded_when_page_cooperates(self):
-        from lib.scrape_graph import _artifacts as mod
+        from scrape_graph import _artifacts as mod
 
         page = _FakePage()
         state = _FakeState()
@@ -91,7 +91,7 @@ class TestCaptureDebugArtifact:
     @pytest.mark.asyncio
     async def test_skips_dom_patch_when_html_already_present(self):
         """Don't clobber a successful captured DOM with the post-mortem one."""
-        from lib.scrape_graph import _artifacts as mod
+        from scrape_graph import _artifacts as mod
 
         page = _FakePage()
         state = _FakeState()
@@ -121,7 +121,7 @@ class TestCaptureDebugArtifact:
     async def test_tolerates_detached_page(self):
         """A detached page raises on screenshot() and content() — helper
         must still return a structured result and not crash."""
-        from lib.scrape_graph import _artifacts as mod
+        from scrape_graph import _artifacts as mod
 
         page = _FakePage(fail_screenshot=True, fail_content=True)
         state = _FakeState()
@@ -145,7 +145,7 @@ class TestCaptureDebugArtifact:
 
     @pytest.mark.asyncio
     async def test_none_page_returns_empty_result(self):
-        from lib.scrape_graph import _artifacts as mod
+        from scrape_graph import _artifacts as mod
 
         result = await mod.capture_debug_artifact(
             None, _FakeState(), reason="obstacle_fail",
@@ -158,7 +158,7 @@ class TestCaptureDebugArtifact:
 
     @pytest.mark.asyncio
     async def test_screenshot_upload_failure_still_returns_structured(self):
-        from lib.scrape_graph import _artifacts as mod
+        from scrape_graph import _artifacts as mod
 
         page = _FakePage()
         state = _FakeState()

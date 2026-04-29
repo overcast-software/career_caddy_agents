@@ -10,7 +10,7 @@ Requires Firefox to be installed on the host. On systems without Firefox
 (e.g. Raspberry Pi), use manual_login.py to seed sessions instead.
 
 Usage:
-    from lib.browser.firefox_cookies import load_cookies_for_domain
+    from browser.firefox_cookies import load_cookies_for_domain
 
     cookies = load_cookies_for_domain("toptal.com")
     await context.add_cookies(cookies)

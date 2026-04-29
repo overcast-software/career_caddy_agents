@@ -1,7 +1,7 @@
 """Browser engine abstraction — Camoufox (Firefox) or Playwright Chromium + stealth.
 
 Usage:
-    from lib.browser.engine import configure, launch_browser, get_engine, get_headless
+    from browser.engine import configure, launch_browser, get_engine, get_headless
 
     # At startup (CLI entry point):
     configure(engine="chrome", headless=True)

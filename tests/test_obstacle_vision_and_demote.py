@@ -142,7 +142,7 @@ class TestDemoteGraduatedSelector:
 
     @pytest.mark.asyncio  # for api parity with the rest of the file
     async def test_rolls_graduated_selector_back_to_candidate(self):
-        from lib.scrape_graph import nodes_extract as mod
+        from scrape_graph import nodes_extract as mod
 
         host = "linkedin.com"
         profile_id = 42
@@ -186,7 +186,7 @@ class TestDemoteGraduatedSelector:
 
     @pytest.mark.asyncio
     async def test_no_graduated_selector_noops(self):
-        from lib.scrape_graph import nodes_extract as mod
+        from scrape_graph import nodes_extract as mod
 
         fake_get_resp = MagicMock(
             status_code=200,
@@ -219,7 +219,7 @@ class TestDemoteGraduatedSelector:
 
     @pytest.mark.asyncio
     async def test_empty_host_noops(self):
-        from lib.scrape_graph import nodes_extract as mod
+        from scrape_graph import nodes_extract as mod
 
         with patch.object(mod, "httpx") as httpx_mod:
             httpx_mod.get = MagicMock()

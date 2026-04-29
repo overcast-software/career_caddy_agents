@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from lib.scrape_graph.apply_resolver import (
+from scrape_graph.apply_resolver import (
     resolve_apply_url,
     scan_apply_candidates,
 )

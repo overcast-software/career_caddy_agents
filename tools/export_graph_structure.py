@@ -16,7 +16,7 @@ from pathlib import Path
 # Ensure the ai/ root is on sys.path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lib.scrape_graph.graph import export_graph_structure  # noqa: E402
+from scrape_graph.graph import export_graph_structure  # noqa: E402
 
 # ai/ and api/ are siblings under the repo root.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent

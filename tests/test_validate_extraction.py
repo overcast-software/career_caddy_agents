@@ -12,12 +12,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from lib.scrape_graph.nodes_extract import (
+from scrape_graph.nodes_extract import (
     ExtractFail,
     PersistJobPost,
     ValidateExtraction,
 )
-from lib.scrape_graph.state import ScrapeGraphState
+from scrape_graph.state import ScrapeGraphState
 
 
 def _run(node, state: ScrapeGraphState):

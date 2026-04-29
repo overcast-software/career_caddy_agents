@@ -22,7 +22,7 @@ from fastmcp import FastMCP
 
 from lib.api_tools import ApiClient, _APPLICATION_SORT_FIELDS
 from lib import api_tools
-from lib.browser.credentials import Credentials  # type: ignore
+from browser.credentials import Credentials  # type: ignore
 from lib.models.career_caddy import APICredentials  # type: ignore
 
 logging.basicConfig(level=logging.INFO)

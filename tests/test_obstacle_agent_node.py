@@ -39,8 +39,8 @@ def _quarantine_browser_imports():
             sys.modules.pop(name, None)
 
 
-from lib.scrape_graph.nodes_obstacle import ObstacleAgent  # noqa: E402
-from lib.scrape_graph.state import ScrapeGraphState  # noqa: E402
+from scrape_graph.nodes_obstacle import ObstacleAgent  # noqa: E402
+from scrape_graph.state import ScrapeGraphState  # noqa: E402
 
 
 class _FakePage:

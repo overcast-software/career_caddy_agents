@@ -29,14 +29,14 @@ dependencies = [
 caddy-pipeline = "agents.job_email_to_caddy:run"
 caddy-public   = "mcp_servers.public_server:main"
 caddy-chat     = "mcp_servers.chat_server:main"
-caddy-poller  = "scripts.hold_poller:main_sync"
-caddy-score    = "scripts.score_poller:run"
+caddy-poller  = "pollers.hold_poller:main_sync"
+caddy-score    = "pollers.score_poller:run"
 caddy-fetch-browser = "camoufox.__main__:main"
-caddy-fetch-chromium = "scripts.fetch_chromium:main"
-caddy-export-graph = "scripts.export_graph_structure:main"
+caddy-fetch-chromium = "tools.fetch_chromium:main"
+caddy-export-graph = "tools.export_graph_structure:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["agents", "mcp_servers", "lib", "scripts"]
+packages = ["agents", "mcp_servers", "browser", "scrape_graph", "pollers", "tools", "lib"]
 
 [tool.hatch.build.targets.editable]
 path = "."

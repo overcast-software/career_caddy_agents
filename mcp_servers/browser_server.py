@@ -42,7 +42,7 @@ except ImportError:
 
 from playwright.async_api import Browser, BrowserContext, Page
 
-from lib.browser.engine import (
+from browser.engine import (
     BrowserEngineError,
     configure as configure_engine,
     get_engine,
@@ -51,9 +51,9 @@ from lib.browser.engine import (
 )
 from fastmcp import FastMCP
 
-from lib.browser.credentials import Credentials
-from lib.browser.firefox_cookies import load_cookies_for_domain
-from lib.browser.session_store import SessionStore
+from browser.credentials import Credentials
+from browser.firefox_cookies import load_cookies_for_domain
+from browser.session_store import SessionStore
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("fastmcp").setLevel(logging.ERROR)

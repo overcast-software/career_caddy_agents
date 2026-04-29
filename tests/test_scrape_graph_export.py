@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from lib.scrape_graph.graph import NODE_META, export_graph_structure
+from scrape_graph.graph import NODE_META, export_graph_structure
 
 
 _SNAPSHOT_PATH = (

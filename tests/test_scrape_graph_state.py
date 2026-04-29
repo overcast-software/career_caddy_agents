@@ -6,12 +6,12 @@ endpoint is live.
 """
 from __future__ import annotations
 
-from lib.scrape_graph import (
+from scrape_graph import (
     ScrapeGraphState,
     canonicalize_url,
 )
-from lib.scrape_graph.nodes_scrape import _flatten_profile_attrs
-from lib.scrape_graph.url_canonicalize import apply_url_rewrites, urls_differ
+from scrape_graph.nodes_scrape import _flatten_profile_attrs
+from scrape_graph.url_canonicalize import apply_url_rewrites, urls_differ
 
 
 # ----------------------------------------------------------------------
@@ -171,7 +171,7 @@ def test_state_payload_serializable():
 
 
 def test_build_scrape_graph_smoke():
-    from lib.scrape_graph.graph import build_scrape_graph, build_extract_graph
+    from scrape_graph.graph import build_scrape_graph, build_extract_graph
 
     full = build_scrape_graph()
     assert full is not None

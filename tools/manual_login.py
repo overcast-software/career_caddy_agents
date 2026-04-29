@@ -15,9 +15,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lib.browser.credentials import Credentials
-from lib.browser.engine import configure as configure_engine, get_engine, launch_browser
-from lib.browser.session_store import SessionStore
+from browser.credentials import Credentials
+from browser.engine import configure as configure_engine, get_engine, launch_browser
+from browser.session_store import SessionStore
 
 
 async def main(domains: list[str], engine: str) -> None:

@@ -26,12 +26,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib.api_tools import (
     ApiClient, get_scrapes, get_scrape_profile, update_scrape,
 )
-from lib.browser.engine import (
+from browser.engine import (
     configure as configure_engine,
     get_engine,
     launch_browser,
 )
-from lib.browser.resident import ResidentBrowser
+from browser.resident import ResidentBrowser
 from lib.url_unwrap import unwrap_url
 
 # Module-level resident browser; set by the attended main() before the poll loop.
@@ -54,7 +54,7 @@ POLL_INTERVAL = int(os.environ.get("HOLD_POLL_INTERVAL", "30"))
 def _parse_hostname(url: str) -> str:
     """Extract and normalize hostname from a URL."""
     from urllib.parse import urlparse
-    from lib.browser.credentials import Credentials
+    from browser.credentials import Credentials
     raw = urlparse(url).hostname or ""
     return Credentials.normalize_domain(raw) if raw else ""
 
@@ -116,8 +116,8 @@ async def _run_graph(
     api: ApiClient, scrape_id: int, url: str, hostname: str, profile: dict | None,
 ) -> bool:
     """Run the pydantic-graph against a live Playwright page."""
-    from lib.scrape_graph import ScrapeGraphState
-    from lib.scrape_graph.runner import run_scrape_graph
+    from scrape_graph import ScrapeGraphState
+    from scrape_graph.runner import run_scrape_graph
 
     css_selectors = (profile or {}).get("css_selectors") or {}
     cookies = []
@@ -198,7 +198,7 @@ async def _run_graph(
 
 def _is_headless() -> bool:
     """Respect the engine's configured headless flag."""
-    from lib.browser.engine import get_headless
+    from browser.engine import get_headless
     return bool(get_headless())
 
 
@@ -254,7 +254,7 @@ def _parse_args() -> argparse.Namespace:
 def _attended_preseed_domains() -> list[str]:
     """Domains to pre-open tabs for — read from secrets.yml."""
     try:
-        from lib.browser.credentials import Credentials
+        from browser.credentials import Credentials
         creds = Credentials.load()
         return sorted(creds.domains.keys())
     except Exception as exc:
@@ -342,7 +342,7 @@ async def main():
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
-    from lib.browser.engine import get_headless
+    from browser.engine import get_headless
     mode = "attended" if args.attended else "ephemeral"
     logger.info(
         "Hold poller started (mode=%s, interval=%ds, api=%s, engine=%s, headless=%s)",

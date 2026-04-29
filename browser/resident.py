@@ -11,7 +11,7 @@ import asyncio
 import logging
 from typing import Any
 
-from lib.browser.session_store import SessionStore
+from browser.session_store import SessionStore
 
 logger = logging.getLogger(__name__)
 

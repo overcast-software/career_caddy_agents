@@ -10,7 +10,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from lib.browser.credentials import Credentials
+from browser.credentials import Credentials
 
 logger = logging.getLogger(__name__)
 

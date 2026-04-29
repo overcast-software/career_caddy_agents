@@ -77,7 +77,7 @@ python mcp_servers/browser_server.py --engine chrome --headless
 uv run caddy-poller --engine chrome --headless
 
 # Manual login (always headed)
-python scripts/manual_login.py --engine chrome linkedin.com
+python tools/manual_login.py --engine chrome linkedin.com
 ```
 
 Sessions (`~/.career_caddy/sessions/`) are stored in Playwright's universal cookie format and are portable across engines. A session saved with Camoufox works with Chromium and vice versa.
@@ -137,7 +137,7 @@ calls it anymore.
 
 ### Credentials & Browser Auth
 
-`lib/browser/credentials.py` loads two YAML files:
+`browser/credentials.py` loads two YAML files:
 
 **`secrets.yml`** (gitignored — create from `secrets.yml.example`):
 ```yaml
@@ -172,12 +172,12 @@ Resolution order: role-specific env var → `CADDY_DEFAULT_MODEL` → hardcoded 
 | `BROWSER_SCRAPER_MODEL` | browser scraper | gpt-4o-mini |
 | `CADDY_DEFAULT_MODEL` | fallback for all roles | gpt-4o-mini |
 
-The hold poller (`scripts/hold_poller.py`) skips the browser_scraper LLM entirely — it calls `scrape_page()` directly as a Python function, then hands content to the job extractor.
+The hold poller (`pollers/hold_poller.py`) skips the browser_scraper LLM entirely — it calls `scrape_page()` directly as a Python function, then hands content to the job extractor.
 
 ## Scrape Graph (Phase 1b skeleton)
 
 The scrape+extract pipeline is being migrated to an explicit
-pydantic-graph state machine. ai/ owns the runtime; api/ exposes thin
+pydantic-graph state machine. agents/ owns the runtime; api/ exposes thin
 persistence endpoints the graph nodes POST to.
 
 **Status**: Phase 1b skeleton merged. Feature flag defaults to off so
@@ -216,9 +216,9 @@ once Phase 1d ships. The graph itself has no knowledge of who called:
 - `python manage.py dump_graph_traces --since 7d --format jsonl`
   emits training data for offline analysis.
 
-**Canonical node registry**: `ai/lib/scrape_graph/graph.py`. The static
+**Canonical node registry**: `agents/scrape_graph/graph.py`. The static
 snapshot in `api/job_hunting/api/views/graph.py` must stay in sync;
-Phase 1d will export from the ai side to make that automatic.
+Phase 1d will export from the agents side to make that automatic.
 
 ## Tests
 

@@ -37,7 +37,7 @@ from pydantic_ai.mcp import MCPServerSSE
 # Project root so imports work when run from any directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lib.browser.credentials import Credentials, SiteConfig
+from browser.credentials import Credentials, SiteConfig
 
 logfire.configure(service_name="discover_sites", console=False)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
