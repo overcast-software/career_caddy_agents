@@ -355,6 +355,36 @@ async def _shaped_get(
     return _respond(payload)
 
 
+async def _shaped_post(
+    api: "ApiClient",
+    path: str,
+    body: dict,
+    *,
+    shape: dict,
+) -> str:
+    """POST + slim single-record response + serialize."""
+    payload, error, status = await api.post_data(path, body)
+    if error is not None:
+        return _respond(None, error=error, status_code=status)
+    _slim_payload(payload, shape=shape, is_single=True)
+    return _respond(payload)
+
+
+async def _shaped_patch(
+    api: "ApiClient",
+    path: str,
+    body: dict,
+    *,
+    shape: dict,
+) -> str:
+    """PATCH + slim single-record response + serialize."""
+    payload, error, status = await api.patch_data(path, body)
+    if error is not None:
+        return _respond(None, error=error, status_code=status)
+    _slim_payload(payload, shape=shape, is_single=True)
+    return _respond(payload)
+
+
 def _slim_payload(payload: Optional[dict], *, shape: dict,
                   is_single: Optional[bool] = None) -> Optional[dict]:
     """Apply a TOOL_SHAPES row to a JSON:API response payload.
@@ -523,6 +553,16 @@ class ApiClient:
             )
             return self._parse(resp)
 
+    async def patch_data(self, path: str, payload: dict) -> tuple[Optional[dict], Optional[str], int]:
+        """Internal-use PATCH that returns parsed (payload, error, status)."""
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
+            resp = await client.patch(
+                urljoin(self.base_url, path),
+                headers=self._headers,
+                json=payload,
+            )
+            return self._parse(resp)
+
     async def patch(self, path: str, payload: dict) -> str:
         async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
             resp = await client.patch(
@@ -571,13 +611,15 @@ async def create_company(
             size=size,
             location=location,
         )
-        payload = {
+        body = {
             "data": {
                 "type": "company",
                 "attributes": data.model_dump(exclude_none=True),
             }
         }
-        return await api.post("/api/v1/companies/", payload)
+        return await _shaped_post(
+            api, "/api/v1/companies/", body, shape=TOOL_SHAPES["create_company"],
+        )
     except ValueError as e:
         return _respond(None, error=f"Validation error: {e}")
 
@@ -596,6 +638,12 @@ async def find_company_by_name(api: ApiClient, company_name: str) -> str:
             error=f"No companies found matching '{company_name}'",
             status_code=404,
         )
+    # Slim each company per audit (relationships → counts).
+    shape = TOOL_SHAPES["find_company_by_name"]
+    rels_mode = shape.get("relationships", "counts")
+    for c in companies:
+        if isinstance(c, dict):
+            _slim_record(c, attrs=shape.get("attrs"), relationships=rels_mode)
     return _respond({"companies": companies, "count": len(companies)})
 
 
@@ -627,7 +675,12 @@ async def get_companies(api: ApiClient, id: Optional[int] = None) -> str:
 
 async def find_job_post_by_link(api: ApiClient, link: str) -> str:
     """Find a job post by its original posting URL."""
-    return await api.get("/api/v1/job-posts/", params={"filter[link]": link})
+    return await _shaped_get(
+        api,
+        "/api/v1/job-posts/",
+        shape=TOOL_SHAPES["find_job_post_by_link"],
+        params={"filter[link]": link},
+    )
 
 
 async def create_job_post_with_company_check(
@@ -733,7 +786,7 @@ async def create_job_post_with_company_check(
         )
         attributes = job_data.model_dump(exclude={"company_id"}, exclude_none=True)
         attributes["source"] = source
-        payload = {
+        body = {
             "data": {
                 "type": "job-post",
                 "attributes": attributes,
@@ -742,7 +795,10 @@ async def create_job_post_with_company_check(
                 },
             }
         }
-        return await api.post("/api/v1/job-posts/", payload)
+        return await _shaped_post(
+            api, "/api/v1/job-posts/", body,
+            shape=TOOL_SHAPES["create_job_post_with_company_check"],
+        )
 
     except Exception as e:
         return _respond(None, error=f"Error creating job post with company check: {e}")
@@ -842,7 +898,7 @@ async def update_job_post(
     if not attributes and company_id is None:
         return _respond(None, error="No fields provided to update")
 
-    payload: dict = {
+    body: dict = {
         "data": {
             "type": "job-post",
             "id": str(job_post_id),
@@ -850,10 +906,13 @@ async def update_job_post(
         }
     }
     if company_id is not None:
-        payload["data"]["relationships"] = {
+        body["data"]["relationships"] = {
             "company": {"data": {"type": "company", "id": str(company_id)}}
         }
-    return await api.patch(f"/api/v1/job-posts/{job_post_id}/", payload)
+    return await _shaped_patch(
+        api, f"/api/v1/job-posts/{job_post_id}/", body,
+        shape=TOOL_SHAPES["update_job_post"],
+    )
 
 
 async def create_job_application(
@@ -876,7 +935,7 @@ async def create_job_application(
     if applied_at is not None:
         attributes["applied_at"] = applied_at
 
-    payload = {
+    body = {
         "data": {
             "type": "job-application",
             "attributes": attributes,
@@ -885,7 +944,10 @@ async def create_job_application(
             },
         }
     }
-    return await api.post("/api/v1/job-applications/", payload)
+    return await _shaped_post(
+        api, "/api/v1/job-applications/", body,
+        shape=TOOL_SHAPES["create_job_application"],
+    )
 
 
 async def get_job_applications(
@@ -945,7 +1007,7 @@ async def update_job_application(
     if not attributes and company_id is None:
         return _respond(None, error="No fields provided to update")
 
-    payload: dict = {
+    body: dict = {
         "data": {
             "type": "job-application",
             "id": str(application_id),
@@ -953,15 +1015,36 @@ async def update_job_application(
         }
     }
     if company_id is not None:
-        payload["data"]["relationships"] = {
+        body["data"]["relationships"] = {
             "company": {"data": {"type": "company", "id": str(company_id)}}
         }
-    return await api.patch(f"/api/v1/job-applications/{application_id}/", payload)
+    return await _shaped_patch(
+        api, f"/api/v1/job-applications/{application_id}/", body,
+        shape=TOOL_SHAPES["update_job_application"],
+    )
 
 
 async def get_career_data(api: ApiClient) -> str:
     """Fetch the user's personal career profile."""
-    return await api.get("/api/v1/career-data/")
+    payload, error, status = await api.get_data("/api/v1/career-data/")
+    if error is not None:
+        return _respond(None, error=error, status_code=status)
+    # career-data is a flat dict of nested arrays per resource type
+    # ({"resume": [...], "skill": [...], ...}). Trim every nested record
+    # to the per-section attr list in TOOL_SHAPES.
+    section_attrs = TOOL_SHAPES["get_career_data"]["section_attrs"]
+    if isinstance(payload, dict):
+        for section, attrs in section_attrs.items():
+            rows = payload.get(section)
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict):
+                        # career-data records are flat (no JSON:API wrapper),
+                        # so filter the dict in place.
+                        for k in list(row.keys()):
+                            if k not in attrs and k != "id":
+                                row.pop(k, None)
+    return _respond(payload)
 
 
 async def get_resumes(
@@ -1019,11 +1102,13 @@ async def create_scrape(
             "data": {"type": "company", "id": str(company_id)}
         }
 
-    payload: dict = {"data": {"type": "scrape", "attributes": attributes}}
+    body: dict = {"data": {"type": "scrape", "attributes": attributes}}
     if relationships:
-        payload["data"]["relationships"] = relationships
+        body["data"]["relationships"] = relationships
 
-    return await api.post("/api/v1/scrapes/", payload)
+    return await _shaped_post(
+        api, "/api/v1/scrapes/", body, shape=TOOL_SHAPES["create_scrape"],
+    )
 
 
 async def get_scrapes(
@@ -1079,14 +1164,17 @@ async def update_scrape(
     if not attributes:
         return _respond(None, error="No fields provided to update")
 
-    payload = {
+    body = {
         "data": {
             "type": "scrape",
             "id": str(scrape_id),
             "attributes": attributes,
         }
     }
-    return await api.patch(f"/api/v1/scrapes/{scrape_id}/", payload)
+    return await _shaped_patch(
+        api, f"/api/v1/scrapes/{scrape_id}/", body,
+        shape=TOOL_SHAPES["update_scrape"],
+    )
 
 
 async def upload_screenshot(api: ApiClient, scrape_id: int, file_path: Path) -> str:
@@ -1134,7 +1222,12 @@ async def fetch_screenshot_bytes(api: ApiClient, scrape_id: int, filename: str) 
 
 async def get_scrape_profile(api: ApiClient, hostname: str) -> str:
     """Fetch the scrape profile for a hostname. Returns profile data or empty."""
-    return await api.get("/api/v1/scrape-profiles/", params={"filter[hostname]": hostname})
+    return await _shaped_get(
+        api,
+        "/api/v1/scrape-profiles/",
+        shape=TOOL_SHAPES["get_scrape_profile"],
+        params={"filter[hostname]": hostname},
+    )
 
 
 async def update_scrape_profile(api: ApiClient, profile_id: int, **attrs) -> str:
@@ -1142,14 +1235,17 @@ async def update_scrape_profile(api: ApiClient, profile_id: int, **attrs) -> str
     json_attrs = {}
     for key, value in attrs.items():
         json_attrs[key.replace("_", "-")] = value
-    payload = {
+    body = {
         "data": {
             "type": "scrape-profile",
             "id": str(profile_id),
             "attributes": json_attrs,
         }
     }
-    return await api.patch(f"/api/v1/scrape-profiles/{profile_id}/", payload)
+    return await _shaped_patch(
+        api, f"/api/v1/scrape-profiles/{profile_id}/", body,
+        shape=TOOL_SHAPES["update_scrape_profile"],
+    )
 
 
 async def get_questions(

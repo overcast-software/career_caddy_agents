@@ -14,7 +14,6 @@ Security invariants:
     - No secrets.yml or mail directory access
 """
 
-import json
 import logging
 import os
 import sys
@@ -123,10 +122,22 @@ def _api() -> ApiClient:
 @server.tool()
 async def get_current_user() -> str:
     """Returns the authenticated user's profile. Use this to know who you are acting as."""
+    from lib.api_tools import TOOL_SHAPES, _respond, _slim_payload
+    shape = TOOL_SHAPES["get_current_user"]
+    attrs_keep = shape.get("attrs") or []
+
     access = get_access_token()
     if access and access.claims.get("user"):
-        return json.dumps(access.claims["user"], indent=2)
-    return await _api().get("/api/v1/me/")
+        # JWT claims is a flat dict, not JSON:API. Filter to audit attrs.
+        user = dict(access.claims["user"])
+        slim = {k: v for k, v in user.items() if k in attrs_keep or k == "id"}
+        return _respond(slim)
+
+    payload, error, status = await _api().get_data("/api/v1/me/")
+    if error is not None:
+        return _respond(None, error=error, status_code=status)
+    _slim_payload(payload, shape=shape, is_single=True)
+    return _respond(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -453,14 +464,14 @@ async def fetch_scrape_screenshot(scrape_id: int, filename: str) -> str:
     pass into a vision model as BinaryContent(media_type="image/png").
     """
     import base64
+    from lib.api_tools import _respond
     data = await api_tools.fetch_screenshot_bytes(_api(), scrape_id, filename)
-    return json.dumps({
-        "success": True,
+    return _respond({
         "scrape_id": scrape_id,
         "filename": filename,
         "media_type": "image/png",
-        "data_base64": base64.b64encode(data).decode("ascii"),
         "size_bytes": len(data),
+        "data_base64": base64.b64encode(data).decode("ascii"),
     })
 
 
@@ -498,7 +509,8 @@ async def update_scrape_profile(
     if enabled is not None:
         attrs["enabled"] = enabled
     if not attrs:
-        return json.dumps({"success": False, "error": "No fields provided to update"})
+        from lib.api_tools import _respond
+        return _respond(None, error="No fields provided to update")
     return await api_tools.update_scrape_profile(_api(), profile_id, **attrs)
 
 
