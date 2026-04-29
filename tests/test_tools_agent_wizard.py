@@ -1,9 +1,9 @@
 """Tests for the Agent Wizard tools registered in lib.api_tools."""
 
-import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import yaml
 
 from lib.api_tools import (
     ApiClient,
@@ -17,10 +17,9 @@ from lib.api_tools import (
 
 
 def _ok(data, status=200):
-    return json.dumps(
-        {"success": True, "data": data, "error": None, "status_code": status},
-        indent=2,
-    )
+    """Build the new YAML response shape — agent-facing tools return the
+    payload directly with no outer envelope."""
+    return yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
 
 
 @pytest.fixture
@@ -56,8 +55,7 @@ class TestEditResume:
 
     @pytest.mark.asyncio
     async def test_rejects_empty_update(self, api):
-        result = json.loads(await edit_resume(api, resume_id=1))
-        assert result["success"] is False
+        result = yaml.safe_load(await edit_resume(api, resume_id=1))
         assert "at least one field" in result["error"]
 
 
@@ -93,8 +91,8 @@ class TestEditCoverLetter:
 
     @pytest.mark.asyncio
     async def test_rejects_empty_update(self, api):
-        result = json.loads(await edit_cover_letter(api, cover_letter_id=3))
-        assert result["success"] is False
+        result = yaml.safe_load(await edit_cover_letter(api, cover_letter_id=3))
+        assert "error" in result
 
 
 class TestReconcileOnboarding:
@@ -105,20 +103,24 @@ class TestReconcileOnboarding:
             "post",
             new=AsyncMock(return_value=_ok({"wizard_enabled": True, "resume_imported": True})),
         ) as mock:
-            result = json.loads(await reconcile_onboarding(api))
+            result = yaml.safe_load(await reconcile_onboarding(api))
         mock.assert_awaited_once()
         path, payload = mock.await_args.args
         assert path == "/api/v1/onboarding/reconcile/"
         assert payload == {}
-        assert result["success"] is True
-        assert result["data"]["resume_imported"] is True
+        assert result["resume_imported"] is True
 
 
 class TestEditProfileOnboarding:
     @pytest.mark.asyncio
     async def test_resolves_me_then_patches_user(self, api):
-        me_response = _ok(
-            {"data": {"type": "user", "id": "11", "attributes": {"onboarding": {}}}}
+        # edit_profile_onboarding now uses get_data (parsed) for the /me/
+        # lookup so it can read the user id without round-tripping through
+        # the agent-facing YAML serializer.
+        me_payload = (
+            {"data": {"type": "user", "id": "11", "attributes": {"onboarding": {}}}},
+            None,
+            200,
         )
         patch_response = _ok(
             {
@@ -129,9 +131,9 @@ class TestEditProfileOnboarding:
                 }
             }
         )
-        with patch.object(ApiClient, "get", new=AsyncMock(return_value=me_response)) as mock_get, \
+        with patch.object(ApiClient, "get_data", new=AsyncMock(return_value=me_payload)) as mock_get, \
              patch.object(ApiClient, "patch", new=AsyncMock(return_value=patch_response)) as mock_patch:
-            result = json.loads(
+            result = yaml.safe_load(
                 await edit_profile_onboarding(api, {"resume_reviewed": True})
             )
 
@@ -139,31 +141,25 @@ class TestEditProfileOnboarding:
         path, payload = mock_patch.await_args.args
         assert path == "/api/v1/users/11/"
         assert payload["data"]["attributes"]["onboarding"] == {"resume_reviewed": True}
-        assert result["success"] is True
+        assert "error" not in result
+        assert result["data"]["id"] == "11"
 
     @pytest.mark.asyncio
     async def test_rejects_empty_patch(self, api):
-        result = json.loads(await edit_profile_onboarding(api, {}))
-        assert result["success"] is False
+        result = yaml.safe_load(await edit_profile_onboarding(api, {}))
+        assert "error" in result
 
     @pytest.mark.asyncio
     async def test_rejects_non_dict_patch(self, api):
-        result = json.loads(await edit_profile_onboarding(api, None))
-        assert result["success"] is False
+        result = yaml.safe_load(await edit_profile_onboarding(api, None))
+        assert "error" in result
 
     @pytest.mark.asyncio
     async def test_propagates_me_lookup_failure(self, api):
-        failure = json.dumps(
-            {
-                "success": False,
-                "data": None,
-                "error": "401 - unauthorized",
-                "status_code": 401,
-            },
-            indent=2,
-        )
-        with patch.object(ApiClient, "get", new=AsyncMock(return_value=failure)), \
+        failure = (None, "401 - unauthorized", 401)
+        with patch.object(ApiClient, "get_data", new=AsyncMock(return_value=failure)), \
              patch.object(ApiClient, "patch", new=AsyncMock()) as mock_patch:
-            result = json.loads(await edit_profile_onboarding(api, {"resume_reviewed": True}))
-        assert result["success"] is False
+            result = yaml.safe_load(await edit_profile_onboarding(api, {"resume_reviewed": True}))
+        assert "error" in result
+        assert "401" in result["error"]
         mock_patch.assert_not_called()

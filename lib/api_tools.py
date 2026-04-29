@@ -7,7 +7,6 @@ with a base_url and a token — the caller decides where the token comes from.
 """
 
 import asyncio
-import json
 import os
 import time
 from pathlib import Path
@@ -381,21 +380,31 @@ class ApiClient:
             "X-Forwarded-Proto": "https",
         }
 
-    def _ok(self, response: httpx.Response) -> str:
+    def _parse(self, response: httpx.Response) -> tuple[Optional[dict], Optional[str], int]:
+        """Parse an httpx Response into (payload, error, status_code).
+
+        On 2xx: payload is the JSON body (post-_inject_frontend_urls), error
+        is None.
+        On non-2xx: payload is None, error is a short string.
+
+        Used by both the agent-facing _ok (which serializes to YAML) and the
+        internal *_data methods that need to inspect the response without
+        round-tripping through a string format.
+        """
         if response.status_code in (200, 201, 202):
             body = response.json()
             _inject_frontend_urls(body)
-            result = APIResponse(
-                success=True, data=body, status_code=response.status_code
-            )
-        else:
-            text = response.text[:500] if len(response.text) > 500 else response.text
-            result = APIResponse(
-                success=False,
-                error=f"{response.status_code} - {text}",
-                status_code=response.status_code,
-            )
-        return json.dumps(result.model_dump(), indent=2)
+            return body, None, response.status_code
+        text = response.text[:500] if len(response.text) > 500 else response.text
+        return None, f"{response.status_code} - {text}", response.status_code
+
+    def _ok(self, response: httpx.Response) -> str:
+        """Agent-facing serializer. Returns a YAML string with no outer
+        envelope; errors land as a top-level `error:` key."""
+        payload, error, status = self._parse(response)
+        if error is not None:
+            return _respond(None, error=error, status_code=status)
+        return _respond(payload)
 
     async def get(self, path: str, params: dict | None = None) -> str:
         async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
@@ -406,11 +415,26 @@ class ApiClient:
             )
             return self._ok(resp)
 
+    async def get_data(self, path: str, params: dict | None = None) -> tuple[Optional[dict], Optional[str], int]:
+        """Internal-use GET that returns parsed (payload, error, status).
+
+        Tools that need to inspect the response (e.g. find duplicate
+        before creating, chain a child request) should use this instead
+        of json.loads-ing the agent-facing YAML output.
+        """
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
+            resp = await client.get(
+                urljoin(self.base_url, path),
+                headers=self._headers,
+                params=params,
+            )
+            return self._parse(resp)
+
     async def get_text(self, path: str, params: dict | None = None) -> str:
         """GET an endpoint that returns a non-JSON body (e.g. text/markdown).
 
-        Returns the raw body on 2xx; on error returns a JSON error envelope
-        matching the APIResponse shape so callers can branch the same way.
+        Returns the raw body on 2xx; on error returns a YAML error string
+        matching the agent-facing shape so callers can branch the same way.
         """
         async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
             resp = await client.get(
@@ -421,13 +445,10 @@ class ApiClient:
         if resp.status_code in (200, 201, 202):
             return resp.text
         text = resp.text[:500] if len(resp.text) > 500 else resp.text
-        return json.dumps(
-            APIResponse(
-                success=False,
-                error=f"{resp.status_code} - {text}",
-                status_code=resp.status_code,
-            ).model_dump(),
-            indent=2,
+        return _respond(
+            None,
+            error=f"{resp.status_code} - {text}",
+            status_code=resp.status_code,
         )
 
     async def post(self, path: str, payload: dict) -> str:
@@ -438,6 +459,16 @@ class ApiClient:
                 json=payload,
             )
             return self._ok(resp)
+
+    async def post_data(self, path: str, payload: dict) -> tuple[Optional[dict], Optional[str], int]:
+        """Internal-use POST that returns parsed (payload, error, status)."""
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
+            resp = await client.post(
+                urljoin(self.base_url, path),
+                headers=self._headers,
+                json=payload,
+            )
+            return self._parse(resp)
 
     async def patch(self, path: str, payload: dict) -> str:
         async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, trust_env=False) as client:
@@ -495,36 +526,24 @@ async def create_company(
         }
         return await api.post("/api/v1/companies/", payload)
     except ValueError as e:
-        return json.dumps(
-            APIResponse(success=False, error=f"Validation error: {e}").model_dump(),
-            indent=2,
-        )
+        return _respond(None, error=f"Validation error: {e}")
 
 
 async def find_company_by_name(api: ApiClient, company_name: str) -> str:
     """Find a company by name (case-insensitive search)."""
-    result = await api.get("/api/v1/companies/", params={"filter[query]": company_name})
-    data = json.loads(result)
-    if data.get("success"):
-        companies = data.get("data", {}).get("data", [])
-        if companies:
-            return json.dumps(
-                APIResponse(
-                    success=True,
-                    data={"companies": companies, "count": len(companies)},
-                    status_code=200,
-                ).model_dump(),
-                indent=2,
-            )
-        return json.dumps(
-            APIResponse(
-                success=False,
-                error=f"No companies found matching '{company_name}'",
-                status_code=404,
-            ).model_dump(),
-            indent=2,
+    payload, error, status = await api.get_data(
+        "/api/v1/companies/", params={"filter[query]": company_name}
+    )
+    if error is not None:
+        return _respond(None, error=error, status_code=status)
+    companies = (payload or {}).get("data", []) or []
+    if not companies:
+        return _respond(
+            None,
+            error=f"No companies found matching '{company_name}'",
+            status_code=404,
         )
-    return result
+    return _respond({"companies": companies, "count": len(companies)})
 
 
 async def search_companies(
@@ -581,79 +600,65 @@ async def create_job_post_with_company_check(
     """
     job_url = url or link
     if not company_name:
-        return json.dumps(
-            APIResponse(
-                success=False, error="company_name is required to create a job post"
-            ).model_dump(),
-            indent=2,
+        return _respond(
+            None, error="company_name is required to create a job post"
         )
 
     _PLACEHOLDER_NAMES = {"unknown", "n/a", "na", "none", "tbd", "not specified", ""}
     if company_name.strip().lower() in _PLACEHOLDER_NAMES:
-        return json.dumps(
-            APIResponse(
-                success=False,
-                error=(
-                    f"'{company_name}' is not an acceptable company name. "
-                    "Infer the company from: (1) the recruiter's company, "
-                    "(2) the email sender domain, (3) the job posting URL domain. "
-                    "If you cannot determine the company, ask the user."
-                ),
-            ).model_dump(),
-            indent=2,
+        return _respond(
+            None,
+            error=(
+                f"'{company_name}' is not an acceptable company name. "
+                "Infer the company from: (1) the recruiter's company, "
+                "(2) the email sender domain, (3) the job posting URL domain. "
+                "If you cannot determine the company, ask the user."
+            ),
         )
 
     try:
         # Check for duplicate by URL
         if job_url:
-            existing = json.loads(await find_job_post_by_link(api, job_url))
-            if existing.get("success"):
-                posts = existing.get("data", {}).get("data", [])
-                if posts:
-                    existing_id = posts[0].get("id")
-                    return json.dumps(
-                        APIResponse(
-                            success=False,
-                            error=f"Duplicate: job post with this link already exists (id={existing_id})",
-                            status_code=409,
-                            data={"duplicate": True, "existing_id": existing_id},
-                        ).model_dump(),
-                        indent=2,
-                    )
+            existing_payload, _, _ = await api.get_data(
+                "/api/v1/job-posts/", params={"filter[link]": job_url}
+            )
+            posts = (existing_payload or {}).get("data", []) or []
+            if posts:
+                existing_id = posts[0].get("id")
+                return _respond({
+                    "error": f"Duplicate: job post with this link already exists (id={existing_id})",
+                    "status_code": 409,
+                    "duplicate": True,
+                    "existing_id": existing_id,
+                })
 
         # Search for existing company
-        company_search = json.loads(await find_company_by_name(api, company_name))
+        company_search_payload, _, _ = await api.get_data(
+            "/api/v1/companies/", params={"filter[query]": company_name}
+        )
         company_id = None
-        if company_search.get("success"):
-            companies = company_search.get("data", {}).get("companies", [])
-            if companies:
-                company_id = int(companies[0].get("id"))
+        existing_companies = (company_search_payload or {}).get("data", []) or []
+        if existing_companies:
+            company_id = int(existing_companies[0].get("id"))
 
         # Create company if not found
         if company_id is None:
-            create_result = json.loads(
-                await create_company(
-                    api,
-                    name=company_name,
-                    description=company_description,
-                    website=company_website,
-                    industry=company_industry,
-                    size=company_size,
-                    location=company_location,
-                )
+            company_data = CompanyData(
+                name=company_name,
+                description=company_description,
+                website=company_website,
+                industry=company_industry,
+                size=company_size,
+                location=company_location,
             )
-            if create_result.get("success"):
-                company_id = int(
-                    create_result.get("data", {}).get("data", {}).get("id")
-                )
-            else:
-                return json.dumps(
-                    APIResponse(
-                        success=False,
-                        error=f"Failed to create company: {create_result.get('error')}",
-                    ).model_dump(),
-                    indent=2,
-                )
+            create_payload, create_err, _ = await api.post_data(
+                "/api/v1/companies/",
+                {"data": {"type": "company", "attributes": company_data.model_dump(exclude_none=True)}},
+            )
+            if create_err is not None:
+                return _respond(None, error=f"Failed to create company: {create_err}")
+            new_company = (create_payload or {}).get("data", {}) or {}
+            company_id = int(new_company.get("id"))
 
         # Create the job post
         job_data = JobPostCreate(
@@ -682,13 +687,7 @@ async def create_job_post_with_company_check(
         return await api.post("/api/v1/job-posts/", payload)
 
     except Exception as e:
-        return json.dumps(
-            APIResponse(
-                success=False,
-                error=f"Error creating job post with company check: {e}",
-            ).model_dump(),
-            indent=2,
-        )
+        return _respond(None, error=f"Error creating job post with company check: {e}")
 
 
 async def search_job_posts(
@@ -776,10 +775,7 @@ async def update_job_post(
         attributes["posted_date"] = posted_date
 
     if not attributes and company_id is None:
-        return json.dumps(
-            APIResponse(success=False, error="No fields provided to update").model_dump(),
-            indent=2,
-        )
+        return _respond(None, error="No fields provided to update")
 
     payload: dict = {
         "data": {
@@ -804,12 +800,9 @@ async def create_job_application(
 ) -> str:
     """Create a new job application linked to an existing job post."""
     if job_post_id <= 0:
-        return json.dumps(
-            APIResponse(
-                success=False,
-                error=f"Invalid job_post_id={job_post_id}. Look up the real ID first.",
-            ).model_dump(),
-            indent=2,
+        return _respond(
+            None,
+            error=f"Invalid job_post_id={job_post_id}. Look up the real ID first.",
         )
 
     attributes: dict = {"status": status}
@@ -876,10 +869,7 @@ async def update_job_application(
         attributes["applied_at"] = applied_at
 
     if not attributes and company_id is None:
-        return json.dumps(
-            APIResponse(success=False, error="No fields provided to update").model_dump(),
-            indent=2,
-        )
+        return _respond(None, error="No fields provided to update")
 
     payload: dict = {
         "data": {
@@ -1003,10 +993,7 @@ async def update_scrape(
         attributes["note"] = note
 
     if not attributes:
-        return json.dumps(
-            APIResponse(success=False, error="No fields provided to update").model_dump(),
-            indent=2,
-        )
+        return _respond(None, error="No fields provided to update")
 
     payload = {
         "data": {
@@ -1262,19 +1249,16 @@ async def _raw_get_scrape(api: ApiClient, scrape_id: int) -> dict:
         return resp.json()
 
 
-def _err(message: str, **data) -> str:
-    return json.dumps(
-        APIResponse(success=False, error=message, data=data or None).model_dump(),
-        indent=2,
-    )
+def _composite_err(message: str, **data) -> str:
+    payload = {"error": message}
+    if data:
+        payload.update(data)
+    return _respond(payload)
 
 
-def _ok(message: str, **data) -> str:
+def _composite_ok(message: str, **data) -> str:
     payload = {"message": message, **data}
-    return json.dumps(
-        APIResponse(success=True, data=payload, status_code=200).model_dump(),
-        indent=2,
-    )
+    return _respond(payload)
 
 
 async def scrape_and_score(
@@ -1292,21 +1276,26 @@ async def scrape_and_score(
     is disabled (501); in that case the hold-poller must be running.
     """
     # 1. Create scrape (try pending first)
-    create_resp = json.loads(await create_scrape(api, url))
+    create_payload, create_err, create_status = await api.post_data(
+        "/api/v1/scrapes/", {"data": {"type": "scrape", "attributes": {"url": url}}}
+    )
     hold_fallback = False
-    if not create_resp.get("success"):
-        if create_resp.get("status_code") == 501:
+    if create_err is not None:
+        if create_status == 501:
             hold_fallback = True
-            create_resp = json.loads(await create_scrape(api, url, status="hold"))
-            if not create_resp.get("success"):
-                return _err(f"Failed to create scrape (hold fallback): {create_resp.get('error')}")
+            create_payload, create_err, _ = await api.post_data(
+                "/api/v1/scrapes/",
+                {"data": {"type": "scrape", "attributes": {"url": url, "status": "hold"}}},
+            )
+            if create_err is not None:
+                return _composite_err(f"Failed to create scrape (hold fallback): {create_err}")
         else:
-            return _err(f"Failed to create scrape: {create_resp.get('error')}")
+            return _composite_err(f"Failed to create scrape: {create_err}")
 
-    scrape_data = create_resp.get("data", {}).get("data", {})
+    scrape_data = (create_payload or {}).get("data", {}) or {}
     scrape_id = scrape_data.get("id")
     if scrape_id is None:
-        return _err("Scrape created but no id returned", response=create_resp)
+        return _composite_err("Scrape created but no id returned", response=create_payload)
     scrape_id = int(scrape_id)
 
     # 2. Poll for terminal status
@@ -1317,14 +1306,14 @@ async def scrape_and_score(
         try:
             scrape_body = await _raw_get_scrape(api, scrape_id)
         except httpx.HTTPError as exc:
-            return _err(f"Error polling scrape {scrape_id}: {exc}", scrape_id=scrape_id)
+            return _composite_err(f"Error polling scrape {scrape_id}: {exc}", scrape_id=scrape_id)
 
         attrs = scrape_body.get("data", {}).get("attributes", {}) or {}
         last_status = attrs.get("status")
         if last_status in _SCRAPE_TERMINAL:
             break
         if time.monotonic() >= deadline:
-            return _err(
+            return _composite_err(
                 f"Timed out after {timeout:.0f}s waiting for scrape {scrape_id}; "
                 f"last status={last_status}.",
                 scrape_id=scrape_id,
@@ -1334,7 +1323,7 @@ async def scrape_and_score(
         await asyncio.sleep(poll_interval)
 
     if last_status == "failed":
-        return _err(
+        return _composite_err(
             f"Scrape {scrape_id} failed.",
             scrape_id=scrape_id,
             last_status=last_status,
@@ -1359,7 +1348,7 @@ async def scrape_and_score(
         job_post_id = _extract_job_post_id(scrape_body)
 
     if job_post_id is None:
-        return _err(
+        return _composite_err(
             f"Scrape {scrape_id} completed but no job-post was linked yet. "
             "Try the 'parse' action on the scrape to extract the job post.",
             scrape_id=scrape_id,
@@ -1367,7 +1356,7 @@ async def scrape_and_score(
 
     # 4. Create the score
     if resume_id is not None:
-        payload = {
+        score_post = {
             "data": {
                 "type": "score",
                 "attributes": {},
@@ -1377,18 +1366,25 @@ async def scrape_and_score(
                 },
             }
         }
-        score_resp = json.loads(await api.post("/api/v1/scores/", payload))
     else:
-        score_resp = json.loads(await score_job_post(api, job_post_id))
-
-    if not score_resp.get("success"):
-        return _err(
-            f"Scrape completed but score creation failed: {score_resp.get('error')}",
+        score_post = {
+            "data": {
+                "type": "score",
+                "attributes": {},
+                "relationships": {
+                    "job-post": {"data": {"type": "job-post", "id": str(job_post_id)}}
+                },
+            }
+        }
+    score_payload, score_err, _ = await api.post_data("/api/v1/scores/", score_post)
+    if score_err is not None:
+        return _composite_err(
+            f"Scrape completed but score creation failed: {score_err}",
             scrape_id=scrape_id,
             job_post_id=job_post_id,
         )
 
-    score_data = score_resp.get("data", {}).get("data", {})
+    score_data = (score_payload or {}).get("data", {}) or {}
     score_id = int(score_data["id"]) if score_data.get("id") else None
     score_status = (score_data.get("attributes") or {}).get("status")
 
@@ -1407,7 +1403,7 @@ async def scrape_and_score(
             "Note: scraping runs via hold-queue (the hold-poller must be running).",
         )
 
-    return _ok(
+    return _composite_ok(
         " ".join(message_parts),
         scrape_id=scrape_id,
         job_post_id=job_post_id,
@@ -1465,12 +1461,8 @@ async def edit_resume(
     if favorite is not None:
         attributes["favorite"] = favorite
     if not attributes:
-        return json.dumps(
-            APIResponse(
-                success=False,
-                error="edit_resume requires at least one field to update",
-            ).model_dump(),
-            indent=2,
+        return _respond(
+            None, error="edit_resume requires at least one field to update"
         )
     payload = {
         "data": {
@@ -1505,12 +1497,8 @@ async def edit_cover_letter(
     if status is not None:
         attributes["status"] = status
     if not attributes:
-        return json.dumps(
-            APIResponse(
-                success=False,
-                error="edit_cover_letter requires at least one field to update",
-            ).model_dump(),
-            indent=2,
+        return _respond(
+            None, error="edit_cover_letter requires at least one field to update"
         )
     payload = {
         "data": {
@@ -1539,13 +1527,10 @@ async def import_resume_from_url(
         ) as client:
             resp = await client.get(url)
         if resp.status_code != 200:
-            return json.dumps(
-                APIResponse(
-                    success=False,
-                    error=f"Download failed: {resp.status_code}",
-                    status_code=resp.status_code,
-                ).model_dump(),
-                indent=2,
+            return _respond(
+                None,
+                error=f"Download failed: {resp.status_code}",
+                status_code=resp.status_code,
             )
         filename = resume_name or url.rsplit("/", 1)[-1] or "resume.docx"
         async with httpx.AsyncClient(
@@ -1567,12 +1552,7 @@ async def import_resume_from_url(
             )
         return api._ok(upload_resp)
     except Exception as e:
-        return json.dumps(
-            APIResponse(
-                success=False, error=f"import_resume_from_url: {e}"
-            ).model_dump(),
-            indent=2,
-        )
+        return _respond(None, error=f"import_resume_from_url: {e}")
 
 
 async def reconcile_onboarding(api: ApiClient) -> str:
@@ -1600,25 +1580,15 @@ async def edit_profile_onboarding(api: ApiClient, patch: dict) -> str:
         edit_profile_onboarding({"wizard_enabled": false})
     """
     if not isinstance(patch, dict) or not patch:
-        return json.dumps(
-            APIResponse(
-                success=False,
-                error="edit_profile_onboarding requires a non-empty dict",
-            ).model_dump(),
-            indent=2,
+        return _respond(
+            None, error="edit_profile_onboarding requires a non-empty dict"
         )
-    me_raw = await api.get("/api/v1/me/")
-    me = json.loads(me_raw)
-    if not me.get("success"):
-        return me_raw
-    user_id = me.get("data", {}).get("data", {}).get("id")
+    me_payload, me_err, me_status = await api.get_data("/api/v1/me/")
+    if me_err is not None:
+        return _respond(None, error=me_err, status_code=me_status)
+    user_id = (me_payload or {}).get("data", {}).get("id")
     if not user_id:
-        return json.dumps(
-            APIResponse(
-                success=False, error="Could not resolve authenticated user id"
-            ).model_dump(),
-            indent=2,
-        )
+        return _respond(None, error="Could not resolve authenticated user id")
     payload = {
         "data": {
             "type": "user",

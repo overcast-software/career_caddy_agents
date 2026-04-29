@@ -1,6 +1,5 @@
 """Tests for lib.api_tools — ApiClient and tool functions."""
 
-import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -34,36 +33,57 @@ class TestApiClient:
         client = ApiClient("http://test:8000", "jh_x")
         response = MagicMock(spec=httpx.Response)
         response.status_code = 200
-        response.json.return_value = {"data": {"id": "1"}}
-        result = json.loads(client._ok(response))
-        assert result["success"] is True
-        assert result["status_code"] == 200
-        assert result["data"]["data"]["id"] == "1"
+        response.json.return_value = {"data": {"type": "company", "id": "1"}}
+        result = yaml.safe_load(client._ok(response))
+        # No outer envelope: the JSON:API body sits at the top.
+        assert "success" not in result
+        assert "status_code" not in result
+        assert result["data"]["id"] == "1"
 
     def test_ok_201(self):
         client = ApiClient("http://test:8000", "jh_x")
         response = MagicMock(spec=httpx.Response)
         response.status_code = 201
-        response.json.return_value = {"data": {"id": "2"}}
-        result = json.loads(client._ok(response))
-        assert result["success"] is True
+        response.json.return_value = {"data": {"type": "company", "id": "2"}}
+        result = yaml.safe_load(client._ok(response))
+        assert result["data"]["id"] == "2"
 
     def test_ok_error(self):
         client = ApiClient("http://test:8000", "jh_x")
         response = MagicMock(spec=httpx.Response)
         response.status_code = 404
         response.text = "Not found"
-        result = json.loads(client._ok(response))
-        assert result["success"] is False
+        result = yaml.safe_load(client._ok(response))
         assert "404" in result["error"]
+        assert result["status_code"] == 404
 
     def test_ok_truncates_long_errors(self):
         client = ApiClient("http://test:8000", "jh_x")
         response = MagicMock(spec=httpx.Response)
         response.status_code = 500
         response.text = "x" * 1000
-        result = json.loads(client._ok(response))
+        result = yaml.safe_load(client._ok(response))
         assert len(result["error"]) < 600
+
+    def test_parse_returns_payload_on_2xx(self):
+        client = ApiClient("http://test:8000", "jh_x")
+        response = MagicMock(spec=httpx.Response)
+        response.status_code = 200
+        response.json.return_value = {"data": {"id": "9"}}
+        payload, error, status = client._parse(response)
+        assert payload == {"data": {"id": "9"}}
+        assert error is None
+        assert status == 200
+
+    def test_parse_returns_error_on_non_2xx(self):
+        client = ApiClient("http://test:8000", "jh_x")
+        response = MagicMock(spec=httpx.Response)
+        response.status_code = 404
+        response.text = "Not found"
+        payload, error, status = client._parse(response)
+        assert payload is None
+        assert "404" in error
+        assert status == 404
 
 
 # ---------------------------------------------------------------------------

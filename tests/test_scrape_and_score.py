@@ -1,25 +1,21 @@
 """Tests for lib.api_tools.scrape_and_score."""
 
-import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import yaml
 
 from lib.api_tools import ApiClient, scrape_and_score
 
 
-def _api_response(data, status_code=200):
-    return json.dumps(
-        {"success": True, "data": data, "error": None, "status_code": status_code},
-        indent=2,
-    )
+def _post_data_ok(body: dict, status_code: int = 200):
+    """Build a (payload, error, status_code) tuple as ApiClient.post_data
+    would return — used to mock chained calls in scrape_and_score."""
+    return (body, None, status_code)
 
 
-def _api_error(message, status_code):
-    return json.dumps(
-        {"success": False, "data": None, "error": message, "status_code": status_code},
-        indent=2,
-    )
+def _post_data_err(message: str, status_code: int):
+    return (None, message, status_code)
 
 
 class _FakeResponse:
@@ -63,94 +59,88 @@ def _no_sleep():
 
 @pytest.mark.asyncio
 async def test_happy_path(api):
-    create_resp = _api_response({"data": {"type": "scrape", "id": "42"}}, 202)
-    score_resp = _api_response(
+    create_resp = _post_data_ok({"data": {"type": "scrape", "id": "42"}}, 202)
+    score_resp = _post_data_ok(
         {"data": {"type": "score", "id": "7", "attributes": {"status": "pending"}}},
         202,
     )
 
-    with patch.object(ApiClient, "post", new=AsyncMock(side_effect=[create_resp, score_resp])), \
+    with patch.object(ApiClient, "post_data", new=AsyncMock(side_effect=[create_resp, score_resp])), \
          patch("lib.api_tools._raw_get_scrape", new=AsyncMock(side_effect=[
              _scrape_body(42, "pending"),
              _scrape_body(42, "completed", job_post_id=9),
          ])):
-        result = json.loads(await scrape_and_score(api, "https://x"))
+        result = yaml.safe_load(await scrape_and_score(api, "https://x"))
 
-    assert result["success"] is True
-    data = result["data"]
-    assert data["scrape_id"] == 42
-    assert data["job_post_id"] == 9
-    assert data["score_id"] == 7
-    assert data["scores_url"].endswith("/job-posts/9/scores")
+    assert result["scrape_id"] == 42
+    assert result["job_post_id"] == 9
+    assert result["score_id"] == 7
+    assert result["scores_url"].endswith("/job-posts/9/scores")
 
 
 @pytest.mark.asyncio
 async def test_scrape_failed(api):
-    create_resp = _api_response({"data": {"type": "scrape", "id": "3"}}, 202)
-    with patch.object(ApiClient, "post", new=AsyncMock(return_value=create_resp)), \
+    create_resp = _post_data_ok({"data": {"type": "scrape", "id": "3"}}, 202)
+    with patch.object(ApiClient, "post_data", new=AsyncMock(return_value=create_resp)), \
          patch("lib.api_tools._raw_get_scrape", new=AsyncMock(return_value=_scrape_body(3, "failed"))):
-        result = json.loads(await scrape_and_score(api, "https://x"))
-    assert result["success"] is False
+        result = yaml.safe_load(await scrape_and_score(api, "https://x"))
     assert "failed" in result["error"]
 
 
 @pytest.mark.asyncio
 async def test_scrape_timeout(api):
-    create_resp = _api_response({"data": {"type": "scrape", "id": "5"}}, 202)
-    with patch.object(ApiClient, "post", new=AsyncMock(return_value=create_resp)), \
+    create_resp = _post_data_ok({"data": {"type": "scrape", "id": "5"}}, 202)
+    with patch.object(ApiClient, "post_data", new=AsyncMock(return_value=create_resp)), \
          patch("lib.api_tools._raw_get_scrape", new=AsyncMock(return_value=_scrape_body(5, "pending"))):
-        result = json.loads(await scrape_and_score(api, "https://x", timeout=0.0))
-    assert result["success"] is False
+        result = yaml.safe_load(await scrape_and_score(api, "https://x", timeout=0.0))
     assert "Timed out" in result["error"]
 
 
 @pytest.mark.asyncio
 async def test_late_job_post_linkage(api):
-    create_resp = _api_response({"data": {"type": "scrape", "id": "11"}}, 202)
-    score_resp = _api_response(
+    create_resp = _post_data_ok({"data": {"type": "scrape", "id": "11"}}, 202)
+    score_resp = _post_data_ok(
         {"data": {"type": "score", "id": "2", "attributes": {"status": "pending"}}},
         202,
     )
-    with patch.object(ApiClient, "post", new=AsyncMock(side_effect=[create_resp, score_resp])), \
+    with patch.object(ApiClient, "post_data", new=AsyncMock(side_effect=[create_resp, score_resp])), \
          patch("lib.api_tools._raw_get_scrape", new=AsyncMock(side_effect=[
              _scrape_body(11, "completed"),          # no job-post yet
              _scrape_body(11, "completed"),          # still none
              _scrape_body(11, "completed", job_post_id=22),
          ])):
-        result = json.loads(await scrape_and_score(api, "https://x"))
-    assert result["success"] is True
-    assert result["data"]["job_post_id"] == 22
+        result = yaml.safe_load(await scrape_and_score(api, "https://x"))
+    assert result["job_post_id"] == 22
 
 
 @pytest.mark.asyncio
 async def test_hold_fallback_on_501(api):
-    create_501 = _api_error("501 - disabled", 501)
-    create_ok = _api_response({"data": {"type": "scrape", "id": "17"}}, 201)
-    score_resp = _api_response(
+    create_501 = _post_data_err("501 - disabled", 501)
+    create_ok = _post_data_ok({"data": {"type": "scrape", "id": "17"}}, 201)
+    score_resp = _post_data_ok(
         {"data": {"type": "score", "id": "1", "attributes": {"status": "pending"}}},
         202,
     )
-    with patch.object(ApiClient, "post", new=AsyncMock(side_effect=[create_501, create_ok, score_resp])), \
+    with patch.object(ApiClient, "post_data", new=AsyncMock(side_effect=[create_501, create_ok, score_resp])), \
          patch("lib.api_tools._raw_get_scrape", new=AsyncMock(return_value=_scrape_body(17, "completed", job_post_id=4))):
-        result = json.loads(await scrape_and_score(api, "https://x"))
-    assert result["success"] is True
-    assert result["data"]["hold_fallback"] is True
-    assert "hold-poller" in result["data"]["message"]
+        result = yaml.safe_load(await scrape_and_score(api, "https://x"))
+    assert result["hold_fallback"] is True
+    assert "hold-poller" in result["message"]
 
 
 @pytest.mark.asyncio
 async def test_explicit_resume_id(api):
-    create_resp = _api_response({"data": {"type": "scrape", "id": "8"}}, 202)
-    score_resp = _api_response(
+    create_resp = _post_data_ok({"data": {"type": "scrape", "id": "8"}}, 202)
+    score_resp = _post_data_ok(
         {"data": {"type": "score", "id": "99", "attributes": {"status": "pending"}}},
         202,
     )
     post_mock = AsyncMock(side_effect=[create_resp, score_resp])
-    with patch.object(ApiClient, "post", new=post_mock), \
+    with patch.object(ApiClient, "post_data", new=post_mock), \
          patch("lib.api_tools._raw_get_scrape", new=AsyncMock(return_value=_scrape_body(8, "completed", job_post_id=3))):
-        result = json.loads(await scrape_and_score(api, "https://x", resume_id=55))
+        result = yaml.safe_load(await scrape_and_score(api, "https://x", resume_id=55))
 
-    assert result["success"] is True
+    assert "error" not in result
     # Second post call is the score — verify it carried the resume relationship.
     score_call = post_mock.await_args_list[1]
     payload = score_call.args[1] if len(score_call.args) > 1 else score_call.kwargs["payload"]
