@@ -77,6 +77,8 @@ async def run_obstacle_agent(
     hints: str,
     page_text: str,
     screenshot_bytes: bytes | None = None,
+    page_structure: str = "",
+    extra_login_wall_signals: list[str] | None = None,
     max_clicks: int = 3,
 ) -> dict:
     """Run the obstacle agent against a live Playwright page.
@@ -89,6 +91,11 @@ async def run_obstacle_agent(
             AND the configured model supports vision, the agent sees the
             page visually instead of reasoning from text alone. Pass None
             to skip — text-only fallback still works.
+        page_structure: free-text DOM-shape guidance from
+            ScrapeProfile.page_structure. Where the deterministic
+            RememberMe path bails out (e.g. URL-pattern pre-condition
+            mismatch), this is what arms the agent with the structural
+            cues + selector list it needs to clear the obstacle.
         max_clicks: safety cap. Agent is instructed to stop earlier once
             verify_resolved() returns True.
 
@@ -131,8 +138,17 @@ async def run_obstacle_agent(
             if word in text:
                 return f"rejected: element text contains {word!r}"
         try:
-            await el.scroll_into_view_if_needed(timeout=2_000)
-            await el.click(timeout=5_000)
+            # force=True bypasses Playwright's actionability checks
+            # (visible/stable/enabled). LinkedIn renders the
+            # account-chooser inside a `glimmer`-class container that
+            # animates the skeleton-loading effect indefinitely, so the
+            # "wait for element to be stable" gate inside
+            # scroll_into_view_if_needed and click() never resolves —
+            # every right-selector click was timing out at 2s with
+            # "waiting for element to be stable". The button is in the
+            # DOM, visible, and clickable; we just have to tell
+            # Playwright to skip its stability heuristic.
+            await el.click(timeout=5_000, force=True)
             try:
                 await ctx.deps.page.wait_for_load_state("networkidle", timeout=10_000)
             except Exception:
@@ -169,7 +185,9 @@ async def run_obstacle_agent(
             # Imported lazily so this module doesn't have a hard dep on
             # mcp_servers at import time.
             from mcp_servers.browser_server import _detect_login_wall
-            walled = bool(_detect_login_wall(text))
+            walled = bool(
+                _detect_login_wall(text, extra_strong_signals=extra_login_wall_signals)
+            )
         except Exception as exc:
             verification_history.append(False)
             return {"resolved": False, "reason": f"detector_failed: {exc}"}
@@ -183,7 +201,14 @@ async def run_obstacle_agent(
     if len(snippet) > 4000:
         snippet = snippet[:4000] + "\n...[truncated]"
 
+    structure_block = (
+        f"Page-structure guidance (from ScrapeProfile.page_structure):\n"
+        f"{page_structure}\n\n"
+        if page_structure
+        else ""
+    )
     text_prompt = (
+        f"{structure_block}"
         f"Site-specific hints for resolving obstacles:\n{hints or '(no hints on this site yet)'}\n\n"
         f"Current page visible text:\n---\n{snippet}\n---\n\n"
         "Resolve the obstacle. Verify after each click."

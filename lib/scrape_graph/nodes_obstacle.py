@@ -77,7 +77,12 @@ class DetectObstacle(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no
         try:
             from mcp_servers.browser_server import _detect_login_wall
             text = await page.inner_text("body")
-            walled = bool(_detect_login_wall(text))
+            profile = state.profile or {}
+            extra_raw = (
+                profile.get("login_wall_signals") if isinstance(profile, dict) else None
+            )
+            extra = extra_raw if isinstance(extra_raw, list) else None
+            walled = bool(_detect_login_wall(text, extra_strong_signals=extra))
         except Exception:
             # Changes routing — if detection itself fails we fall through
             # to ResolveFinalUrl so the scrape can still attempt content
@@ -202,13 +207,26 @@ class ObstacleAgent(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
                     screenshot_bytes = await page.screenshot(full_page=False)
                 except Exception:
                     screenshot_bytes = None
-                hints_raw = (state.profile or {}).get("interaction_hints")
+                profile = state.profile or {}
+                hints_raw = profile.get("interaction_hints") if isinstance(profile, dict) else None
                 hints = hints_raw if isinstance(hints_raw, str) else ""
+                # page_structure carries the obstacle-clearing instructions
+                # (selector list + visual cues) for hosts where the
+                # deterministic RememberMe path bails at its pre-condition
+                # check (URL pattern, etc.) without trying any selectors.
+                ps_raw = profile.get("page_structure") if isinstance(profile, dict) else None
+                page_structure = ps_raw if isinstance(ps_raw, str) else ""
+                lws_raw = (
+                    profile.get("login_wall_signals") if isinstance(profile, dict) else None
+                )
+                lws = lws_raw if isinstance(lws_raw, list) else None
                 result = await run_obstacle_agent(
                     page,
                     hints=hints,
                     page_text=page_text,
                     screenshot_bytes=screenshot_bytes,
+                    page_structure=page_structure,
+                    extra_login_wall_signals=lws,
                 )
                 if isinstance(result, dict):
                     actions = result.get("actions") or []
@@ -226,7 +244,14 @@ class ObstacleAgent(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
                             fresh_text = page_text
                         try:
                             from mcp_servers.browser_server import _detect_login_wall
-                            succeeded = not _detect_login_wall(fresh_text)
+                            extra_raw = (
+                                profile.get("login_wall_signals")
+                                if isinstance(profile, dict) else None
+                            )
+                            extra = extra_raw if isinstance(extra_raw, list) else None
+                            succeeded = not _detect_login_wall(
+                                fresh_text, extra_strong_signals=extra,
+                            )
                         except Exception:
                             # Trust the agent's own verification if the
                             # caller-side detector fails outright.

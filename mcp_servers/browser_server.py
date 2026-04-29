@@ -212,7 +212,13 @@ async def _try_rememberme_reauth(
                 except Exception:
                     label = ""
             logfire.info(f"rememberme: clicking {sel!r} ({label!r})")
-            await el.click(timeout=5_000)
+            # force=True — bypass Playwright's "wait for element to be
+            # stable" gate. LinkedIn's chooser sits inside a `glimmer`
+            # skeleton-animation container that never goes stable, so
+            # the default click would time out even though the element
+            # is in the DOM and visible. See obstacle_agent.try_click
+            # for the same fix.
+            await el.click(timeout=5_000, force=True)
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=15_000)
             except Exception:
@@ -228,13 +234,42 @@ async def _try_rememberme_reauth(
     return False
 
 
-def _detect_login_wall(content: str) -> bool:
+def _detect_login_wall(
+    content: str,
+    extra_strong_signals: list[str] | None = None,
+) -> bool:
+    """Return True iff `content` looks like a login wall / bot-check.
+
+    Two-tier detection:
+
+    - **Strong signals** are unambiguous and decisive at any page length
+      (Cloudflare bot-checks, "logging you in" interstitials, etc.).
+      Long login walls — LinkedIn's /uas/login is well over 200 words
+      once you include footer boilerplate + ToS links + language
+      switcher — used to slip past entirely because the word-count gate
+      fired before strong signals were checked. That bug fed the
+      extractor login-wall text and let it hallucinate "job posts"
+      from welcome copy.
+    - **Weak signals** ("sign in", "log in", "join now") false-positive
+      easily on real job pages that mention applying via login, so
+      they're gated by both a 2-of-list threshold AND a 200-word cap.
+
+    Per-host strong-signal phrases live on `ScrapeProfile.css_selectors
+    .login_wall_signals` (e.g. LinkedIn-specific "sign in to stay
+    updated", "new to linkedin? join now") and are passed in via
+    `extra_strong_signals`. They're treated like the global strong list
+    and bypass the word-count gate. Keeping them on the profile means a
+    new walled host doesn't require a code change.
+    """
     stripped = content.strip().lower()
+    strong = LOGIN_WALL_STRONG_SIGNALS
+    if extra_strong_signals:
+        strong = strong + list(extra_strong_signals)
+    if any(s in stripped for s in strong):
+        return True
     word_count = len(stripped.split())
     if word_count >= 200:
         return False
-    if any(s in stripped for s in LOGIN_WALL_STRONG_SIGNALS):
-        return True
     return sum(1 for s in LOGIN_WALL_SIGNALS if s in stripped) >= 2
 
 
