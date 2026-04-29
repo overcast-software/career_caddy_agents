@@ -101,8 +101,12 @@ class TestGetModel:
             assert len(result) > 0
 
     def test_unknown_role_returns_default(self):
-        result = get_model("nonexistent_role")
-        assert result == "openai:gpt-4o-mini"
+        # Isolate from shell env: a developer with CADDY_DEFAULT_MODEL set
+        # (e.g. unprefixed "gpt-4o-mini") would otherwise read the leaked
+        # value and falsely fail this assertion.
+        with patch.dict(os.environ, {}, clear=True):
+            result = get_model("nonexistent_role")
+            assert result == "openai:gpt-4o-mini"
 
     def test_browser_has_separate_env_var(self):
         with patch.dict(os.environ, {"BROWSER_SCRAPER_MODEL": "openai:gpt-4o"}, clear=True):
