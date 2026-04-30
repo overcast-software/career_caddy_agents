@@ -101,12 +101,14 @@ Agents (in `agents/`) use the `pydantic-ai` framework. They access tools through
 
 ### MCP Servers
 
-| Server | Transport | Port | Purpose |
-|--------|-----------|------|---------|
-| `career_caddy_server.py` | stdio | — | CRUD on Career Caddy REST API (jobs, companies, applications) |
-| `browser_server.py` | stdio or SSE | 3004 | Browser automation via `camoufox`. Optional / ad-hoc only — the production scrape path is the hold-poller, not this server. |
-| `public_server.py` | SSE | 8000 | Public MCP endpoint at `mcp.careercaddy.online` |
-| `chat_server.py` | SSE | 8000 | Frontend chat via SSE streaming |
+See `mcp_servers/README.md` for the canonical table (prod vs local-only, transport, port, auth, consumers). Quick summary:
+
+| Server | Transport | Port | Deploy |
+|--------|-----------|------|--------|
+| `public_server.py` | SSE | `:8030` prod / `:8000` local | **Prod** (`mcp.careercaddy.online`, per-client `jh_*` keys) |
+| `chat_server.py` | SSE | `:8031` prod / `:8000` local | **Prod** (frontend chat, internal-only) |
+| `browser_server.py` | stdio + SSE | `:3004` | Local-only (Camoufox/Playwright) |
+| `career_caddy_server.py` | stdio | — | Local-only (CRUD against api) |
 
 **Hold-poller is the only supported scrape driver.** The historical
 synchronous flow — api `Scraper.dispatch()` POSTing to a browser-MCP
