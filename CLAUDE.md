@@ -222,6 +222,56 @@ once Phase 1d ships. The graph itself has no knowledge of who called:
 snapshot in `api/job_hunting/api/views/graph.py` must stay in sync;
 Phase 1d will export from the agents side to make that automatic.
 
+## Agent memory does NOT flow to production extraction tiers
+
+`.claude/agent-memory/<agent-name>/` is loaded only when the
+matching Claude Code subagent is next invoked. None of the
+production scrape pipeline reads it:
+
+- **Hold-poller + scrape-graph** (Python service) — reads
+  `ScrapeProfile` rows + `nodes_*.py` code.
+- **Tier1Mini / Tier2Haiku / Tier3** (Pydantic-AI agents in
+  `agents/scrape_graph/nodes_extract.py`) — hardcoded system
+  prompts + `ScrapeProfile.extraction_hints` blob, that's it.
+- **browser-mcp** (Camoufox/Playwright) — `ScrapeProfile.css_selectors`,
+  `sites.yml`, `secrets.yml`.
+
+So when an investigator agent (e.g. `scrape-profile-enhancer`)
+discovers a generalizable pattern, recording it as memory keeps the
+insight available to future *investigator* sessions but does NOT
+change runtime extraction behavior. To make a learning actually
+shape scrapes you must land it in one of three places production
+reads:
+
+1. **`ScrapeProfile` fields** — declarative rules read at scrape
+   time. Best home for host-specific selectors (`css_selectors`,
+   `ready_selector`), URL canonicalisation (`url_rewrites`),
+   apply-resolver hints (`apply_resolver_config`), and any
+   "previous extractions found …" priors fed into the LLM
+   (`extraction_hints`). The 2026-05-01 LinkedIn `/comm/` →
+   `/jobs/view/` fix landed via `url_rewrites` for exactly this
+   reason.
+2. **Pydantic response models + validators** — bake structural
+   guarantees into `ParsedJobData` (or sibling models) so a Tier1
+   model that hallucinates can't get its output past the
+   schema. The 2026-05-01 closed-banner guard is the example:
+   `closed_evidence: Optional[str]` validated as a verbatim
+   substring of `scrape.job_content`, plus a
+   `_strip_closed_banner_prefix` sanitizer on the persisted
+   `description`. Untrusted LLM-rendered prefixes never reach
+   downstream consumers.
+3. **Periodic enhancer pass** — schedule the
+   `scrape-profile-enhancer` subagent (via CronCreate or the
+   /loop autonomous mode) to scan recent failures, read its own
+   memory, and apply learnings as profile mutations on a cadence.
+   The memory remains the source of truth for *why*; the cron is
+   the bridge that makes it production-effective.
+
+When you find yourself writing memory text like "in the future, the
+extractor should …" — stop and ask which of (1)/(2)/(3) is the right
+home. Memory entries that don't have a corresponding production
+landing site decay into folklore.
+
 ## Tests
 
 ```bash
