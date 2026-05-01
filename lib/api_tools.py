@@ -873,6 +873,7 @@ async def update_job_post(
     link: Optional[str] = None,
     posted_date: Optional[str] = None,
     company_id: Optional[int] = None,
+    source: Optional[str] = None,
 ) -> str:
     """Update an existing job post's attributes or company relationship."""
     attributes = {}
@@ -894,6 +895,8 @@ async def update_job_post(
         attributes["link"] = link
     if posted_date is not None:
         attributes["posted_date"] = posted_date
+    if source is not None:
+        attributes["source"] = source
 
     if not attributes and company_id is None:
         return _respond(None, error="No fields provided to update")
