@@ -276,16 +276,18 @@ async def update_job_post(
     link: Optional[str] = None,
     posted_date: Optional[str] = None,
     company_id: Optional[int] = None,
+    source: Optional[str] = None,
 ) -> str:
     """Update an existing job post's attributes or company relationship.
 
     All fields are optional — only provided fields are updated.
     To change the company, pass company_id (use find_company_by_name to look it up).
+    `source` rewrites the JobPost provenance label (email / scrape / manual / paste / chat / email_direct).
     """
     return await api_tools.update_job_post(
         _api(), job_post_id, title, description, location,
         salary_min, salary_max, employment_type, remote_ok,
-        link, posted_date, company_id,
+        link, posted_date, company_id, source,
     )
 
 
