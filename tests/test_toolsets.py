@@ -24,14 +24,16 @@ class TestScopes:
     def test_all_scope_matches_registry(self):
         assert SCOPES["all"] == set(TOOL_REGISTRY.keys())
 
-    def test_career_caddy_scope_has_27_tools(self):
-        # 20 core CRUD + 7 Agent Wizard tools (show/edit resume + cover letter,
+    def test_career_caddy_scope_has_28_tools(self):
+        # 21 core CRUD + 7 Agent Wizard tools (show/edit resume + cover letter,
         # import_resume_from_url, edit_profile_onboarding, reconcile_onboarding).
         # AW intentionally does NOT get a tool for writing user account fields
         # (first_name, email, etc.) — those edits go through the settings UI.
-        # Core CRUD count bumped 19→20 when create_question was added so the
-        # chat agent stops guessing question_ids on bulk Q&A adds.
-        assert len(SCOPES["career_caddy"]) == 27
+        # Core CRUD count bumped 19→20 when create_question was added; bumped
+        # 20→21 when get_current_user was added to give the chat agent a
+        # first-class identity-lookup tool (so it stops calling get_career_data
+        # for "what's my name?" questions).
+        assert len(SCOPES["career_caddy"]) == 28
 
     def test_career_caddy_scope_includes_agent_wizard_tools(self):
         aw_tools = {

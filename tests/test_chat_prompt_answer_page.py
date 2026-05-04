@@ -65,7 +65,10 @@ class TestAnswerModificationGuidance:
         prompt = _build_system_prompt(PROFILE)
         assert "Modifying an Existing Answer" in prompt
         # Defaults: prefer create, offer replace via propose_actions.
-        assert "default to CREATE" in prompt or "default to CREATE a new answer" in prompt
+        # Whitespace-tolerant — the rule is about CREATE-as-default, not
+        # exact line wrap.
+        normalized = " ".join(prompt.split())
+        assert "DEFAULT to `create_answer`" in normalized
         assert "Replace original instead" in prompt
 
 

@@ -1028,7 +1028,7 @@ async def update_job_application(
 
 
 async def get_career_data(api: ApiClient) -> str:
-    """Fetch the user's personal career profile."""
+    """Fetch the user's resumes, skills, experience, education, certifications, cover letters, and favorited answers. Large aggregated blob — call only when role-fit / experience-tailoring is needed and you don't already have it in this conversation. Does NOT contain the user's name, email, phone, address, LinkedIn, or GitHub — for those, call get_current_user."""
     payload, error, status = await api.get_data("/api/v1/career-data/")
     if error is not None:
         return _respond(None, error=error, status_code=status)
@@ -1048,6 +1048,13 @@ async def get_career_data(api: ApiClient) -> str:
                             if k not in attrs and k != "id":
                                 row.pop(k, None)
     return _respond(payload)
+
+
+async def get_current_user(api: ApiClient) -> str:
+    """Fetch the authenticated user's profile: name, email, phone, address, LinkedIn, GitHub, and onboarding state. Use this for any "who am I / what's my name / what's my contact info" question. Cheap, single-resource fetch. Does NOT include resume/skills/experience — that's get_career_data."""
+    return await _shaped_get(
+        api, "/api/v1/me/", shape=TOOL_SHAPES["get_current_user"], is_single=True,
+    )
 
 
 async def get_resumes(
@@ -1346,7 +1353,10 @@ async def create_answer(
     ai_assist: bool = False,
     prompt: Optional[str] = None,
 ) -> str:
-    """Create an answer for an interview question. Set ai_assist=true to let the backend AI generate the content (content can be empty in that case). Optionally pass a prompt to guide AI generation."""
+    """Save a drafted answer. DEFAULT choice for any new answer text — including variants/rewrites of an existing answer. Multiple answers per question are supported, so saving a variant alongside the original is the safe move. Use update_answer ONLY when the user explicitly said "replace" / "overwrite" / "edit this one".
+
+    Grounding requirement: if `content` is non-empty and not a verbatim user-supplied string, you must already have the relevant context in conversation (from this turn or an earlier one — do not refetch what you already have): the question text, the linked job post when one exists, and resume/skills when the user asked to tailor / emphasize / lean on specific experience. Fetch only what is missing (`get_questions`, `get_job_posts`, `get_career_data`). `get_career_data` is large — call it only when the request is genuinely about role-fit / experience-tailoring. Generic, ungrounded content is a bug. Set `ai_assist=true` (with `content=''`) to delegate generation to the backend instead of drafting yourself; pass `prompt` to guide that generation.
+    """
     attributes: dict = {}
     if content:
         attributes["content"] = content
@@ -1373,7 +1383,12 @@ async def update_answer(
     content: Optional[str] = None,
     favorite: Optional[bool] = None,
 ) -> str:
-    """Update an existing answer's content or favorite status."""
+    """DESTRUCTIVE: overwrites an existing answer in place. The previous content is lost. Only call when the user explicitly said "replace" / "overwrite" / "edit this one" / "update in place". For "shorten" / "rewrite" / "punch up" / "tailor" / etc., use create_answer to save the variant — the user usually wants the original preserved.
+
+    Grounding requirement: if `content` is non-empty, you must have the answer text in conversation (call `get_answers(id=answer_id)` only if you have not already seen the current text — do not refetch). For substantive rewrites (tailoring, role-fit, experience emphasis) you also need the question, job post, and resume context in conversation; fetch only what is missing. `get_career_data` is large — call it only when the user's request is genuinely experience-tailoring. Surface-only edits ("drop the last sentence", "fix the typo") need only the current answer text.
+
+    Pass `favorite=True/False` alone to just toggle the favorite flag without touching content.
+    """
     attributes = {}
     if content is not None:
         attributes["content"] = content
