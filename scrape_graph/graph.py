@@ -171,17 +171,23 @@ NODE_META: dict[str, dict[str, str]] = {
         "description": (
             "Iterates the profile's ready_selector list, trying each "
             "via locator(s).first.wait_for(state='visible') with a "
-            "1.5s per-selector budget. First hit → ScrollToLoad; all "
-            "miss → SettleWait. Emits matched_selector / matched_index "
-            "/ timed_out / per-attempt durations + error class so "
-            "parser errors are distinguishable from real timeouts."
+            "1.5s per-selector budget. Always routes to SettleWait — "
+            "a heading match only proves a section header is in DOM, "
+            "not that the description body has finished streaming, so "
+            "we always pay a post-match sleep. Emits matched_selector "
+            "/ matched_index / timed_out / per-attempt durations + "
+            "error class so parser errors are distinguishable from "
+            "real timeouts."
         ),
     },
     "SettleWait": {
         "group": "scrape", "label": "Settle wait",
         "description": (
-            "Fallback fixed 2s sleep when no ready_selector is known, "
-            "giving SPAs a chance to finish rendering before capture."
+            "Fixed 5s sleep on every path. After WaitReadySelector "
+            "matches the heading we still need the body to finish "
+            "rendering; on miss we need any chance the section will "
+            "appear. 5s of guaranteed wait is cheaper than maintaining "
+            "a tail-anchor selector and works on any site."
         ),
     },
     "ScrollToLoad": {

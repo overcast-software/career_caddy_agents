@@ -390,7 +390,7 @@ class WaitReadySelector(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore
 
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> Union[ScrollToLoad, SettleWait]:
+    ) -> SettleWait:
         started = time.time()
         state = ctx.state
         page = getattr(state, "_browser_page", None)
@@ -441,9 +441,12 @@ class WaitReadySelector(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore
             "selector_count": len(selectors),
             "attempts": attempts,
         }
-        if matched_selector is not None:
-            trace_node(state, "WaitReadySelector", "ScrollToLoad", started, payload)
-            return ScrollToLoad()
+        # Always go through SettleWait — the heading selector matching
+        # only proves the section header is in DOM, not that the
+        # description body has finished streaming. A fixed post-match
+        # sleep lets the rest of the sections fill in before Capture
+        # reads the DOM. Cheaper and more general than maintaining a
+        # tail-anchor selector.
         trace_node(state, "WaitReadySelector", "SettleWait", started, payload)
         return SettleWait()
 
@@ -458,7 +461,7 @@ class SettleWait(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-red
         page = getattr(ctx.state, "_browser_page", None)
         if page:
             try:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(5.0)
             except Exception:
                 pass
         trace_node(ctx.state, "SettleWait", "ScrollToLoad", started)
