@@ -302,6 +302,21 @@ class ResolveFinalUrl(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[n
                 if resp.status_code in (200, 201):
                     new_id = (resp.json() or {}).get("data", {}).get("id")
                     if new_id:
+                        # Terminal-close the parent before swapping
+                        # state.scrape_id to the child. Without this, the
+                        # parent stays at status='running' forever — every
+                        # subsequent trace_node / _patch_scrape_status call
+                        # below targets the child, so no terminal PATCH
+                        # ever lands on the parent and the poller keeps
+                        # re-dispatching it. Provenance is preserved via
+                        # the child's source_scrape FK (set on POST above).
+                        _patch_scrape_status(
+                            state.scrape_id, "completed",
+                            note=(
+                                f"redirected to scrape {new_id} "
+                                f"({state.canonical_url})"
+                            ),
+                        )
                         state.scrape_id = int(new_id)
             except Exception:
                 logger.warning("ResolveFinalUrl: child-scrape create failed", exc_info=True)
