@@ -9,6 +9,7 @@ of each run() via `trace_node(state, ...)`.
 # Forward-declare stubs then redefine — see nodes_extract for rationale.
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -24,6 +25,15 @@ from .tracing import trace_node
 from .url_canonicalize import apply_url_rewrites, canonicalize_url, urls_differ
 
 logger = logging.getLogger(__name__)
+
+# Wall-clock budget for ResolveFinalUrl — bounds the redirect-handoff
+# work (canonicalize + child-scrape POST + parent terminal-close) so a
+# wedged httpx call or an unresponsive api can't park the parent scrape
+# in `running` indefinitely. See TODO #309 (ZipRecruiter /km/ tracker
+# URLs hung for hours).
+_RESOLVE_FINAL_URL_BUDGET_S = float(
+    os.environ.get("SCRAPE_GRAPH_RESOLVE_FINAL_URL_BUDGET_S", "15")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +273,66 @@ class Navigate(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef
         return nodes_obstacle.DetectObstacle()
 
 
+def _resolve_final_url_body(state: ScrapeGraphState) -> None:
+    """Synchronous core of ResolveFinalUrl — split out so we can wrap
+    the whole thing in a thread + asyncio.wait_for budget below.
+
+    Mutates state in place: canonical_url, did_redirect, scrape_id (on
+    redirect handoff). Idempotent on the no-redirect path.
+    """
+    landed = state.final_url or state.submitted_url
+    state.canonical_url = canonicalize_url(landed)
+    if not urls_differ(state.submitted_url, landed):
+        return
+    state.did_redirect = True
+    # Chain a child scrape via source_scrape FK so provenance
+    # of the tracker → destination step is queryable via
+    # Scrape.child_scrapes later.
+    try:
+        resp = httpx.post(
+            f"{_api_base()}/api/v1/scrapes/",
+            json={
+                "data": {
+                    "attributes": {
+                        "url": state.canonical_url,
+                        "source": "redirect",
+                    },
+                    "relationships": {
+                        "source-scrape": {
+                            "data": {
+                                "type": "scrape",
+                                "id": str(state.scrape_id),
+                            }
+                        }
+                    },
+                }
+            },
+            headers={**_api_headers(), "Content-Type": "application/json"},
+            timeout=10.0,
+        )
+        if resp.status_code in (200, 201):
+            new_id = (resp.json() or {}).get("data", {}).get("id")
+            if new_id:
+                # Terminal-close the parent before swapping
+                # state.scrape_id to the child. Without this, the
+                # parent stays at status='running' forever — every
+                # subsequent trace_node / _patch_scrape_status call
+                # below targets the child, so no terminal PATCH
+                # ever lands on the parent and the poller keeps
+                # re-dispatching it. Provenance is preserved via
+                # the child's source_scrape FK (set on POST above).
+                _patch_scrape_status(
+                    state.scrape_id, "completed",
+                    note=(
+                        f"redirected to scrape {new_id} "
+                        f"({state.canonical_url})"
+                    ),
+                )
+                state.scrape_id = int(new_id)
+    except Exception:
+        logger.warning("ResolveFinalUrl: child-scrape create failed", exc_info=True)
+
+
 @dataclass
 class ResolveFinalUrl(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
@@ -270,62 +340,57 @@ class ResolveFinalUrl(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[n
     ) -> CheckLinkDedup:
         started = time.time()
         state = ctx.state
-        landed = state.final_url or state.submitted_url
-        state.canonical_url = canonicalize_url(landed)
-        if urls_differ(state.submitted_url, landed):
-            state.did_redirect = True
-            # Chain a child scrape via source_scrape FK so provenance
-            # of the tracker → destination step is queryable via
-            # Scrape.child_scrapes later.
+        # Wrap the sync body in a thread + wait_for so a wedged httpx
+        # call (api unreachable, tracker host hanging on a half-open
+        # connection) can't park the parent scrape in `running`
+        # forever. On timeout: best-effort close the parent so the
+        # poller stops re-dispatching, then continue to CheckLinkDedup
+        # with whatever state we managed to set. canonical_url is
+        # written eagerly inside the body before any blocking call, so
+        # downstream nodes still have something to work with.
+        timed_out = False
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(_resolve_final_url_body, state),
+                timeout=_RESOLVE_FINAL_URL_BUDGET_S,
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            logger.warning(
+                "ResolveFinalUrl: budget exceeded scrape_id=%s budget_s=%s — "
+                "closing parent and continuing",
+                state.scrape_id, _RESOLVE_FINAL_URL_BUDGET_S,
+            )
+            # Best-effort terminal close so the parent doesn't sit in
+            # `running`. Note routes the operator to the timeout cause.
             try:
-                resp = httpx.post(
-                    f"{_api_base()}/api/v1/scrapes/",
-                    json={
-                        "data": {
-                            "attributes": {
-                                "url": state.canonical_url,
-                                "source": "redirect",
-                            },
-                            "relationships": {
-                                "source-scrape": {
-                                    "data": {
-                                        "type": "scrape",
-                                        "id": str(state.scrape_id),
-                                    }
-                                }
-                            },
-                        }
-                    },
-                    headers={**_api_headers(), "Content-Type": "application/json"},
-                    timeout=10.0,
+                _patch_scrape_status(
+                    state.scrape_id, "failed",
+                    note=(
+                        f"ResolveFinalUrl timeout after "
+                        f"{_RESOLVE_FINAL_URL_BUDGET_S:g}s"
+                    ),
                 )
-                if resp.status_code in (200, 201):
-                    new_id = (resp.json() or {}).get("data", {}).get("id")
-                    if new_id:
-                        # Terminal-close the parent before swapping
-                        # state.scrape_id to the child. Without this, the
-                        # parent stays at status='running' forever — every
-                        # subsequent trace_node / _patch_scrape_status call
-                        # below targets the child, so no terminal PATCH
-                        # ever lands on the parent and the poller keeps
-                        # re-dispatching it. Provenance is preserved via
-                        # the child's source_scrape FK (set on POST above).
-                        _patch_scrape_status(
-                            state.scrape_id, "completed",
-                            note=(
-                                f"redirected to scrape {new_id} "
-                                f"({state.canonical_url})"
-                            ),
-                        )
-                        state.scrape_id = int(new_id)
             except Exception:
-                logger.warning("ResolveFinalUrl: child-scrape create failed", exc_info=True)
+                logger.warning(
+                    "ResolveFinalUrl: post-timeout PATCH failed scrape_id=%s",
+                    state.scrape_id, exc_info=True,
+                )
+            # Make sure canonical_url is at least the submitted URL so
+            # CheckLinkDedup has something non-empty to filter on.
+            if not state.canonical_url:
+                state.canonical_url = state.submitted_url
         trace_node(
             state,
             "ResolveFinalUrl",
             "CheckLinkDedup",
             started,
-            {"did_redirect": state.did_redirect, "canonical_url": state.canonical_url},
+            {
+                "did_redirect": state.did_redirect,
+                "canonical_url": state.canonical_url,
+                "timed_out": timed_out,
+                "budget_s": _RESOLVE_FINAL_URL_BUDGET_S,
+            },
         )
         return CheckLinkDedup()
 
