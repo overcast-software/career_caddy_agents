@@ -9,6 +9,7 @@ of each run() via `trace_node(state, ...)`.
 # Forward-declare stubs then redefine — see nodes_extract for rationale.
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
@@ -76,6 +77,69 @@ class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):
 
 
 # Obstacle-side forward refs live in nodes_obstacle; import at run time.
+
+
+def _split_top_level_commas(value: str) -> list[str]:
+    """Split a CSS-selector list on top-level commas.
+
+    Commas inside parens or quoted strings stay attached to their host
+    selector, so `h2:has-text("About, the job")` is one entry, not two.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    in_str: str | None = None
+    for ch in value:
+        if in_str:
+            buf.append(ch)
+            if ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"'):
+            in_str = ch
+            buf.append(ch)
+            continue
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            chunk = "".join(buf).strip()
+            if chunk:
+                parts.append(chunk)
+            buf = []
+        else:
+            buf.append(ch)
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _normalize_ready_selectors(value) -> list[str]:
+    """Profile may store ready_selector as list[str] (post-0067) or str
+    (pre-0067 / hand-edited). Normalize to list[str] either way.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [s for s in (str(x).strip() for x in value) if s]
+    if isinstance(value, str):
+        return _split_top_level_commas(value)
+    return []
+
+
+def _selector_hash(selectors: list[str]) -> str:
+    """Short stable hash of the resolved selector list — emit in
+    LoadProfile telemetry so we can correlate "WaitReadySelector kept
+    timing out" with "the profile was actually loaded with this list".
+    """
+    if not selectors:
+        return ""
+    blob = "\n".join(selectors).encode("utf-8")
+    return hashlib.sha1(blob).hexdigest()[:12]
 
 
 def _api_base() -> str:
@@ -148,7 +212,18 @@ class LoadProfile(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-re
                 state.profile = _flatten_profile_attrs(attrs)
         except Exception:
             logger.debug("LoadProfile: profile fetch failed", exc_info=True)
-        trace_node(state, "LoadProfile", "Navigate", started)
+        selectors = _normalize_ready_selectors(
+            (state.profile or {}).get("ready_selector")
+        )
+        trace_node(
+            state, "LoadProfile", "Navigate", started,
+            {
+                "profile_hostname": host,
+                "profile_loaded": bool(state.profile),
+                "ready_selector_count": len(selectors),
+                "ready_selector_hash": _selector_hash(selectors),
+            },
+        )
         return Navigate()
 
 
@@ -293,33 +368,83 @@ class DuplicateShortCircuit(BaseNode[ScrapeGraphState, None, dict]):  # type: ig
         })
 
 
+# Per-selector wait budget. With ~20 candidates per profile that's a
+# 30s upper bound, but we exit on the first hit so the typical cost is
+# one miss + one match (~1.5–3s).
+_READY_SELECTOR_PER_TIMEOUT_MS = 1500
+
+
 @dataclass
 class WaitReadySelector(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
+    """Iterate the profile's ready_selector list until one matches.
+
+    Why iterate (vs one `wait_for_selector` on a comma-joined string):
+    Playwright's CSS parser rejects comma lists that mix standard CSS
+    with text-engine selectors (`:has-text(...)`), and a single bad
+    fragment can silently neutralize the whole list. Iterating with
+    `locator(s).first.wait_for(state="visible")` also gives us
+    visibility semantics (the LinkedIn description container exists
+    in DOM before it paints) and per-attempt telemetry so a failing
+    profile is debuggable from the trace alone.
+    """
+
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
     ) -> Union[ScrollToLoad, SettleWait]:
         started = time.time()
         state = ctx.state
         page = getattr(state, "_browser_page", None)
-        selector = (state.profile or {}).get("ready_selector")
-        if page and selector:
-            try:
-                await page.wait_for_selector(selector, timeout=5_000)
-                trace_node(
-                    state, "WaitReadySelector", "ScrollToLoad", started,
-                    {"matched_selector": selector, "timed_out": False},
-                )
-                return ScrollToLoad()
-            except Exception:
-                trace_node(
-                    state, "WaitReadySelector", "SettleWait", started,
-                    {"matched_selector": None, "timed_out": True},
-                )
-                return SettleWait()
-        trace_node(
-            state, "WaitReadySelector", "SettleWait", started,
-            {"matched_selector": None, "timed_out": False},
+        selectors = _normalize_ready_selectors(
+            (state.profile or {}).get("ready_selector")
         )
+        attempts: list[dict] = []
+        matched_selector: str | None = None
+        matched_index: int | None = None
+        if page and selectors:
+            for idx, sel in enumerate(selectors):
+                attempt_started = time.time()
+                ok = False
+                error: str | None = None
+                try:
+                    locator = page.locator(sel).first
+                    await locator.wait_for(
+                        state="visible",
+                        timeout=_READY_SELECTOR_PER_TIMEOUT_MS,
+                    )
+                    ok = True
+                except Exception as exc:
+                    # Distinguish parser errors (selector is malformed)
+                    # from timeouts so the trace tells us which is which.
+                    msg = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+                    if "TimeoutError" in exc.__class__.__name__ or "timeout" in msg.lower():
+                        error = "timeout"
+                    elif "Unknown engine" in msg or "selector" in msg.lower():
+                        error = f"parse:{msg[:80]}"
+                    else:
+                        error = f"{exc.__class__.__name__}:{msg[:80]}"
+                attempts.append({
+                    "selector": sel,
+                    "index": idx,
+                    "duration_ms": int((time.time() - attempt_started) * 1000),
+                    "matched": ok,
+                    "error": error,
+                })
+                if ok:
+                    matched_selector = sel
+                    matched_index = idx
+                    break
+
+        payload: dict = {
+            "matched_selector": matched_selector,
+            "matched_index": matched_index,
+            "timed_out": matched_selector is None and bool(selectors),
+            "selector_count": len(selectors),
+            "attempts": attempts,
+        }
+        if matched_selector is not None:
+            trace_node(state, "WaitReadySelector", "ScrollToLoad", started, payload)
+            return ScrollToLoad()
+        trace_node(state, "WaitReadySelector", "SettleWait", started, payload)
         return SettleWait()
 
 
@@ -368,7 +493,9 @@ class ScrollToLoad(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-r
         started = time.time()
         state = ctx.state
         page = getattr(state, "_browser_page", None)
-        selector = (state.profile or {}).get("ready_selector") or None
+        selectors = _normalize_ready_selectors(
+            (state.profile or {}).get("ready_selector")
+        )
         ticks = 0
         matched: str | None = None
         last_height = -1
@@ -384,14 +511,16 @@ class ScrollToLoad(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-r
                     except Exception:
                         break
                     await asyncio.sleep(_SCROLL_TICK_MS / 1000.0)
-                    if selector:
+                    for sel in selectors:
                         try:
-                            handle = await page.query_selector(selector)
+                            handle = await page.query_selector(sel)
                             if handle is not None:
-                                matched = selector
+                                matched = sel
                                 break
                         except Exception:
                             pass
+                    if matched:
+                        break
                     try:
                         height = await page.evaluate(
                             "document.body.scrollHeight"
