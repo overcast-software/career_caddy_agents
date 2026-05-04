@@ -12,7 +12,6 @@ import asyncio
 from types import SimpleNamespace
 
 from scrape_graph.nodes_scrape import (
-    ScrollToLoad,
     SettleWait,
     WaitReadySelector,
 )
@@ -90,7 +89,9 @@ def test_wait_ready_returns_first_match_and_stops():
     ]
     state = _state_with(page, selectors)
     next_node = _run(WaitReadySelector(), state)
-    assert isinstance(next_node, ScrollToLoad)
+    # Even on hit we now route through SettleWait — a fixed post-match
+    # sleep gives the rest of the page time to fill in before Capture.
+    assert isinstance(next_node, SettleWait)
     payload = state.node_trace[-1].payload
     assert payload["matched_selector"] == "h2:has-text(\"About the job\")"
     assert payload["matched_index"] == 2
@@ -129,7 +130,7 @@ def test_wait_ready_normalizes_legacy_string_input():
     })
     state = _state_with(page, legacy)
     next_node = _run(WaitReadySelector(), state)
-    assert isinstance(next_node, ScrollToLoad)
+    assert isinstance(next_node, SettleWait)
     payload = state.node_trace[-1].payload
     assert payload["selector_count"] == 2
     assert payload["matched_index"] == 0
