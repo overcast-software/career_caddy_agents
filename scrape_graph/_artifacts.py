@@ -77,7 +77,11 @@ async def capture_debug_artifact(
 
     png_bytes: bytes | None = None
     try:
-        png_bytes = await page.screenshot(full_page=False)
+        # Tight timeout: this fires on the failure path where the page
+        # is often half-rendered, so Playwright's default 30s
+        # "waiting for fonts to load" wait blocks the poller for no
+        # diagnostic value. 5s is enough to snap whatever did paint.
+        png_bytes = await page.screenshot(full_page=False, timeout=5_000)
     except Exception:
         logger.warning(
             "capture_debug_artifact: screenshot failed scrape_id=%s reason=%s",
