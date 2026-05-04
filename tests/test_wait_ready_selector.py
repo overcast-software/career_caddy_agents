@@ -85,7 +85,7 @@ def test_wait_ready_returns_first_match_and_stops():
         ".jobs-description__container",
         "h2:has-text(\"About this job\")",
         "h2:has-text(\"About the job\")",
-        ".never-tried",  # must NOT be tried — loop exits on first hit
+        ".never-tried",  # must NOT be tried in pass 1 — loop exits on first hit
     ]
     state = _state_with(page, selectors)
     next_node = _run(WaitReadySelector(), state)
@@ -95,9 +95,11 @@ def test_wait_ready_returns_first_match_and_stops():
     payload = state.node_trace[-1].payload
     assert payload["matched_selector"] == "h2:has-text(\"About the job\")"
     assert payload["matched_index"] == 2
+    assert payload["matched_pass"] == 1
+    assert payload["passes"] == 1
     assert payload["timed_out"] is False
     assert payload["selector_count"] == 4
-    # Three attempts, no fourth — early exit on match.
+    # Three attempts in pass 1, no fourth — early exit on match.
     assert len(payload["attempts"]) == 3
     assert page.calls == [
         ".jobs-description__container",
@@ -107,6 +109,10 @@ def test_wait_ready_returns_first_match_and_stops():
 
 
 def test_wait_ready_all_miss_routes_to_settle_wait():
+    """All-miss in instant-fake mode bails after one pass via the
+    min-pass-duration guard (the fakes return synchronously, so the
+    pass takes ~0ms — clearly not a real Playwright wait). In
+    production the loop runs until the wall-clock budget elapses."""
     page = _FakePage({})  # no entry matches
     selectors = ["a", "b", "c"]
     state = _state_with(page, selectors)
@@ -115,9 +121,48 @@ def test_wait_ready_all_miss_routes_to_settle_wait():
     payload = state.node_trace[-1].payload
     assert payload["matched_selector"] is None
     assert payload["timed_out"] is True
+    # One pass × 3 selectors = 3 attempts; instant-fake guard exits.
+    assert payload["passes"] == 1
     assert len(payload["attempts"]) == 3
     assert all(a["matched"] is False for a in payload["attempts"])
     assert all(a["error"] == "timeout" for a in payload["attempts"])
+
+
+def test_wait_ready_matches_on_later_pass():
+    """A selector that misses on pass 1 but matches on pass 2 (e.g.
+    SDUI hydration race) should be caught by the loop."""
+
+    class _LateMatchLocator:
+        """Misses the first N attempts then matches. Sleeps on miss
+        to simulate a real Playwright `wait_for` exhausting its
+        timeout — otherwise the loop's instant-fake guard would bail
+        after pass 1."""
+        def __init__(self, miss_count: int) -> None:
+            self._remaining_misses = miss_count
+
+        @property
+        def first(self) -> "_LateMatchLocator":
+            return self
+
+        async def wait_for(self, *, state: str = "visible", timeout: float = 500) -> None:
+            if self._remaining_misses > 0:
+                self._remaining_misses -= 1
+                # Sleep ~timeout to mimic real Playwright behavior
+                # and clear the min-pass-duration guard.
+                await asyncio.sleep(0.06)
+                raise _FakeTimeout(f"Timeout {timeout}ms exceeded.")
+            return None  # match
+
+    late = _LateMatchLocator(miss_count=3)  # misses passes 1, 2, then... wait
+    page = _FakePage({"h2:has-text(\"About the job\")": late})  # type: ignore[arg-type]
+    state = _state_with(page, ["h2:has-text(\"About the job\")"])
+    _run(WaitReadySelector(), state)
+    payload = state.node_trace[-1].payload
+    # 3 misses (passes 1-3) then match on pass 4.
+    assert payload["matched_selector"] == "h2:has-text(\"About the job\")"
+    assert payload["matched_pass"] == 4
+    assert payload["passes"] == 4
+    assert len(payload["attempts"]) == 4
 
 
 def test_wait_ready_normalizes_legacy_string_input():

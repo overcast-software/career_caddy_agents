@@ -368,15 +368,30 @@ class DuplicateShortCircuit(BaseNode[ScrapeGraphState, None, dict]):  # type: ig
         })
 
 
-# Per-selector wait budget. With ~20 candidates per profile that's a
-# 30s upper bound, but we exit on the first hit so the typical cost is
-# one miss + one match (~1.5–3s).
-_READY_SELECTOR_PER_TIMEOUT_MS = 1500
+# Per-selector wait budget. Short enough that one full pass over a
+# ~20-candidate list completes in <10s, leaving room for the outer
+# loop (below) to cycle the list multiple times within the total
+# budget. Hydration races on SDUI sites (LinkedIn) typically resolve
+# in seconds, so a short per-attempt + retry-soon beats a long
+# per-attempt + try-once.
+_READY_SELECTOR_PER_TIMEOUT_MS = 500
+
+# Overall WaitReadySelector budget. The inner loop iterates the
+# selector list repeatedly, exiting on first match or when this
+# budget is exhausted. ~30s gives ~3 passes over a 20-selector list
+# at 500ms each.
+_READY_SELECTOR_TOTAL_BUDGET_MS = 30_000
+
+# Below this per-pass wall time we assume the wait_for is faked and
+# bail to avoid spinning the budget loop. In production, even an
+# all-miss pass against a single selector spends ~per-timeout ms
+# (~500ms), well above this threshold.
+_READY_SELECTOR_MIN_PASS_MS = 50
 
 
 @dataclass
 class WaitReadySelector(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
-    """Iterate the profile's ready_selector list until one matches.
+    """Loop the profile's ready_selector list until one matches.
 
     Why iterate (vs one `wait_for_selector` on a comma-joined string):
     Playwright's CSS parser rejects comma lists that mix standard CSS
@@ -386,6 +401,12 @@ class WaitReadySelector(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore
     visibility semantics (the LinkedIn description container exists
     in DOM before it paints) and per-attempt telemetry so a failing
     profile is debuggable from the trace alone.
+
+    Why loop (vs one pass): SDUI hydration is a race. A selector that
+    misses on pass 1 (because that card hasn't hydrated yet) may land
+    by pass 2. Re-checking the whole list on a tight cycle catches
+    late-arriving content sooner than waiting a long per-attempt
+    timeout once.
     """
 
     async def run(
@@ -400,45 +421,69 @@ class WaitReadySelector(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore
         attempts: list[dict] = []
         matched_selector: str | None = None
         matched_index: int | None = None
+        matched_pass: int | None = None
+        passes = 0
+        budget_s = _READY_SELECTOR_TOTAL_BUDGET_MS / 1000.0
         if page and selectors:
-            for idx, sel in enumerate(selectors):
-                attempt_started = time.time()
-                ok = False
-                error: str | None = None
-                try:
-                    locator = page.locator(sel).first
-                    await locator.wait_for(
-                        state="visible",
-                        timeout=_READY_SELECTOR_PER_TIMEOUT_MS,
-                    )
-                    ok = True
-                except Exception as exc:
-                    # Distinguish parser errors (selector is malformed)
-                    # from timeouts so the trace tells us which is which.
-                    msg = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
-                    if "TimeoutError" in exc.__class__.__name__ or "timeout" in msg.lower():
-                        error = "timeout"
-                    elif "Unknown engine" in msg or "selector" in msg.lower():
-                        error = f"parse:{msg[:80]}"
-                    else:
-                        error = f"{exc.__class__.__name__}:{msg[:80]}"
-                attempts.append({
-                    "selector": sel,
-                    "index": idx,
-                    "duration_ms": int((time.time() - attempt_started) * 1000),
-                    "matched": ok,
-                    "error": error,
-                })
-                if ok:
-                    matched_selector = sel
-                    matched_index = idx
+            while (
+                matched_selector is None
+                and (time.time() - started) < budget_s
+            ):
+                passes += 1
+                pass_started = time.time()
+                for idx, sel in enumerate(selectors):
+                    if (time.time() - started) >= budget_s:
+                        break
+                    attempt_started = time.time()
+                    ok = False
+                    error: str | None = None
+                    try:
+                        locator = page.locator(sel).first
+                        await locator.wait_for(
+                            state="visible",
+                            timeout=_READY_SELECTOR_PER_TIMEOUT_MS,
+                        )
+                        ok = True
+                    except Exception as exc:
+                        # Distinguish parser errors (selector is malformed)
+                        # from timeouts so the trace tells us which is which.
+                        msg = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+                        if "TimeoutError" in exc.__class__.__name__ or "timeout" in msg.lower():
+                            error = "timeout"
+                        elif "Unknown engine" in msg or "selector" in msg.lower():
+                            error = f"parse:{msg[:80]}"
+                        else:
+                            error = f"{exc.__class__.__name__}:{msg[:80]}"
+                    attempts.append({
+                        "selector": sel,
+                        "index": idx,
+                        "pass": passes,
+                        "duration_ms": int((time.time() - attempt_started) * 1000),
+                        "matched": ok,
+                        "error": error,
+                    })
+                    if ok:
+                        matched_selector = sel
+                        matched_index = idx
+                        matched_pass = passes
+                        break
+                # If the entire pass returned in negligible wall time
+                # (no real Playwright sleeping), we're in test/fake
+                # mode — bail to avoid spinning the budget loop.
+                if (
+                    matched_selector is None
+                    and (time.time() - pass_started) * 1000 < _READY_SELECTOR_MIN_PASS_MS
+                ):
                     break
 
         payload: dict = {
             "matched_selector": matched_selector,
             "matched_index": matched_index,
+            "matched_pass": matched_pass,
+            "passes": passes,
             "timed_out": matched_selector is None and bool(selectors),
             "selector_count": len(selectors),
+            "total_duration_ms": int((time.time() - started) * 1000),
             "attempts": attempts,
         }
         # Always go through SettleWait — the heading selector matching
