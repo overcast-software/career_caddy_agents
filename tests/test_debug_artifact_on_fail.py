@@ -38,7 +38,7 @@ class _FakePage:
         self._fail_screenshot = fail_screenshot
         self._fail_content = fail_content
 
-    async def screenshot(self, full_page: bool = False) -> bytes:
+    async def screenshot(self, full_page: bool = False, timeout: float = 30_000) -> bytes:
         if self._fail_screenshot:
             raise RuntimeError("page detached")
         return self._png  # type: ignore[return-value]
