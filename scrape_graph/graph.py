@@ -40,6 +40,7 @@ from .nodes_scrape import (
     Navigate,
     PersistScrape,
     ResolveFinalUrl,
+    ScrollToLoad,
     SettleWait,
     StartScrape,
     WaitReadySelector,
@@ -51,11 +52,12 @@ from .state import ScrapeGraphState
 # them via this module's namespace (parent of the Graph(...) call).
 __all_nodes__ = (
     StartScrape, LoadProfile, Navigate, ResolveFinalUrl, CheckLinkDedup,
-    DuplicateShortCircuit, WaitReadySelector, SettleWait, ExpandTruncations,
-    Capture, PersistScrape, DetectObstacle, ObstacleRememberMe,
-    ObstacleWaitRetry, ObstacleAgent, ObstacleFail, StartExtract, Tier0CSS,
-    Tier1Mini, Tier2Haiku, Tier3Sonnet, EvaluateExtraction, ValidateExtraction,
-    PersistJobPost, UpdateProfile, ResolveApplyUrl, ExtractFail,
+    DuplicateShortCircuit, WaitReadySelector, SettleWait, ScrollToLoad,
+    ExpandTruncations, Capture, PersistScrape, DetectObstacle,
+    ObstacleRememberMe, ObstacleWaitRetry, ObstacleAgent, ObstacleFail,
+    StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
+    EvaluateExtraction, ValidateExtraction, PersistJobPost, UpdateProfile,
+    ResolveApplyUrl, ExtractFail,
 )
 
 
@@ -68,7 +70,8 @@ _SCRAPE_NODES = [
     DetectObstacle, ObstacleRememberMe, ObstacleWaitRetry, ObstacleAgent,
     ObstacleFail,
     ResolveFinalUrl, CheckLinkDedup,
-    DuplicateShortCircuit, WaitReadySelector, SettleWait, ExpandTruncations,
+    DuplicateShortCircuit, WaitReadySelector, SettleWait, ScrollToLoad,
+    ExpandTruncations,
     Capture, PersistScrape,
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
     EvaluateExtraction, ValidateExtraction, PersistJobPost, UpdateProfile,
@@ -164,8 +167,9 @@ NODE_META: dict[str, dict[str, str]] = {
         "group": "scrape", "label": "Wait ready selector",
         "description": (
             "When the profile has a ready_selector (signals SPA content "
-            "has rendered), waits up to 5s for it. Hit → ExpandTruncations; "
-            "miss → SettleWait."
+            "has rendered), waits up to 5s for it. Hit → ScrollToLoad; "
+            "miss → SettleWait. Emits matched_selector / timed_out so "
+            "traces distinguish a real hit from a 5s timeout."
         ),
     },
     "SettleWait": {
@@ -173,6 +177,16 @@ NODE_META: dict[str, dict[str, str]] = {
         "description": (
             "Fallback fixed 2s sleep when no ready_selector is known, "
             "giving SPAs a chance to finish rendering before capture."
+        ),
+    },
+    "ScrollToLoad": {
+        "group": "scrape", "label": "Scroll to load",
+        "description": (
+            "Scrolls the page in ~250ms increments to trigger "
+            "IntersectionObserver-driven lazy hydration (LinkedIn's "
+            "'About the job' card is the canonical case). Stops on "
+            "ready_selector match, scrollHeight stall, or ~5s budget. "
+            "Emits ticks / matched_selector / final_scroll_y telemetry."
         ),
     },
     "ExpandTruncations": {
