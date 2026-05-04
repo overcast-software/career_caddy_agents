@@ -32,6 +32,18 @@ _TIER2_MODEL = os.environ.get("SCRAPE_GRAPH_TIER2_MODEL", "anthropic:claude-haik
 _TIER3_MODEL = os.environ.get("SCRAPE_GRAPH_TIER3_MODEL", "anthropic:claude-sonnet-4-6")
 _STUB_MIN_WORDS = 60
 
+# When a profile's extraction_hints instructs the LLM to emit a
+# placeholder description for a documented partial-render state (see
+# the LinkedIn SDUI hint), the description will be short — well under
+# _STUB_MIN_WORDS — but is intentional, not a thin extraction. Detect
+# the literal prefix so EvaluateExtraction lets it through with
+# title/company instead of escalating to higher tiers and failing.
+_PARTIAL_RENDER_DESCRIPTION_PREFIX = "[DESCRIPTION NOT CAPTURED"
+
+
+def _is_partial_render_placeholder(description: str) -> bool:
+    return description.lstrip().startswith(_PARTIAL_RENDER_DESCRIPTION_PREFIX)
+
 
 def _api_base() -> str:
     return os.environ.get("CC_API_BASE_URL", "").rstrip("/")
@@ -207,10 +219,19 @@ class EvaluateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
             reasons.append("missing_title")
         if not company:
             reasons.append("missing_company")
-        if description and len(description.split()) < _STUB_MIN_WORDS:
+        partial_render = _is_partial_render_placeholder(description)
+        if (
+            description
+            and not partial_render
+            and len(description.split()) < _STUB_MIN_WORDS
+        ):
             reasons.append("thin_description")
         passed = not reasons
-        state.evaluation = {"passed": passed, "reasons": reasons}
+        state.evaluation = {
+            "passed": passed,
+            "reasons": reasons,
+            "partial_render": partial_render,
+        }
 
         last_tier = state.tier_attempts[-1].tier if state.tier_attempts else ""
         tier3_enabled = os.environ.get("SCRAPE_GRAPH_ENABLE_TIER3") == "1"

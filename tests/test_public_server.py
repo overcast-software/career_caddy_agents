@@ -11,7 +11,7 @@ class TestPublicServerTools:
     def load_server(self):
         from mcp_servers.public_server import server
         self.server = server
-        self.tools = asyncio.get_event_loop().run_until_complete(server.list_tools())
+        self.tools = asyncio.run(server.list_tools())
         self.tool_names = {t.name for t in self.tools}
 
     def test_tool_count(self):

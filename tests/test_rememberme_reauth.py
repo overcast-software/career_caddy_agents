@@ -16,7 +16,7 @@ from mcp_servers.browser_server import _try_rememberme_reauth
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def _make_element(text: str = "", aria_label: str | None = None):
