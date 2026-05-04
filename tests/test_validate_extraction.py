@@ -76,6 +76,50 @@ def test_validate_fails_on_thin_source():
     assert "source_too_short" in state.evaluation["validate_reasons"]
 
 
+def test_validate_fails_on_ui_chrome_only_description():
+    """LinkedIn lazy-hydration repro — when the 'About the job' card
+    never renders, Tier1 sometimes returns a description that's just
+    the visible chrome (pills, salary banner, Apply/Save, the 'Use AI
+    to assess how you fit' CTA). EvaluateExtraction passes it because
+    title + company are in the page header; ValidateExtraction must
+    reject it before it poisons the JobPost.
+    """
+    state = ScrapeGraphState(scrape_id=1650, submitted_url="https://linkedin.com/jobs/view/4407097463")
+    state.parsed = {
+        "title": "Staff Engineer",
+        "company_name": "Some Co",
+        "description": (
+            "$215K/yr - $250K/yr\nRemote\nFull-time\nApply\nSave\n"
+            "Use AI to assess how you fit"
+        ),
+    }
+    # Source content is long enough — the gate has to fire on the
+    # parsed description, not the source word count.
+    state.job_content = " ".join(["word"] * 80)
+    next_node = _run(ValidateExtraction(), state)
+    assert isinstance(next_node, ExtractFail)
+    assert "ui_chrome_only" in state.evaluation["validate_reasons"]
+
+
+def test_validate_passes_on_real_description_short_but_meaningful():
+    """A short description that contains real-job vocabulary
+    ('responsibilities', 'requirements', etc.) must NOT trip the
+    chrome guard, even if it's under the size threshold.
+    """
+    state = ScrapeGraphState(scrape_id=1, submitted_url="https://x.com/job/1")
+    state.parsed = {
+        "title": "Backend Engineer",
+        "company_name": "Acme",
+        "description": (
+            "Responsibilities: ship the platform. "
+            "Requirements: 5+ years Python."
+        ),
+    }
+    state.job_content = " ".join(["word"] * 80)
+    next_node = _run(ValidateExtraction(), state)
+    assert isinstance(next_node, PersistJobPost)
+
+
 def test_validate_preserves_prior_evaluation(good_state):
     good_state.evaluation = {"passed": True, "reasons": []}
     _run(ValidateExtraction(), good_state)

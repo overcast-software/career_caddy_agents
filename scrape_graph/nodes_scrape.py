@@ -59,6 +59,10 @@ class SettleWait(BaseNode[ScrapeGraphState, None, dict]):
     pass
 
 
+class ScrollToLoad(BaseNode[ScrapeGraphState, None, dict]):
+    pass
+
+
 class ExpandTruncations(BaseNode[ScrapeGraphState, None, dict]):
     pass
 
@@ -293,7 +297,7 @@ class DuplicateShortCircuit(BaseNode[ScrapeGraphState, None, dict]):  # type: ig
 class WaitReadySelector(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> Union[ExpandTruncations, SettleWait]:
+    ) -> Union[ScrollToLoad, SettleWait]:
         started = time.time()
         state = ctx.state
         page = getattr(state, "_browser_page", None)
@@ -301,11 +305,21 @@ class WaitReadySelector(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore
         if page and selector:
             try:
                 await page.wait_for_selector(selector, timeout=5_000)
-                trace_node(state, "WaitReadySelector", "ExpandTruncations", started)
-                return ExpandTruncations()
+                trace_node(
+                    state, "WaitReadySelector", "ScrollToLoad", started,
+                    {"matched_selector": selector, "timed_out": False},
+                )
+                return ScrollToLoad()
             except Exception:
-                pass
-        trace_node(state, "WaitReadySelector", "SettleWait", started)
+                trace_node(
+                    state, "WaitReadySelector", "SettleWait", started,
+                    {"matched_selector": None, "timed_out": True},
+                )
+                return SettleWait()
+        trace_node(
+            state, "WaitReadySelector", "SettleWait", started,
+            {"matched_selector": None, "timed_out": False},
+        )
         return SettleWait()
 
 
@@ -313,7 +327,7 @@ class WaitReadySelector(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore
 class SettleWait(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> ExpandTruncations:
+    ) -> ScrollToLoad:
         import asyncio
         started = time.time()
         page = getattr(ctx.state, "_browser_page", None)
@@ -322,7 +336,90 @@ class SettleWait(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-red
                 await asyncio.sleep(2.0)
             except Exception:
                 pass
-        trace_node(ctx.state, "SettleWait", "ExpandTruncations", started)
+        trace_node(ctx.state, "SettleWait", "ScrollToLoad", started)
+        return ScrollToLoad()
+
+
+# Cap on the scroll-to-load loop. ~5s total budget, ~250ms per tick =
+# ~20 ticks. LinkedIn's IntersectionObserver-driven hydration of the
+# "About the job" card finishes inside this window in practice.
+_SCROLL_STEP_PX = 800
+_SCROLL_TICK_MS = 250
+_SCROLL_MAX_TICKS = 20
+_SCROLL_POST_SETTLE_MS = 500
+
+
+@dataclass
+class ScrollToLoad(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
+    """Scroll the page in increments to trigger IntersectionObserver-
+    driven lazy hydration (e.g. LinkedIn's "About the job" card).
+
+    Stops as soon as one of the profile's ready_selector candidates
+    matches, or when scrollHeight stops advancing for two consecutive
+    ticks, or when the per-loop budget is hit. A short post-settle
+    lets the just-fetched description XHR paint before
+    ExpandTruncations looks for "See more".
+    """
+
+    async def run(
+        self, ctx: GraphRunContext[ScrapeGraphState, None]
+    ) -> ExpandTruncations:
+        import asyncio
+        started = time.time()
+        state = ctx.state
+        page = getattr(state, "_browser_page", None)
+        selector = (state.profile or {}).get("ready_selector") or None
+        ticks = 0
+        matched: str | None = None
+        last_height = -1
+        stalled = 0
+        final_y = 0
+        if page:
+            try:
+                for ticks in range(1, _SCROLL_MAX_TICKS + 1):
+                    try:
+                        await page.evaluate(
+                            f"window.scrollBy(0, {_SCROLL_STEP_PX})"
+                        )
+                    except Exception:
+                        break
+                    await asyncio.sleep(_SCROLL_TICK_MS / 1000.0)
+                    if selector:
+                        try:
+                            handle = await page.query_selector(selector)
+                            if handle is not None:
+                                matched = selector
+                                break
+                        except Exception:
+                            pass
+                    try:
+                        height = await page.evaluate(
+                            "document.body.scrollHeight"
+                        )
+                    except Exception:
+                        height = last_height
+                    if height == last_height:
+                        stalled += 1
+                        if stalled >= 2:
+                            break
+                    else:
+                        stalled = 0
+                        last_height = height
+                try:
+                    final_y = await page.evaluate("window.scrollY") or 0
+                except Exception:
+                    final_y = 0
+                await asyncio.sleep(_SCROLL_POST_SETTLE_MS / 1000.0)
+            except Exception:
+                logger.debug("ScrollToLoad failed", exc_info=True)
+        trace_node(
+            state, "ScrollToLoad", "ExpandTruncations", started,
+            {
+                "ticks": ticks,
+                "matched_selector": matched,
+                "final_scroll_y": int(final_y) if final_y else 0,
+            },
+        )
         return ExpandTruncations()
 
 
@@ -509,6 +606,7 @@ __all__ = [
     "DuplicateShortCircuit",
     "WaitReadySelector",
     "SettleWait",
+    "ScrollToLoad",
     "ExpandTruncations",
     "Capture",
     "PersistScrape",

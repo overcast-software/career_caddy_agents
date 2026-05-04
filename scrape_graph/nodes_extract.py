@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Union
@@ -245,6 +246,72 @@ _LOADING_SHELL_MIN_HITS = 2
 
 _SOURCE_MIN_WORDS = 40
 
+# UI-chrome-only description fingerprint. LinkedIn's lazy-hydrated
+# "About the job" card occasionally produces an extraction whose
+# `description` is just the visible chrome around it (filter pills,
+# salary banner, Apply/Save buttons, the "Use AI to assess how you
+# fit" CTA). It looks plausible to EvaluateExtraction because the
+# title and company come from the page header — but the body has no
+# real prose. Reject when the description is short AND has no real-
+# job vocabulary AND is dominated by chrome words.
+_UI_CHROME_DESC_MAX_CHARS = 200
+_UI_CHROME_REAL_JOB_PHRASES = (
+    "responsibilities", "qualifications", "requirements", "experience",
+    "years", "you will", "we are looking", "about the role",
+    "about the job", "our team",
+)
+_UI_CHROME_PILL_PHRASES = (
+    "remote", "hybrid", "on-site", "onsite", "full-time", "fulltime",
+    "part-time", "parttime", "contract", "apply", "save",
+    "use ai to assess", "how you fit",
+)
+# Salary/timeframe units that show up in the chrome banner without
+# carrying real prose (e.g. "$215K/yr - $250K/yr").
+_UI_CHROME_UNIT_TOKENS = frozenset({"yr", "hr", "wk", "mo", "k"})
+_UI_CHROME_PILL_RATIO = 0.6
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _ui_chrome_vocab() -> frozenset[str]:
+    """Words that appear inside any chrome pill phrase. Built once."""
+    vocab: set[str] = set()
+    for phrase in _UI_CHROME_PILL_PHRASES:
+        for word in phrase.replace("-", " ").split():
+            vocab.add(word)
+    return frozenset(vocab)
+
+
+_UI_CHROME_VOCAB = _ui_chrome_vocab()
+
+
+def _is_ui_chrome_description(description: str) -> bool:
+    """Heuristic: does this description look like it's just LinkedIn
+    UI chrome (pills + salary + Apply/Save) instead of real prose?
+
+    Tokenises on non-alphanumerics so '$215K/yr' yields ['215k', 'yr']
+    — both count as chrome. A token counts as chrome if it's in the
+    pill vocabulary, contains a digit (salary fragment), or is a
+    short unit word like 'yr'.
+    """
+    text = (description or "").strip()
+    if not text or len(text) > _UI_CHROME_DESC_MAX_CHARS:
+        return False
+    lowered = text.lower()
+    if any(p in lowered for p in _UI_CHROME_REAL_JOB_PHRASES):
+        return False
+    tokens = _TOKEN_RE.findall(lowered)
+    if not tokens:
+        return False
+    chrome = 0
+    for tok in tokens:
+        if tok in _UI_CHROME_VOCAB:
+            chrome += 1
+        elif any(c.isdigit() for c in tok):
+            chrome += 1
+        elif tok in _UI_CHROME_UNIT_TOKENS:
+            chrome += 1
+    return (chrome / len(tokens)) >= _UI_CHROME_PILL_RATIO
+
 
 @dataclass
 class ValidateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
@@ -278,6 +345,10 @@ class ValidateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
         hits = sum(1 for p in _LOADING_SHELL_PHRASES if p in lowered)
         if hits >= _LOADING_SHELL_MIN_HITS:
             reasons.append("loading_shell_fingerprint")
+
+        parsed_description = ((state.parsed or {}).get("description") or "")
+        if _is_ui_chrome_description(parsed_description):
+            reasons.append("ui_chrome_only")
 
         state.evaluation = {
             **(state.evaluation or {}),
