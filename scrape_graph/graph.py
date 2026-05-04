@@ -126,7 +126,10 @@ NODE_META: dict[str, dict[str, str]] = {
         "description": (
             "Fetches the per-hostname ScrapeProfile (css selectors, "
             "ready_selector, obstacle hints) from the api. Missing "
-            "profile is fine — later nodes degrade to generic behavior."
+            "profile is fine — later nodes degrade to generic behavior. "
+            "Emits ready_selector_count / ready_selector_hash so later "
+            "nodes' selector misses are correlatable to which profile "
+            "version was loaded."
         ),
     },
     "Navigate": {
@@ -166,10 +169,12 @@ NODE_META: dict[str, dict[str, str]] = {
     "WaitReadySelector": {
         "group": "scrape", "label": "Wait ready selector",
         "description": (
-            "When the profile has a ready_selector (signals SPA content "
-            "has rendered), waits up to 5s for it. Hit → ScrollToLoad; "
-            "miss → SettleWait. Emits matched_selector / timed_out so "
-            "traces distinguish a real hit from a 5s timeout."
+            "Iterates the profile's ready_selector list, trying each "
+            "via locator(s).first.wait_for(state='visible') with a "
+            "1.5s per-selector budget. First hit → ScrollToLoad; all "
+            "miss → SettleWait. Emits matched_selector / matched_index "
+            "/ timed_out / per-attempt durations + error class so "
+            "parser errors are distinguishable from real timeouts."
         ),
     },
     "SettleWait": {
