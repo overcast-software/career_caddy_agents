@@ -150,6 +150,10 @@ TOOL_SHAPES: dict[str, dict[str, Any]] = {
         "kind": "passthrough",
         "notes": "Already slim. Just YAML-serialize and drop wrapper.",
     },
+    "get_duplicate_candidates": {
+        "kind": "passthrough",
+        "notes": "Slim by construction (≤10 candidates, scalar attrs).",
+    },
 
     # --- Read: list (table) ---
     "get_companies": {
@@ -1197,6 +1201,19 @@ async def upload_screenshot(api: ApiClient, scrape_id: int, file_path: Path) -> 
 async def list_screenshots(api: ApiClient, scrape_id: int) -> str:
     """List screenshot filenames for a scrape. Staff-only endpoint."""
     return await api.get(f"/api/v1/scrapes/{scrape_id}/screenshots/")
+
+
+async def get_duplicate_candidates(api: ApiClient, job_post_id: int) -> str:
+    """Fetch likely-duplicate JobPosts for a given post.
+
+    Returns a list of {id, title, company_name, match_signals,
+    confidence, frontend_url} ordered confidence-desc, recent-first,
+    capped at 10. Confidence values: 'high' (canonical_link or
+    fingerprint match) / 'medium' (same company + title prefix/suffix
+    overlap). Visibility-scoped per the calling user."""
+    return await api.get(
+        f"/api/v1/job-posts/{job_post_id}/duplicate-candidates/"
+    )
 
 
 async def get_scrape_graph_trace(api: ApiClient, scrape_id: int) -> str:

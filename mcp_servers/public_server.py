@@ -228,6 +228,25 @@ async def find_job_post_by_link(link: str) -> str:
 
 
 @server.tool()
+async def get_duplicate_candidates(job_post_id: int) -> str:
+    """List likely-duplicate JobPosts for a given post.
+
+    Returns up to 10 peer posts the system suspects represent the
+    same role, ordered confidence-desc, recent-first. Each candidate
+    has match_signals drawn from:
+      - canonical_link (high confidence, exact URL match after
+        tracking-param strip + host rewrites)
+      - fingerprint (high confidence, same company + normalized
+        title + location)
+      - title_similarity (medium, same company + one title is a
+        prefix/suffix of the other — catches suffix-drift cases
+        fingerprint hashing can't)
+    Empty list when nothing looks duplicate. Use to verify a stub
+    or freshly-extracted post before treating it as unique."""
+    return await api_tools.get_duplicate_candidates(_api(), job_post_id)
+
+
+@server.tool()
 async def search_job_posts(
     query: Optional[str] = None,
     title: Optional[str] = None,
