@@ -182,3 +182,116 @@ class TestCaptureDebugArtifact:
         assert result["screenshot_uploaded"] is False
         # DOM path still ran and succeeded.
         assert result["dom_saved"] is True
+
+
+class TestUploadPageScreenshot:
+    """Direct tests for the shared helper that backs both
+    capture_debug_artifact AND Capture._screenshot_and_upload. The
+    happy-path call (no `reason`) is the one that regressed in prod —
+    scrapes 320, 321, 323, 324, 325 all silently dropped — so its
+    invariants need their own coverage."""
+
+    @pytest.mark.asyncio
+    async def test_happy_path_no_reason_uploads_with_two_segment_filename(self):
+        from scrape_graph import _artifacts as mod
+
+        page = _FakePage()
+        state = _FakeState()
+        post_resp = MagicMock(status_code=201)
+
+        with patch.object(mod, "httpx") as httpx_mod:
+            httpx_mod.post = MagicMock(return_value=post_resp)
+            name = await mod.upload_page_screenshot(page, state)
+
+        assert name is not None
+        # Happy-path filename schema: {host}_{ts}.png — no reason segment.
+        assert name.startswith("linkedin.com_")
+        assert "_obstacle_fail_" not in name
+        assert "_extract_fail_" not in name
+        assert state.screenshot_name == name
+        assert httpx_mod.post.called
+
+    @pytest.mark.asyncio
+    async def test_failure_path_with_reason_uploads_with_three_segment_filename(self):
+        from scrape_graph import _artifacts as mod
+
+        page = _FakePage()
+        state = _FakeState()
+        post_resp = MagicMock(status_code=201)
+
+        with patch.object(mod, "httpx") as httpx_mod:
+            httpx_mod.post = MagicMock(return_value=post_resp)
+            name = await mod.upload_page_screenshot(
+                page, state, reason="obstacle_fail",
+            )
+
+        assert name is not None
+        assert name.startswith("linkedin.com_obstacle_fail_")
+
+    @pytest.mark.asyncio
+    async def test_calls_screenshot_with_safe_defaults(self):
+        """Regression guard: Playwright's default 30s screenshot timeout
+        was the root cause of the happy-path silent-drop. The shared
+        helper must call page.screenshot() with full_page=False AND a
+        bounded timeout so brittle pages still land an artifact."""
+        from scrape_graph import _artifacts as mod
+
+        captured = {}
+
+        class _RecordingPage(_FakePage):
+            async def screenshot(self, full_page: bool = False, timeout: float = 30_000) -> bytes:
+                captured["full_page"] = full_page
+                captured["timeout"] = timeout
+                return self._png  # type: ignore[return-value]
+
+        page = _RecordingPage()
+        state = _FakeState()
+        post_resp = MagicMock(status_code=201)
+
+        with patch.object(mod, "httpx") as httpx_mod:
+            httpx_mod.post = MagicMock(return_value=post_resp)
+            await mod.upload_page_screenshot(page, state)
+
+        assert captured["full_page"] is False
+        assert captured["timeout"] <= 10_000, (
+            "must be well under Playwright's 30s default; the regression"
+            " was caused by hitting that default"
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_screenshot_exception(self):
+        from scrape_graph import _artifacts as mod
+
+        page = _FakePage(fail_screenshot=True)
+        state = _FakeState()
+
+        with patch.object(mod, "httpx") as httpx_mod:
+            httpx_mod.post = MagicMock()
+            name = await mod.upload_page_screenshot(page, state)
+
+        assert name is None
+        assert not httpx_mod.post.called
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_non_2xx_response(self):
+        from scrape_graph import _artifacts as mod
+
+        page = _FakePage()
+        state = _FakeState()
+        post_resp = MagicMock(status_code=403, text="staff required")
+
+        with patch.object(mod, "httpx") as httpx_mod:
+            httpx_mod.post = MagicMock(return_value=post_resp)
+            name = await mod.upload_page_screenshot(page, state)
+
+        assert name is None
+        assert state.screenshot_name is None
+
+    @pytest.mark.asyncio
+    async def test_none_page_or_no_scrape_id_short_circuits(self):
+        from scrape_graph import _artifacts as mod
+
+        assert await mod.upload_page_screenshot(None, _FakeState()) is None
+        no_id = _FakeState()
+        no_id.scrape_id = 0
+        assert await mod.upload_page_screenshot(_FakePage(), no_id) is None

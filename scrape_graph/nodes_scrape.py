@@ -719,49 +719,20 @@ class Capture(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
 
 
 async def _screenshot_and_upload(page, state: ScrapeGraphState) -> None:
-    """Take a full-page screenshot, upload to the api's screenshots
-    endpoint, and record the filename on state. Matches the legacy
-    poller's upload path so the /scrapes/:id/screenshots/ viewer keeps
-    working after the primary cutover."""
-    from datetime import datetime
-    from urllib.parse import urlparse
-    try:
-        from mcp_servers.browser_server import SCREENSHOT_DIR
-    except Exception:
-        logger.debug("Capture: SCREENSHOT_DIR unavailable, skipping screenshot", exc_info=True)
-        return
-    host = (urlparse(state.canonical_url or state.submitted_url or "").hostname or "unknown").lower()
-    if host.startswith("www."):
-        host = host[4:]
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = f"{host}_{ts}.png"
-    path = SCREENSHOT_DIR / name
-    try:
-        await page.screenshot(path=str(path), full_page=True)
-    except Exception as exc:
-        logger.warning("Capture: screenshot failed: %s", exc)
-        return
-    try:
-        with open(path, "rb") as f:
-            resp = httpx.post(
-                f"{_api_base()}/api/v1/scrapes/{state.scrape_id}/screenshots/",
-                files={"file": (name, f, "image/png")},
-                headers=_api_headers(),
-                timeout=30.0,
-            )
-        if resp.status_code < 400:
-            state.screenshot_name = name
-        else:
-            logger.warning(
-                "Capture: screenshot upload %s: %s", resp.status_code, resp.text[:200]
-            )
-    except Exception as exc:
-        logger.warning("Capture: screenshot upload exception: %s", exc)
-    finally:
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
+    """Happy-path screenshot for the scrapes/:id/screenshots/ viewer.
+
+    Delegates to the shared in-memory uploader in ``_artifacts``. Until
+    2026-05-05 this had its own disk-round-trip implementation that
+    imported ``mcp_servers.browser_server.SCREENSHOT_DIR`` and called
+    ``page.screenshot(full_page=True)`` with no explicit timeout —
+    Playwright's 30s default fired on every LinkedIn login-wall page
+    and the screenshot silently dropped (scrape 322 was the last
+    happy-path screenshot to land before the regression became
+    visible). The shared helper uses a viewport-only snap with a 5s
+    timeout so brittle pages still produce a usable artifact.
+    """
+    from ._artifacts import upload_page_screenshot
+    await upload_page_screenshot(page, state)
 
 
 async def _discover_selectors(page, state: ScrapeGraphState) -> None:

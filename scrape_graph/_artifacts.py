@@ -1,21 +1,26 @@
-"""Shared debug-artifact helper: snapshot the page on any terminal failure.
+"""Shared debug-artifact helper: snapshot the page for any scrape outcome.
 
-Capture's happy path (nodes_scrape.py) already takes a screenshot, uploads
-it, and PATCHes the scrape's html + job_content. But failure paths short-
-circuit before Capture — `ObstacleFail` fires when we can't clear a login
-wall, `ExtractFail` fires when all tiers produce junk. At those moments
-we have nothing to look at post-mortem except a cryptic failure_reason.
+Two callers:
+- ``capture_debug_artifact`` — invoked by every Fail terminal
+  (``ObstacleFail`` / ``ExtractFail``) BEFORE ``_patch_scrape_status``.
+  Snapshots the page + DOM so the admin UI has something to render
+  post-mortem.
+- ``Capture._screenshot_and_upload`` (nodes_scrape.py) — happy-path
+  capture so the /scrapes/:id/screenshots/ viewer keeps working when
+  the scrape succeeds.
 
-`capture_debug_artifact` is the invariant: every Fail terminal calls it
-before `_patch_scrape_status`. Takes a viewport screenshot (best-effort),
-uploads it to the scrape's screenshots endpoint, and snapshots the HTML
-into scrape.html if that column is still empty. Tolerant of detached
-pages, closed browsers, upload errors — never raises, never blocks the
-Fail terminal from finalizing the scrape.
+Both call ``upload_page_screenshot`` underneath. Until 2026-05-05 the
+happy path had its own disk-round-trip implementation that imported
+``mcp_servers.browser_server.SCREENSHOT_DIR`` and called
+``page.screenshot(full_page=True)`` with no timeout — Playwright's 30s
+default fired on slow LinkedIn pages and the screenshot never landed
+(scrapes 320, 321, 323, 324, 325 all silently dropped). The shared
+helper uses ``full_page=False`` + ``timeout=5_000`` so the same
+viewport-fast snap that worked on the failure path now works on the
+happy path too. See notes.org Operations/Scrape Log 2026-05-05.
 
-Why viewport over full-page: full-page can be multi-MB on LinkedIn and
-sometimes takes >5s to render. On a failure path we're already in a
-degraded state; we want a quick visual, not a perfect one.
+Both paths are tolerant of detached pages, closed browsers, upload
+errors — never raises, never blocks the caller.
 """
 
 from __future__ import annotations
@@ -42,6 +47,88 @@ def _api_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+async def upload_page_screenshot(
+    page,
+    state,
+    *,
+    reason: str | None = None,
+    full_page: bool = False,
+    timeout_ms: int = 5_000,
+) -> str | None:
+    """Snap a screenshot in-memory and POST to /api/v1/scrapes/:id/screenshots/.
+
+    Returns the uploaded filename on success, None on any failure
+    (screenshot exception, upload exception, non-2xx response, missing
+    page or scrape_id). Records ``state.screenshot_name`` on success so
+    ``graph_payload`` can reference it.
+
+    Best-effort: never raises. Logs warnings on failure.
+
+    Filename schema:
+        with reason → ``{host}_{reason}_{YYYYMMDD_HHMMSS}.png``
+        without    → ``{host}_{YYYYMMDD_HHMMSS}.png``
+
+    ``full_page`` defaults to False and ``timeout_ms`` defaults to 5s
+    deliberately — Playwright's default 30s "wait for fonts" stalls on
+    LinkedIn / Cloudflare-gated pages where the page DOM never settles.
+    Both callers (failure path AND Capture's happy path) use these
+    defaults; the LinkedIn login-wall pages were the case that
+    motivated the unification.
+    """
+    if page is None or not getattr(state, "scrape_id", None):
+        return None
+
+    host = (
+        urlparse(state.canonical_url or state.submitted_url or "").hostname
+        or "unknown"
+    ).lower()
+    if host.startswith("www."):
+        host = host[4:]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"{host}_{reason}_{ts}.png" if reason else f"{host}_{ts}.png"
+
+    try:
+        png_bytes: bytes | None = await page.screenshot(
+            full_page=full_page, timeout=timeout_ms,
+        )
+    except Exception:
+        logger.warning(
+            "upload_page_screenshot: screenshot failed scrape_id=%s reason=%s",
+            state.scrape_id, reason, exc_info=True,
+        )
+        return None
+
+    if not png_bytes:
+        return None
+
+    try:
+        resp = httpx.post(
+            f"{_api_base()}/api/v1/scrapes/{state.scrape_id}/screenshots/",
+            files={"file": (name, png_bytes, "image/png")},
+            headers=_api_headers(),
+            timeout=30.0,
+        )
+    except Exception:
+        logger.warning(
+            "upload_page_screenshot: upload exception scrape_id=%s",
+            state.scrape_id, exc_info=True,
+        )
+        return None
+
+    if resp.status_code >= 400:
+        logger.warning(
+            "upload_page_screenshot: upload %s: %s",
+            resp.status_code, resp.text[:200],
+        )
+        return None
+
+    try:
+        state.screenshot_name = name
+    except Exception:
+        pass
+    return name
+
+
 async def capture_debug_artifact(
     page, state, *, reason: str,
 ) -> dict:
@@ -60,59 +147,8 @@ async def capture_debug_artifact(
     if page is None or not getattr(state, "scrape_id", None):
         return result
 
-    # ── Screenshot ────────────────────────────────────────────────────────
-    host = (
-        urlparse(state.canonical_url or state.submitted_url or "").hostname
-        or "unknown"
-    ).lower()
-    if host.startswith("www."):
-        host = host[4:]
-    name = f"{host}_{reason}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-
-    # Capture's happy path writes the screenshot to SCREENSHOT_DIR on disk
-    # first. Here we keep it purely in-memory — the helper fires on failure
-    # paths where disk cleanup adds risk, and the upload accepts bytes
-    # directly. The extra disk round-trip Capture does is cosmetic, not
-    # required.
-
-    png_bytes: bytes | None = None
-    try:
-        # Tight timeout: this fires on the failure path where the page
-        # is often half-rendered, so Playwright's default 30s
-        # "waiting for fonts to load" wait blocks the poller for no
-        # diagnostic value. 5s is enough to snap whatever did paint.
-        png_bytes = await page.screenshot(full_page=False, timeout=5_000)
-    except Exception:
-        logger.warning(
-            "capture_debug_artifact: screenshot failed scrape_id=%s reason=%s",
-            state.scrape_id, reason, exc_info=True,
-        )
-
-    if png_bytes:
-        try:
-            resp = httpx.post(
-                f"{_api_base()}/api/v1/scrapes/{state.scrape_id}/screenshots/",
-                files={"file": (name, png_bytes, "image/png")},
-                headers=_api_headers(),
-                timeout=30.0,
-            )
-            if resp.status_code < 400:
-                result["screenshot_uploaded"] = True
-                # Record on state so graph_payload can reference it.
-                try:
-                    state.screenshot_name = name
-                except Exception:
-                    pass
-            else:
-                logger.warning(
-                    "capture_debug_artifact: upload %s: %s",
-                    resp.status_code, resp.text[:200],
-                )
-        except Exception:
-            logger.warning(
-                "capture_debug_artifact: upload exception scrape_id=%s",
-                state.scrape_id, exc_info=True,
-            )
+    uploaded = await upload_page_screenshot(page, state, reason=reason)
+    result["screenshot_uploaded"] = uploaded is not None
 
     # ── DOM snapshot (first _MAX_DOM_BYTES bytes) ─────────────────────────
     # Only write to scrape.html if it's empty — we don't want to clobber a
