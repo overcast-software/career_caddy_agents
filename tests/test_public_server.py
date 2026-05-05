@@ -15,13 +15,17 @@ class TestPublicServerTools:
         self.tool_names = {t.name for t in self.tools}
 
     def test_tool_count(self):
-        assert len(self.tools) == 26
+        # Bumped 26→27 when get_duplicate_candidates was added so a chat /
+        # MCP client can ask "are there other posts that look like this?"
+        # before creating a new one.
+        assert len(self.tools) == 27
 
     def test_has_all_expected_tools(self):
         expected = {
             "create_company", "find_company_by_name", "search_companies", "get_companies",
             "create_job_post_with_company_check", "find_job_post_by_link",
             "search_job_posts", "get_job_posts", "update_job_post",
+            "get_duplicate_candidates",
             "create_job_application", "get_job_applications",
             "get_applications_for_job_post", "update_job_application",
             "get_career_data", "get_current_user",
