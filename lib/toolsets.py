@@ -55,6 +55,7 @@ TOOL_REGISTRY: dict[str, Any] = {
     "search_job_posts": api_tools.search_job_posts,
     "get_job_posts": api_tools.get_job_posts,
     "update_job_post": api_tools.update_job_post,
+    "get_duplicate_candidates": api_tools.get_duplicate_candidates,
     # Job applications
     "create_job_application": api_tools.create_job_application,
     "get_job_applications": api_tools.get_job_applications,
@@ -101,6 +102,7 @@ SCOPES: dict[str, set[str]] = {
         "create_company", "find_company_by_name", "search_companies", "get_companies",
         "create_job_post_with_company_check", "find_job_post_by_link",
         "search_job_posts", "get_job_posts", "update_job_post",
+        "get_duplicate_candidates",
         "create_job_application", "get_job_applications",
         "get_applications_for_job_post", "update_job_application",
         "get_career_data",
