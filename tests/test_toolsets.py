@@ -60,6 +60,53 @@ class TestScopes:
         for name, tools in SCOPES.items():
             assert len(tools) > 0, f"Scope '{name}' is empty"
 
+    def test_main_chat_includes_scrape_management(self):
+        # main_chat carries scrape tools at the scope level; the chat agent
+        # filters them at runtime to staff users only via .filtered() in
+        # agent_factory. The scope itself stays inclusive.
+        assert SCOPES["scrape_management"] <= SCOPES["main_chat"]
+
+
+class TestStaffOnlyChatFilter:
+    """The chat agent's runtime filter that hides scrape_management tools
+    from non-staff users. See agent_factory.chat_tool_gate_filter."""
+
+    def _make_ctx(self, is_staff: bool):
+        from types import SimpleNamespace
+        deps = CareerCaddyDeps(api_token="t", is_staff=is_staff)
+        return SimpleNamespace(deps=deps)
+
+    def _make_tool_def(self, name: str):
+        from types import SimpleNamespace
+        return SimpleNamespace(name=name)
+
+    def test_scrape_tool_hidden_from_non_staff(self):
+        from agents.agent_factory import chat_tool_gate_filter
+
+        ctx = self._make_ctx(is_staff=False)
+        for tool_name in SCOPES["scrape_management"]:
+            assert not chat_tool_gate_filter(ctx, self._make_tool_def(tool_name)), (
+                f"{tool_name} must be hidden from non-staff"
+            )
+
+    def test_scrape_tool_visible_to_staff(self):
+        from agents.agent_factory import chat_tool_gate_filter
+
+        ctx = self._make_ctx(is_staff=True)
+        for tool_name in SCOPES["scrape_management"]:
+            assert chat_tool_gate_filter(ctx, self._make_tool_def(tool_name)), (
+                f"{tool_name} must be visible to staff"
+            )
+
+    def test_non_scrape_tool_visible_to_anyone(self):
+        from agents.agent_factory import chat_tool_gate_filter
+
+        for is_staff in (True, False):
+            ctx = self._make_ctx(is_staff=is_staff)
+            assert chat_tool_gate_filter(
+                ctx, self._make_tool_def("get_career_data")
+            )
+
 
 # ---------------------------------------------------------------------------
 # Toolset construction

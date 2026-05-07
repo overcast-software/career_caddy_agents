@@ -37,6 +37,11 @@ class CareerCaddyDeps:
     user_profile: str = ""
     onboarding: dict | None = None
     page_context: dict | None = None
+    # Identity-derived authorization flag, looked up once per request from
+    # /api/v1/me/. Read by toolset filters at run time (see staff_only filter
+    # in agent_factory) so scrape tools only appear in the chat agent's tool
+    # list when the caller is staff.
+    is_staff: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +161,9 @@ SCOPES: dict[str, set[str]] = {
 }
 
 # "main_chat" = all tools minus the onboarding-only surface.
+# scrape_management tools are included here; they are runtime-filtered
+# down to staff users only (see staff_only_filter in agent_factory)
+# rather than excluded from the scope wholesale.
 SCOPES["main_chat"] = set(TOOL_REGISTRY.keys()) - {
     "reconcile_onboarding",
     "edit_profile_onboarding",
