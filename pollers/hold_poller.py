@@ -145,9 +145,11 @@ async def _run_graph(
 
     async def _drive() -> None:
         if _RESIDENT is not None:
-            async with _RESIDENT.lock_for(hostname):
-                page = await _RESIDENT.page_for(hostname, seed_cookies=cookies)
+            page = await _RESIDENT.open_tab(domain=hostname, seed_cookies=cookies)
+            try:
                 await run_scrape_graph(state, browser_page=page, has_browser=True)
+            finally:
+                await _RESIDENT.close_tab(page)
         else:
             async with launch_browser(get_engine(), _is_headless()) as browser:
                 ctx = await browser.new_context()
@@ -236,30 +238,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--headed", dest="headless", action="store_false", help="Run headed")
     parser.add_argument(
         "--attended", action="store_true",
-        help="Launch a single headed browser with per-domain tabs. Solve captchas "
-             "once in the open tabs; state persists across scrapes. Implies --headed.",
-    )
-    parser.add_argument(
-        "--attended-delay", type=int, nargs="?", const=5, default=0, metavar="N",
-        help="Seconds to wait after the browser launches before preseeding "
-             "tabs (attended mode only). Gives you a chance to move the "
-             "first Camoufox window to a dedicated workspace before the "
-             "~10 preseed tabs spawn. Omit the flag for no delay; pass "
-             "--attended-delay (no value) for 5 seconds; pass a number "
-             "to override. No-op when --attended is off.",
+        help="Launch a single headed browser; spawn an ephemeral tab per scrape "
+             "in the same window and close it on completion. Cookies persist on "
+             "the shared context across scrapes. Implies --headed.",
     )
     return parser.parse_args()
-
-
-def _attended_preseed_domains() -> list[str]:
-    """Domains to pre-open tabs for — read from secrets.yml."""
-    try:
-        from browser.credentials import Credentials
-        creds = Credentials.load()
-        return sorted(creds.domains.keys())
-    except Exception as exc:
-        logger.warning("Could not load secrets.yml for preseed: %s", exc)
-        return []
 
 
 async def _preflight_auth(api: ApiClient) -> bool:
@@ -357,25 +340,10 @@ async def main():
         try:
             async with launch_browser(get_engine(), headless=False) as browser:
                 _RESIDENT = ResidentBrowser(browser)
-                preseed = _attended_preseed_domains()
-                # Give the user a chance to move the first Camoufox window
-                # (or set up compositor rules, move monitors, whatever)
-                # before the preseed burst spawns another ~10 windows. Opt-in
-                # via --attended-delay N; silent when N<=0.
-                if args.attended_delay and args.attended_delay > 0:
-                    for remaining in range(args.attended_delay, 0, -1):
-                        sys.stderr.write(
-                            f"\rattended: preseed in {remaining}s "
-                            f"({len(preseed)} tabs)... "
-                        )
-                        sys.stderr.flush()
-                        await asyncio.sleep(1)
-                    sys.stderr.write("\n")
-                logger.info("Attended: preseeding tabs for %s", preseed)
-                await _RESIDENT.preseed(preseed)
                 logger.info(
-                    "Attended: tabs open. Solve any captchas/logins in the browser; "
-                    "scrapes will start on the next poll tick."
+                    "Attended: ready. Each scrape opens a tab in the resident "
+                    "window and closes it on completion. Solve captchas in the "
+                    "live tab as scrapes arrive."
                 )
                 try:
                     await _run_poll_loop(api, lambda: running)

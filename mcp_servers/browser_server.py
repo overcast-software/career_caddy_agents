@@ -1190,16 +1190,16 @@ async def scrape_page(url: str, profile: dict | None = None) -> str:
 
 
 async def scrape_page_attended(resident, url: str, profile: dict | None = None) -> str:
-    """Attended scrape: reuse a ResidentBrowser's per-domain tab.
-
-    Acquires the domain lock to serialize concurrent scrapes for the same
-    host. Live captcha/login state persists across scrapes for the lifetime
-    of the resident browser.
+    """Attended scrape: spawn an ephemeral tab in a ResidentBrowser, scrape,
+    close the tab. Cookies persist on the resident's shared context so login
+    state survives across scrapes.
     """
     _, norm_domain, cookies, css_selectors = _resolve_scrape_inputs(url, profile)
-    async with resident.lock_for(norm_domain):
-        page = await resident.page_for(norm_domain, seed_cookies=cookies)
+    page = await resident.open_tab(domain=norm_domain, seed_cookies=cookies)
+    try:
         return await _scrape_on_page(page, url, norm_domain, css_selectors)
+    finally:
+        await resident.close_tab(page)
 
 
 if __name__ == "__main__":
