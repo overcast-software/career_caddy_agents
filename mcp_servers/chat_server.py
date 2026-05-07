@@ -468,6 +468,28 @@ navigate action to /settings/profile:
 """
 
 
+async def _fetch_user_is_staff(api_key: str) -> bool:
+    """Identity-only lookup: does this token belong to a staff user?
+
+    Kept separate from `_fetch_user_profile` so authorization state doesn't
+    bleed into a function whose contract is "string for the system prompt".
+    Returns False on any non-200 — fails closed.
+    """
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        resp = await client.get(
+            f"{API_BASE_URL}/api/v1/me/",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "X-Forwarded-Proto": "https",
+            },
+        )
+        if resp.status_code != 200:
+            return False
+        data = resp.json().get("data", resp.json())
+        attrs = data.get("attributes", data)
+        return bool(attrs.get("is_staff") or attrs.get("is-staff"))
+
+
 async def _fetch_user_profile(api_key: str) -> str:
     """Fetch the authenticated user's profile from the API."""
     async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -842,6 +864,7 @@ async def chat(request: Request):
     async def event_stream():
         encoder = EventEncoder()
         user_profile = await _fetch_user_profile(token)
+        is_staff = await _fetch_user_is_staff(token)
         agent = _build_agent(
             user_profile,
             page_context=page_context,
@@ -856,6 +879,7 @@ async def chat(request: Request):
             user_profile=user_profile,
             onboarding=onboarding or {},
             page_context=page_context,
+            is_staff=is_staff,
         )
 
         # Prefix user message with context so the model sees it inline,

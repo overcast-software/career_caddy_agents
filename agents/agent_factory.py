@@ -329,6 +329,43 @@ def get_agent(role: str, **overrides) -> Agent:
 
 
 # ---------------------------------------------------------------------------
+# Toolset filters — runtime gating via pydantic-ai's AbstractToolset.filtered
+# ---------------------------------------------------------------------------
+#
+# Pattern: each filter function receives (ctx, tool_def) and returns bool.
+# The chat agent wraps its CareerCaddyToolset with one of these so a single
+# global agent serves every user; access is scoped per request via deps.
+#
+# CHAT_TOOL_REQUIREMENTS is the gate definition: tool name → required
+# truthy attr on CareerCaddyDeps. Extending to user tiers (free/pro/staff)
+# is one new dep attr + new entries in this map; no agent re-registration.
+# Today it's a single is_staff bit; tomorrow it's is_pro / is_premium / etc.
+
+CHAT_TOOL_REQUIREMENTS: dict[str, str] = {
+    # Scrape management — staff-only during alpha. The api 403s
+    # POST /api/v1/scrapes/ for non-staff regardless; filtering here just
+    # keeps the chat agent from offering a tool it can't usefully call.
+    "create_scrape": "is_staff",
+    "get_scrapes": "is_staff",
+    "update_scrape": "is_staff",
+}
+
+
+def chat_tool_gate_filter(ctx, tool_def) -> bool:
+    """Apply CHAT_TOOL_REQUIREMENTS at runtime.
+
+    Tools without an entry are always visible. Tools with an entry are
+    visible only when ctx.deps has the required attr set truthy. The chat
+    server stamps the deps once per request after looking up the user's
+    role at /api/v1/me/.
+    """
+    required_attr = CHAT_TOOL_REQUIREMENTS.get(tool_def.name)
+    if required_attr is None:
+        return True
+    return bool(getattr(ctx.deps, required_attr, False))
+
+
+# ---------------------------------------------------------------------------
 # Default agent registrations
 # ---------------------------------------------------------------------------
 # These are lazy-imported to avoid circular imports — the register_defaults()
@@ -375,13 +412,21 @@ def register_defaults() -> None:
     # tools (reconcile_onboarding, edit_profile_onboarding,
     # import_resume_from_url) are NOT directly callable — forcing delegation
     # for any onboarding work.
+    #
+    # Scrape tools (create_scrape, get_scrapes, update_scrape) are in the
+    # scope but runtime-filtered to staff users only via staff_only_chat_filter
+    # below — non-staff hit the api 403 anyway, and exposing the tool to
+    # their agent only produces confusing mid-conversation errors.
     from lib.elicitation_tool import elicitation_toolset
+
     register_agent("chat", AgentConfig(
         role="chat",
         system_prompt="",  # chat_server injects user-profile-aware prompt at runtime
         deps_type=CareerCaddyDeps,
         toolset_factories=[
-            lambda: CareerCaddyToolset(scope="main_chat"),
+            lambda: CareerCaddyToolset(scope="main_chat").filtered(
+                chat_tool_gate_filter
+            ),
             lambda: onboarding_delegation_toolset(),
             lambda: elicitation_toolset(),
         ],
