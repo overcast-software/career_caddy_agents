@@ -1,13 +1,21 @@
-"""ResidentBrowser — long-lived headed browser with per-domain contexts.
+"""ResidentBrowser — long-lived headed browser with ephemeral per-scrape tabs.
 
-Used by the attended poller: one browser, one BrowserContext + tab per
-domain. Captcha/login state persists for the lifetime of the process,
-so challenges solved manually stay warm across scrapes.
+One browser, one BrowserContext, one anchor page that stays open for the
+process lifetime, plus one ephemeral tab spawned per scrape via
+window.open() and closed when the scrape finishes.
+
+Why window.open() instead of ctx.new_page(): Playwright Firefox / Camoufox
+renders ctx.new_page() as a separate OS window. Pages spawned via
+anchor.evaluate("window.open(...)") and captured via expect_page() honor
+the user's browser.link.open_newwindow preference and land as tabs in the
+anchor's window — the attended ergonomics we want.
+
+Cookies persist on the shared context, so login state survives across
+scrapes regardless of which tab solved the auth challenge.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
@@ -17,19 +25,10 @@ logger = logging.getLogger(__name__)
 
 
 class ResidentBrowser:
-    """One shared BrowserContext, one page (tab) per domain.
-
-    Firefox renders each BrowserContext as a separate window, so we keep
-    ONE context and add tabs into it. Cookies are shared across tabs, but
-    each tab only navigates to its own domain — cross-contamination is
-    minimal in practice.
-    """
-
     def __init__(self, browser):
         self._browser = browser
-        self._context = None  # created lazily on first page_for()
-        self._pages: dict[str, Any] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._context = None
+        self._anchor = None
         self._session_store = SessionStore()
         self._seeded_domains: set[str] = set()
 
@@ -37,24 +36,28 @@ class ResidentBrowser:
     def browser(self):
         return self._browser
 
-    def lock_for(self, domain: str) -> asyncio.Lock:
-        if domain not in self._locks:
-            self._locks[domain] = asyncio.Lock()
-        return self._locks[domain]
-
     async def _ensure_context(self):
         if self._context is None:
             self._context = await self._browser.new_context()
+            self._anchor = await self._context.new_page()
+            try:
+                await self._anchor.goto("about:blank")
+            except Exception:
+                pass
         return self._context
 
-    async def page_for(self, domain: str, seed_cookies: list[dict] | None = None):
-        """Return the tab for `domain`, creating it on demand in the shared context."""
-        if not domain:
-            domain = "_default"
-        ctx = await self._ensure_context()
+    async def open_tab(self, domain: str = "", seed_cookies: list[dict] | None = None):
+        """Spawn a fresh blank tab in the resident window and return it.
 
-        # Seed cookies once per domain into the shared context.
-        if domain not in self._seeded_domains:
+        On first encounter for a domain, seed cookies (from arg or
+        SessionStore) into the shared context so subsequent navigations
+        run already-authenticated. The caller is expected to drive the
+        page (typically via the graph's Navigate node).
+        """
+        ctx = await self._ensure_context()
+        assert self._anchor is not None  # _ensure_context() set it
+
+        if domain and domain not in self._seeded_domains:
             cookies = seed_cookies or self._session_store.load(domain) or []
             if cookies:
                 try:
@@ -64,33 +67,20 @@ class ResidentBrowser:
                     logger.warning("Resident: cookie seed failed for %s: %s", domain, exc)
             self._seeded_domains.add(domain)
 
-        if domain not in self._pages:
-            page = await ctx.new_page()
-            self._pages[domain] = page
-            logger.info("Resident: opened new tab for %s", domain)
-        return self._pages[domain]
+        async with ctx.expect_page() as new_page_info:
+            await self._anchor.evaluate("window.open('about:blank', '_blank')")
+        return await new_page_info.value
 
-    async def preseed(self, domains: list[str]):
-        """Open a tab per domain up-front and navigate to its homepage so the
-        user can solve captchas / log in before scrapes start arriving.
-        """
-        for d in domains:
-            try:
-                page = await self.page_for(d)
-                homepage = f"https://{d}/"
-                try:
-                    await page.goto(homepage, wait_until="domcontentloaded", timeout=30_000)
-                    logger.info("Resident: preseed navigated to %s", homepage)
-                except Exception as exc:
-                    logger.info("Resident: preseed nav skipped for %s: %s", d, exc)
-            except Exception as exc:
-                logger.warning("Resident: preseed failed for %s: %s", d, exc)
+    async def close_tab(self, page: Any) -> None:
+        try:
+            await page.close()
+        except Exception:
+            logger.debug("Resident: tab close raised", exc_info=True)
 
     async def save_sessions(self) -> int:
         """Write current cookies back to SessionStore, one file per seeded
-        domain. Called on shutdown so manually-solved logins persist across
-        poller restarts. Returns the number of domains whose sessions were
-        written.
+        domain. Called after each scrape and on shutdown so manually-solved
+        logins persist across poller restarts.
         """
         if self._context is None or not self._seeded_domains:
             return 0
@@ -106,7 +96,6 @@ class ResidentBrowser:
                 if _cookie_matches_domain(c.get("domain") or "", domain)
             ]
             if not matches:
-                logger.info("Resident: no cookies to save for %s", domain)
                 continue
             self._session_store.save(domain, matches)
             saved += 1
@@ -119,15 +108,14 @@ class ResidentBrowser:
             except Exception:
                 pass
             self._context = None
-        self._pages.clear()
+        self._anchor = None
         self._seeded_domains.clear()
 
 
 def _cookie_matches_domain(cookie_domain: str, target: str) -> bool:
     """Match a Playwright cookie's domain attribute against our canonical
     target domain (e.g. 'linkedin.com'). Accepts '.linkedin.com',
-    'www.linkedin.com', 'linkedin.com' — all three should save under the
-    target.
+    'www.linkedin.com', 'linkedin.com'.
     """
     if not cookie_domain or not target:
         return False
