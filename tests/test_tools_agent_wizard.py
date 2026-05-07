@@ -106,43 +106,43 @@ class TestReconcileOnboarding:
             result = yaml.safe_load(await reconcile_onboarding(api))
         mock.assert_awaited_once()
         path, payload = mock.await_args.args
-        assert path == "/api/v1/onboarding/reconcile/"
+        assert path == "/api/v1/users/me/onboarding/reconcile/"
         assert payload == {}
         assert result["resume_imported"] is True
 
 
 class TestEditProfileOnboarding:
     @pytest.mark.asyncio
-    async def test_resolves_me_then_patches_user(self, api):
-        # edit_profile_onboarding now uses get_data (parsed) for the /me/
-        # lookup so it can read the user id without round-tripping through
-        # the agent-facing YAML serializer.
-        me_payload = (
-            {"data": {"type": "user", "id": "11", "attributes": {"onboarding": {}}}},
-            None,
-            200,
-        )
+    async def test_patches_onboarding_endpoint_directly(self, api):
+        # edit_profile_onboarding uses the nested singleton-per-user
+        # /api/v1/users/me/onboarding/ endpoint. The `me` alias resolves
+        # server-side to request.user. Response is JSON:API:
+        # {"data": {"type": "onboarding", "id": "...", "attributes": {...}}}.
         patch_response = _ok(
             {
                 "data": {
-                    "type": "user",
+                    "type": "onboarding",
                     "id": "11",
-                    "attributes": {"onboarding": {"resume_reviewed": True}},
-                }
+                    "attributes": {
+                        "derived": {},
+                        "subjective": {
+                            "resume_reviewed": True,
+                            "wizard_enabled": True,
+                        },
+                    },
+                },
+                "meta": {"source": "stored"},
             }
         )
-        with patch.object(ApiClient, "get_data", new=AsyncMock(return_value=me_payload)) as mock_get, \
-             patch.object(ApiClient, "patch", new=AsyncMock(return_value=patch_response)) as mock_patch:
+        with patch.object(ApiClient, "patch", new=AsyncMock(return_value=patch_response)) as mock_patch:
             result = yaml.safe_load(
                 await edit_profile_onboarding(api, {"resume_reviewed": True})
             )
 
-        mock_get.assert_awaited_once_with("/api/v1/me/")
         path, payload = mock_patch.await_args.args
-        assert path == "/api/v1/users/11/"
-        assert payload["data"]["attributes"]["onboarding"] == {"resume_reviewed": True}
+        assert path == "/api/v1/users/me/onboarding/"
+        assert payload == {"resume_reviewed": True}
         assert "error" not in result
-        assert result["data"]["id"] == "11"
 
     @pytest.mark.asyncio
     async def test_rejects_empty_patch(self, api):
@@ -153,13 +153,3 @@ class TestEditProfileOnboarding:
     async def test_rejects_non_dict_patch(self, api):
         result = yaml.safe_load(await edit_profile_onboarding(api, None))
         assert "error" in result
-
-    @pytest.mark.asyncio
-    async def test_propagates_me_lookup_failure(self, api):
-        failure = (None, "401 - unauthorized", 401)
-        with patch.object(ApiClient, "get_data", new=AsyncMock(return_value=failure)), \
-             patch.object(ApiClient, "patch", new=AsyncMock()) as mock_patch:
-            result = yaml.safe_load(await edit_profile_onboarding(api, {"resume_reviewed": True}))
-        assert "error" in result
-        assert "401" in result["error"]
-        mock_patch.assert_not_called()

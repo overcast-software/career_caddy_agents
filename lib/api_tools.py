@@ -1798,32 +1798,25 @@ async def reconcile_onboarding(api: ApiClient) -> str:
     (=wizard_enabled=, =resume_reviewed=) and overwrites the rest based on
     actual resume / job post / score / cover letter / profile-basics state.
     """
-    return await api.post("/api/v1/onboarding/reconcile/", {})
+    return await api.post("/api/v1/users/me/onboarding/reconcile/", {})
 
 
 async def edit_profile_onboarding(api: ApiClient, patch: dict) -> str:
-    """Merge a partial dict into the authenticated user's profile.onboarding blob.
+    """Set subjective onboarding flags via PATCH /api/v1/users/me/onboarding/.
 
-    Only keys in the canonical onboarding shape are accepted server-side; unknown
-    keys are ignored. Typical usage:
+    Accepts only the *subjective* keys: `wizard_enabled`, `resume_reviewed`.
+    Derived keys (`profile_basics`, `resume_imported`, `first_job_post`,
+    `first_score`, `first_cover_letter`) are recomputed by reconcile from
+    real records and the server returns 400 if you try to write them.
+
+    Typical usage:
         edit_profile_onboarding({"resume_reviewed": true})
         edit_profile_onboarding({"wizard_enabled": false})
+
+    To refresh the derived flags, call `reconcile_onboarding` instead.
     """
     if not isinstance(patch, dict) or not patch:
         return _respond(
             None, error="edit_profile_onboarding requires a non-empty dict"
         )
-    me_payload, me_err, me_status = await api.get_data("/api/v1/me/")
-    if me_err is not None:
-        return _respond(None, error=me_err, status_code=me_status)
-    user_id = (me_payload or {}).get("data", {}).get("id")
-    if not user_id:
-        return _respond(None, error="Could not resolve authenticated user id")
-    payload = {
-        "data": {
-            "type": "user",
-            "id": str(user_id),
-            "attributes": {"onboarding": patch},
-        }
-    }
-    return await api.patch(f"/api/v1/users/{user_id}/", payload)
+    return await api.patch("/api/v1/users/me/onboarding/", patch)
