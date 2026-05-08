@@ -16,6 +16,7 @@ from .nodes_extract import (
     ExtractFail,
     PersistJobPost,
     ResolveApplyUrl,
+    ReviewCompleteness,
     StartExtract,
     Tier0CSS,
     Tier1Mini,
@@ -56,8 +57,8 @@ __all_nodes__ = (
     ExpandTruncations, Capture, PersistScrape, DetectObstacle,
     ObstacleRememberMe, ObstacleWaitRetry, ObstacleAgent, ObstacleFail,
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
-    EvaluateExtraction, ValidateExtraction, PersistJobPost, UpdateProfile,
-    ResolveApplyUrl, ExtractFail,
+    EvaluateExtraction, ValidateExtraction, PersistJobPost,
+    ReviewCompleteness, UpdateProfile, ResolveApplyUrl, ExtractFail,
 )
 
 
@@ -74,13 +75,13 @@ _SCRAPE_NODES = [
     ExpandTruncations,
     Capture, PersistScrape,
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
-    EvaluateExtraction, ValidateExtraction, PersistJobPost, UpdateProfile,
-    ResolveApplyUrl, ExtractFail,
+    EvaluateExtraction, ValidateExtraction, PersistJobPost,
+    ReviewCompleteness, UpdateProfile, ResolveApplyUrl, ExtractFail,
 ]
 _EXTRACT_NODES = [
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
-    EvaluateExtraction, ValidateExtraction, PersistJobPost, UpdateProfile,
-    ResolveApplyUrl, ExtractFail,
+    EvaluateExtraction, ValidateExtraction, PersistJobPost,
+    ReviewCompleteness, UpdateProfile, ResolveApplyUrl, ExtractFail,
 ]
 
 _SCRAPE_GRAPH = Graph(nodes=_SCRAPE_NODES, state_type=ScrapeGraphState)
@@ -329,7 +330,24 @@ NODE_META: dict[str, dict[str, str]] = {
         "group": "extract", "label": "Persist job post",
         "description": (
             "POSTs parsed data to /api/v1/scrapes/:id/persist-extraction/ "
-            "which handles dedup, stub-upgrade, and posted_date fallback."
+            "which handles dedup, stub-upgrade, and posted_date fallback. "
+            "The persist endpoint also runs the CompletenessReviewer as a "
+            "side effect, which may flip JobPost.complete=False on rejection."
+        ),
+    },
+    "ReviewCompleteness": {
+        "group": "extract", "label": "Review completeness",
+        "description": (
+            "Final LLM gate (cheap Haiku-class) on the persisted JobPost: "
+            "does this title+description+company actually look like a real "
+            "job posting? Pass → leave JobPost.complete=True (parse_scrape "
+            "just flipped it) and route to UpdateProfile. Fail → set "
+            "JobPost.complete=False and route to ExtractFail; the JP still "
+            "exists so URL lookup works and the extension popup will offer "
+            "Send. Today the gate runs as a side effect inside parse_scrape "
+            "and persist-extraction; this node will be promoted to a real "
+            "graph node when Phase 1d wires the graph for production "
+            "execution."
         ),
     },
     "UpdateProfile": {

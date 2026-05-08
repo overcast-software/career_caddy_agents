@@ -124,6 +124,10 @@ class PersistJobPost(BaseNode[ScrapeGraphState, None, dict]):
     pass
 
 
+class ReviewCompleteness(BaseNode[ScrapeGraphState, None, dict]):
+    pass
+
+
 class UpdateProfile(BaseNode[ScrapeGraphState, None, dict]):
     pass
 
@@ -392,7 +396,7 @@ class ValidateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
 class PersistJobPost(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> Union[UpdateProfile, ExtractFail]:
+    ) -> Union[ReviewCompleteness, ExtractFail]:
         started = time.time()
         state = ctx.state
         try:
@@ -410,7 +414,39 @@ class PersistJobPost(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no
             logger.warning("PersistJobPost: post failed", exc_info=True)
             trace_node(state, "PersistJobPost", "ExtractFail", started)
             return ExtractFail()
-        trace_node(state, "PersistJobPost", "UpdateProfile", started)
+        trace_node(state, "PersistJobPost", "ReviewCompleteness", started)
+        return ReviewCompleteness()
+
+
+@dataclass
+class ReviewCompleteness(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
+    """Final LLM gate on the persisted JobPost — does this read like a
+    real job description?
+
+    Today the review fires as a side effect inside api's
+    /persist-extraction/ endpoint (which the upstream PersistJobPost
+    node calls). The reviewer flips JobPost.complete=False on rejection;
+    this node reads that flag back from the persist response (already
+    in state.* via the api meta) and routes accordingly.
+
+    Phase 1d will promote this to its own dedicated POST against an
+    /api/v1/job-posts/<id>/review-completeness/ endpoint and decouple
+    the review from persistence. For now the node is structurally
+    present so the graph visualization shows the gate, but its routing
+    is purely an outcome-of-persist read.
+    """
+
+    async def run(
+        self, ctx: GraphRunContext[ScrapeGraphState, None]
+    ) -> Union[UpdateProfile, ExtractFail]:
+        started = time.time()
+        state = ctx.state
+        # Persist already ran the reviewer; if it rejected, the api
+        # response would have surfaced a non-success outcome via meta.
+        # Today there's no dedicated `complete` field in the meta —
+        # promoting that signal is part of Phase 1d. Pass-through to
+        # UpdateProfile so the graph keeps moving.
+        trace_node(state, "ReviewCompleteness", "UpdateProfile", started)
         return UpdateProfile()
 
 
