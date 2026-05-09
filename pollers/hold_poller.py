@@ -88,6 +88,7 @@ async def process_scrape(api: ApiClient, scrape: dict) -> bool:
     scrape_id = int(scrape["id"])
     attrs = scrape.get("attributes", {})
     url = attrs.get("url")
+    skip_extract = bool(attrs.get("skip_extract"))
 
     if not url:
         logger.warning("Scrape %s has no URL, skipping", scrape_id)
@@ -109,11 +110,16 @@ async def process_scrape(api: ApiClient, scrape: dict) -> bool:
         logger.info("Scrape %s: no profile for %s", scrape_id, hostname)
 
     await update_scrape(api, scrape_id, status="running", note="Poller picked up")
-    return await _run_graph(api, scrape_id, url, hostname, profile)
+    return await _run_graph(api, scrape_id, url, hostname, profile, skip_extract)
 
 
 async def _run_graph(
-    api: ApiClient, scrape_id: int, url: str, hostname: str, profile: dict | None,
+    api: ApiClient,
+    scrape_id: int,
+    url: str,
+    hostname: str,
+    profile: dict | None,
+    skip_extract: bool = False,
 ) -> bool:
     """Run the pydantic-graph against a live Playwright page."""
     from scrape_graph import ScrapeGraphState
@@ -133,6 +139,7 @@ async def _run_graph(
         original_scrape_id=scrape_id,
         profile=css_selectors,
         source="poller",
+        skip_extract=skip_extract,
     )
 
     # Hard cap on a single graph run. Without this, a node that hangs

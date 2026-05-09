@@ -73,6 +73,13 @@ class ScrapeGraphState:
     submitted_url: str = ""
     source: str = "manual"  # poller/paste/email/chat/manual/extension
     feature_flag_variant: str = "off"
+    # When True, PersistScrape routes to ResolveApplyUrl and skips the
+    # StartExtract → Tier* → PersistJobPost → ReviewCompleteness →
+    # UpdateProfile chain. Used by the staff "Resolve & dedupe" action
+    # on jp.edit — runs the browser fetch + apply-url capture but
+    # leaves extraction to a future explicit pass. Loaded from the
+    # Scrape's `skip_extract` attribute by the hold-poller.
+    skip_extract: bool = False
 
     # URL resolution
     final_url: Optional[str] = None

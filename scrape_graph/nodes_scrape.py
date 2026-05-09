@@ -786,7 +786,7 @@ async def _discover_selectors(page, state: ScrapeGraphState) -> None:
 class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> "StartExtract":  # noqa: F821 — resolved via graph.py namespace
+    ) -> Union["StartExtract", "ResolveApplyUrl"]:  # noqa: F821 — resolved via graph.py namespace
         from . import nodes_extract
         started = time.time()
         state = ctx.state
@@ -812,6 +812,15 @@ class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
             )
         except Exception:
             logger.warning("PersistScrape: patch failed", exc_info=True)
+        # skip_extract scrapes (staff "Resolve & dedupe" path) bypass
+        # the extraction chain: page is loaded, redirect resolved by
+        # ResolveFinalUrl, dup check ran in CheckLinkDedup. The only
+        # remaining work is apply-URL capture before End. The
+        # originating JobPost's title/description/etc. are intentionally
+        # left untouched.
+        if state.skip_extract:
+            trace_node(state, "PersistScrape", "ResolveApplyUrl", started)
+            return nodes_extract.ResolveApplyUrl()
         trace_node(state, "PersistScrape", "StartExtract", started)
         return nodes_extract.StartExtract()
 
