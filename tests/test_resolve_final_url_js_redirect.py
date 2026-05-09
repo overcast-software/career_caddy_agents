@@ -1,0 +1,180 @@
+"""Tests for ResolveFinalUrl's networkidle re-read of page.url.
+
+Repro: scrape 394 = jp 1908 (2026-05-08, prod attended Camoufox).
+Submitted URL was a ZipRecruiter /km/<opaque-token> email-tracker URL.
+Graph trace showed ResolveFinalUrl with `duration_ms=0
+did_redirect=false canonical_url=/km/<opaque>` — the browser navigated
+but the canonical_url stayed pinned to the tracker form, so dedupe
+against the canonical /jobs/altus-llc/... rows could never fire.
+
+Root cause: Navigate uses `page.goto(wait_until="domcontentloaded")`
+and captures `state.final_url = page.url` immediately. Server-side
+301/302 redirects are followed by Playwright before domcontentloaded,
+so those work. But meta-refresh + JS `window.location` redirects
+execute AFTER domcontentloaded — Navigate already returned, and
+state.final_url is frozen at the tracker URL. ResolveFinalUrl then
+reads state.final_url without re-checking page.url and short-circuits
+when submitted == landed.
+
+The fix (nodes_scrape.py ResolveFinalUrl): before _resolve_final_url_body,
+await page.wait_for_load_state("networkidle", timeout=5_000) and
+re-read page.url into state.final_url. Best-effort try/except so a
+slow tracker can't park ResolveFinalUrl past the 15s outer budget.
+Navigate's domcontentloaded choice stays unchanged — the comment there
+documents that wait_until="load" can deadlock on LinkedIn /comm/
+auth-interstitials.
+"""
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from scrape_graph.nodes_scrape import ResolveFinalUrl, CheckLinkDedup
+from scrape_graph.state import ScrapeGraphState
+
+
+def _run(node, state: ScrapeGraphState):
+    ctx = SimpleNamespace(state=state)
+    return asyncio.run(node.run(ctx))
+
+
+class _FakeResp:
+    def __init__(self, status_code: int, payload: dict | None = None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = ""
+
+    def json(self):
+        return self._payload
+
+
+class _FakePage:
+    """Minimal Playwright Page stand-in.
+
+    `url` returns the page URL — by mutating `_url` between
+    wait_for_load_state and the read, we simulate a JS / meta-refresh
+    redirect that resolves only after networkidle.
+    """
+
+    def __init__(self, url_at_domcontentloaded: str, url_at_networkidle: str):
+        self._url = url_at_domcontentloaded
+        self._post_idle_url = url_at_networkidle
+        self.wait_calls: list[tuple[str, int | None]] = []
+
+    @property
+    def url(self) -> str:
+        return self._url
+
+    async def wait_for_load_state(self, state: str, timeout: int | None = None):
+        self.wait_calls.append((state, timeout))
+        # The redirect happens during the wait — flip _url so the next
+        # `.url` read reflects post-redirect canonical.
+        self._url = self._post_idle_url
+
+
+def _state_for_js_redirect(submitted: str, landed_after_idle: str) -> ScrapeGraphState:
+    """Build a state where Navigate captured the tracker URL but a
+    later networkidle wait will see the redirected canonical URL.
+    """
+    state = ScrapeGraphState(scrape_id=394, submitted_url=submitted)
+    state.final_url = submitted  # Navigate's capture, frozen pre-redirect
+    page = _FakePage(
+        url_at_domcontentloaded=submitted,
+        url_at_networkidle=landed_after_idle,
+    )
+    # _browser_page is not a declared field — runtime attribute.
+    state._browser_page = page  # type: ignore[attr-defined]
+    return state
+
+
+def test_networkidle_reread_picks_up_js_redirect():
+    """ResolveFinalUrl must wait for networkidle, re-read page.url, and
+    treat the post-redirect URL as the landed URL — driving did_redirect=True
+    and the parent terminal-close + child-scrape handoff."""
+    submitted = (
+        "https://www.ziprecruiter.com/km/AAHQDn_YYvnvafLIF4GPjtD94u5MyqYcZ2T"
+    )
+    landed = "https://www.ziprecruiter.com/jobs/altus-llc/software-developer-c-remote"
+    state = _state_for_js_redirect(submitted, landed)
+
+    patches: list[dict] = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        return _FakeResp(201, {"data": {"id": "395"}})
+
+    def fake_patch_status(scrape_id, status, note=None):
+        patches.append({"scrape_id": scrape_id, "status": status, "note": note})
+
+    with patch("scrape_graph.nodes_scrape.httpx.post", side_effect=fake_post), \
+         patch("scrape_graph.nodes_scrape._patch_scrape_status", side_effect=fake_patch_status):
+        next_node = _run(ResolveFinalUrl(), state)
+
+    assert isinstance(next_node, CheckLinkDedup)
+    page = state._browser_page  # type: ignore[attr-defined]
+    assert page.wait_calls == [("networkidle", 5_000)], (
+        "must call wait_for_load_state with networkidle + 5s budget"
+    )
+    assert state.final_url == landed, (
+        "page.url re-read after networkidle must replace Navigate's stale capture"
+    )
+    assert state.did_redirect is True, (
+        "post-redirect URL differs from submitted — should detect the redirect"
+    )
+    assert state.scrape_id == 395, "child scrape id should be swapped in"
+    assert len(patches) == 1, "parent scrape should be terminal-closed exactly once"
+    assert patches[0]["scrape_id"] == 394
+    assert patches[0]["status"] == "completed"
+
+
+def test_no_browser_page_falls_back_to_navigate_capture():
+    """When state has no _browser_page (e.g. text-only paste flow),
+    ResolveFinalUrl must not crash on the networkidle re-read — it
+    falls through to whatever final_url Navigate captured."""
+    same = "https://example.com/jobs/42"
+    state = ScrapeGraphState(scrape_id=394, submitted_url=same)
+    state.final_url = same
+    # No state._browser_page set.
+
+    patches: list[dict] = []
+
+    def fake_patch_status(scrape_id, status, note=None):
+        patches.append({"scrape_id": scrape_id, "status": status, "note": note})
+
+    with patch("scrape_graph.nodes_scrape._patch_scrape_status", side_effect=fake_patch_status):
+        next_node = _run(ResolveFinalUrl(), state)
+
+    assert isinstance(next_node, CheckLinkDedup)
+    assert state.did_redirect is False
+    assert patches == []
+
+
+def test_networkidle_timeout_does_not_break_node():
+    """If wait_for_load_state raises (real-world: a tracker host that
+    never goes idle), swallow it and continue with whatever final_url
+    Navigate captured. The 5s budget keeps this from eating the outer
+    15s _RESOLVE_FINAL_URL_BUDGET_S."""
+    submitted = "https://example.com/track/abc"
+    state = ScrapeGraphState(scrape_id=394, submitted_url=submitted)
+    state.final_url = submitted
+
+    class _HangingPage:
+        url = submitted
+
+        async def wait_for_load_state(self, state_name, timeout=None):
+            raise asyncio.TimeoutError()
+
+    state._browser_page = _HangingPage()  # type: ignore[attr-defined]
+
+    patches: list[dict] = []
+
+    def fake_patch_status(scrape_id, status, note=None):
+        patches.append({"scrape_id": scrape_id, "status": status, "note": note})
+
+    with patch("scrape_graph.nodes_scrape._patch_scrape_status", side_effect=fake_patch_status):
+        next_node = _run(ResolveFinalUrl(), state)
+
+    assert isinstance(next_node, CheckLinkDedup)
+    assert state.final_url == submitted, "frozen Navigate capture preserved on timeout"
+    assert state.did_redirect is False
+    assert patches == []
