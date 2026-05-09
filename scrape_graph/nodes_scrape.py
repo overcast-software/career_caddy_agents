@@ -340,6 +340,23 @@ class ResolveFinalUrl(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[n
     ) -> CheckLinkDedup:
         started = time.time()
         state = ctx.state
+        # Settle JS / meta-refresh redirects that fire AFTER Navigate's
+        # `domcontentloaded` cutoff. Email-tracker URLs (ZipRecruiter
+        # /km/<token>, SendGrid /ls/click, Mailgun /c/) all drive the
+        # redirect from a meta-refresh tag or window.location.replace,
+        # which executes after the HTML parses but before the page
+        # finishes loading. Navigate captured state.final_url at
+        # domcontentloaded so it's frozen at the tracker URL — re-read
+        # page.url here once the network goes idle so the redirect
+        # destination is what we hand to _resolve_final_url_body. 5s cap
+        # so a hung tracker can't eat the 15s outer budget.
+        page = getattr(state, "_browser_page", None)
+        if page is not None:
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5_000)
+                state.final_url = page.url
+            except Exception:
+                pass  # best-effort; fall back to Navigate's capture
         # Wrap the sync body in a thread + wait_for so a wedged httpx
         # call (api unreachable, tracker host hanging on a half-open
         # connection) can't park the parent scrape in `running`
