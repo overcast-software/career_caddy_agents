@@ -102,6 +102,17 @@ class ScrapeGraphState:
     parsed: Optional[dict] = None  # ParsedJobData as dict (serializable)
     evaluation: Optional[dict] = None  # {passed: bool, reasons: [str]}
 
+    # Closed-state detection — writer = DetectClosedState (single).
+    # Verdict is "closed" or None; None means either "open" (the curated
+    # selectors / phrases ran and didn't fire) or "unknown" (no config,
+    # capture too thin to invoke LLM). The distinction lives in
+    # closed_detection_method, not in the verdict, because downstream
+    # JobPostExtractor only flips posting_status on "closed" — None is
+    # a no-op for that channel.
+    detected_posting_status: Optional[str] = None
+    detected_closed_evidence: Optional[str] = None
+    closed_detection_method: Optional[str] = None  # css|phrase|llm|no_signal|skipped_thin_capture|no_config
+
     # Outcome
     outcome: Optional[str] = None  # "success" / "duplicate" / "failure"
     failure_reason: Optional[str] = None
