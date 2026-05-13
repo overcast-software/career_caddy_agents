@@ -37,6 +37,23 @@ from lib.url_unwrap import unwrap_url
 # Module-level resident browser; set by the attended main() before the poll loop.
 _RESIDENT: ResidentBrowser | None = None
 
+
+def format_scrape_label(entry_id, final_id) -> str:
+    """Format a scrape id for terminal log lines.
+
+    ResolveFinalUrl can fork a child scrape and swap ``state.scrape_id``;
+    downstream nodes (and the resulting JobPost) belong to the child, not
+    the entry row. Logging the entry id alone misattributes the child's
+    outcome to the parent — a logfire search for "Scrape 302 graph done"
+    lights up even when row 302 itself produced no JobPost.
+
+    Returns ``"entry→final"`` whenever the swap happened, ``"entry"``
+    otherwise. ``None``/zero final_id falls back to entry.
+    """
+    if final_id and final_id != entry_id:
+        return f"{entry_id}→{final_id}"
+    return str(entry_id)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -177,14 +194,21 @@ async def _run_graph(
     try:
         await asyncio.wait_for(_drive(), timeout=GRAPH_RUN_TIMEOUT_S)
     except asyncio.TimeoutError:
-        logger.warning("Scrape %s exceeded %.0fs graph cap", scrape_id, GRAPH_RUN_TIMEOUT_S)
+        logger.warning(
+            "Scrape %s exceeded %.0fs graph cap",
+            format_scrape_label(scrape_id, state.scrape_id),
+            GRAPH_RUN_TIMEOUT_S,
+        )
         await update_scrape(
             api, scrape_id, status="failed",
             note=f"graph run exceeded {int(GRAPH_RUN_TIMEOUT_S)}s cap",
         )
         return False
     except Exception as exc:
-        logger.exception("Scrape %s failed inside graph run", scrape_id)
+        logger.exception(
+            "Scrape %s failed inside graph run",
+            format_scrape_label(scrape_id, state.scrape_id),
+        )
         await update_scrape(api, scrape_id, status="failed", note=str(exc)[:200])
         return False
 
@@ -199,8 +223,11 @@ async def _run_graph(
     outcome = state.outcome or "failure"
     logger.info(
         "Scrape %s graph done: outcome=%s job_post_id=%s tiers=%d trace=%d",
-        scrape_id, outcome, state.job_post_id,
-        len(state.tier_attempts), len(state.node_trace),
+        format_scrape_label(scrape_id, state.scrape_id),
+        outcome,
+        state.job_post_id,
+        len(state.tier_attempts),
+        len(state.node_trace),
     )
     return outcome in ("success", "duplicate")
 
