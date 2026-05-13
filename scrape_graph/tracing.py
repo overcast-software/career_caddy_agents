@@ -38,13 +38,16 @@ def trace_node(
     routed_to: str,
     started_at: float,
     payload: dict | None = None,
+    note: str | None = None,
 ) -> None:
     """Record transition locally + best-effort POST to api.
 
     Call at the end of a node's run() before returning the next node.
     `routed_to` is the class name of the next node (or "End" / a
     terminal tag). `started_at` is `time.time()` captured at run()
-    entry.
+    entry. `note` (optional) is a one-line human-readable summary
+    surfaced verbatim in the per-scrape Transitions list — use it for
+    nodes whose graph_payload is rich enough to benefit from a TL;DR.
     """
     entry = NodeTraceEntry(
         node=node,
@@ -54,7 +57,7 @@ def trace_node(
         payload=payload or {},
     )
     state.node_trace.append(entry)
-    _post_transition(state.scrape_id, node, routed_to, entry, payload or {})
+    _post_transition(state.scrape_id, node, routed_to, entry, payload or {}, note)
 
 
 def _post_transition(
@@ -63,6 +66,7 @@ def _post_transition(
     routed_to: str,
     entry: NodeTraceEntry,
     payload: dict,
+    note: str | None = None,
 ) -> None:
     if not scrape_id:
         return
@@ -79,6 +83,8 @@ def _post_transition(
             **payload,
         },
     }
+    if note:
+        body["note"] = note
     try:
         resp = httpx.post(
             f"{base}/api/v1/scrapes/{scrape_id}/graph-transition/",

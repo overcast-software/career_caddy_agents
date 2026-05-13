@@ -82,6 +82,10 @@ class Capture(BaseNode[ScrapeGraphState, None, dict]):
     pass
 
 
+class DetectClosedState(BaseNode[ScrapeGraphState, None, dict]):
+    pass
+
+
 class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):
     pass
 
@@ -718,7 +722,7 @@ class ExpandTruncations(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore
 class Capture(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> PersistScrape:
+    ) -> "DetectClosedState":
         started = time.time()
         state = ctx.state
         page = getattr(state, "_browser_page", None)
@@ -731,8 +735,11 @@ class Capture(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
 
             await _screenshot_and_upload(page, state)
             await _discover_selectors(page, state)
-        trace_node(state, "Capture", "PersistScrape", started)
-        return PersistScrape()
+        # DetectClosedState runs while DOM is still live so the CSS path
+        # can probe the page; passes through to PersistScrape regardless
+        # of verdict (closed-state is metadata, never terminal).
+        trace_node(state, "Capture", "DetectClosedState", started)
+        return DetectClosedState()
 
 
 async def _screenshot_and_upload(page, state: ScrapeGraphState) -> None:
@@ -783,6 +790,256 @@ async def _discover_selectors(page, state: ScrapeGraphState) -> None:
 
 
 @dataclass
+class DetectClosedState(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
+    """Probe captured page (live DOM + text) for closed-state signal.
+
+    Three paths in priority order:
+      1. CSS selectors against the live Playwright page (deterministic,
+         host-curated). Runs in full so the trace records every
+         attempted selector — first hit wins the verdict.
+      2. text_phrases + learned_phrases regex/substring scan against
+         state.job_content (deterministic).
+      3. Haiku LLM fallback — only when no host config defined AND
+         len(job_content) >= min_chars_for_llm. Quote is verbatim-
+         validated against text. Hits are PROMOTED back to the host's
+         closed_state_config.learned_phrases for future runs.
+
+    Always routes to PersistScrape — closed-state is metadata, not a
+    graph terminal. The verdict + evidence land on Scrape.detected_*
+    columns via the next node's PATCH; downstream JobPostExtractor
+    reads them as the priority-1 channel for posting_status flips.
+    """
+    async def run(
+        self, ctx: GraphRunContext[ScrapeGraphState, None]
+    ) -> "PersistScrape":
+        from .closed_state_detector import (
+            DEFAULT_MIN_CHARS_FOR_LLM,
+            TRACE_QUOTE_MAX,
+            detect_via_css,
+            detect_via_phrases,
+            detect_via_llm,
+        )
+        started = time.time()
+        state = ctx.state
+        page = getattr(state, "_browser_page", None)
+        text = state.job_content or ""
+
+        # Pull config out of the existing css_selectors JSONB blob, same
+        # shape pattern as apply_resolver_config. None of the keys are
+        # required; missing/empty → fall through.
+        profile = state.profile if isinstance(state.profile, dict) else {}
+        css_blob = profile.get("css_selectors") if isinstance(profile.get("css_selectors"), dict) else {}
+        cfg = (css_blob or {}).get("closed_state_config") or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        css_sels = cfg.get("css_selectors") or []
+        phrases  = cfg.get("text_phrases") or []
+        learned  = cfg.get("learned_phrases") or []
+        min_chars = int(cfg.get("min_chars_for_llm") or DEFAULT_MIN_CHARS_FOR_LLM)
+
+        config_present = {
+            "css_selectors": len(css_sels) if isinstance(css_sels, list) else 0,
+            "text_phrases":  len(phrases)  if isinstance(phrases,  list) else 0,
+            "learned_phrases": len(learned) if isinstance(learned, list) else 0,
+            "min_chars_for_llm": min_chars,
+        }
+
+        css_block: dict | None = None
+        phrase_block: dict | None = None
+        llm_block: dict | None = None
+        promoted_block: dict | None = None
+
+        verdict: str | None = None
+        evidence: str | None = None
+        method: str = "no_config"
+
+        # Path 1: CSS — runs all selectors so the trace records full
+        # attempt history (per the "Run both, log both" choice).
+        if css_sels and page:
+            attempts, hit = await detect_via_css(page, list(css_sels))
+            css_block = {"ran": True, "attempts": attempts, "matched_selector": hit["selector"] if hit else None}
+            if hit:
+                verdict = "closed"
+                evidence = hit.get("snippet") or hit["selector"]
+                method = "css"
+
+        # Path 2: phrases — also runs even if CSS hit, so the trace can
+        # show whether the cheaper phrase path WOULD have caught it
+        # too (regret-analysis signal). Phrase result only becomes the
+        # verdict if CSS didn't hit.
+        if (phrases or learned):
+            phrase_hit = detect_via_phrases(
+                text,
+                list(phrases) if isinstance(phrases, list) else [],
+                learned if isinstance(learned, list) else [],
+            )
+            phrase_block = {"ran": True, **(phrase_hit or {"matched": False})}
+            if phrase_hit and verdict is None:
+                verdict = "closed"
+                evidence = phrase_hit.get("matched_substring")
+                method = "phrase"
+
+        # Path 3: LLM bootstrap — only fires when host has NO config
+        # at all AND captured text is substantive. Cost guard prevents
+        # degraded auth-walled chrome captures from triggering the
+        # call (jp 1532 incident: 756 chars → would have flipped).
+        if not css_sels and not phrases and not learned:
+            if len(text) >= min_chars:
+                llm_result = await detect_via_llm(text)
+                quote = (llm_result.get("evidence_quote") or "").strip()
+                quote_validated = bool(quote and quote in text)
+                llm_block = {
+                    "ran": True,
+                    "model": llm_result.get("model"),
+                    "captured_chars": len(text),
+                    "min_chars": min_chars,
+                    "verdict": "closed" if llm_result.get("is_closed") else "open",
+                    "evidence_quote": (quote or "")[:TRACE_QUOTE_MAX] or None,
+                    "quote_validated": quote_validated,
+                    "duration_ms": llm_result.get("duration_ms", 0),
+                    "error": llm_result.get("error"),
+                }
+                if llm_result.get("is_closed") and quote_validated:
+                    verdict = "closed"
+                    evidence = quote
+                    method = "llm"
+                    promoted_block = self._promote(state, quote)
+            else:
+                method = "skipped_thin_capture"
+                llm_block = {
+                    "ran": False,
+                    "reason": "below_min_chars",
+                    "captured_chars": len(text),
+                    "min_chars": min_chars,
+                }
+        elif (css_sels or phrases or learned) and verdict is None:
+            method = "no_signal"
+
+        if llm_block is None and (css_sels or phrases or learned):
+            llm_block = {"ran": False, "reason": "config_present"}
+
+        state.detected_posting_status = verdict
+        state.detected_closed_evidence = evidence
+        state.closed_detection_method = method
+
+        payload = {
+            "method": method,
+            "verdict": verdict,
+            "evidence": (evidence or "")[:TRACE_QUOTE_MAX] or None,
+            "config_present": config_present,
+            "css": css_block,
+            "phrase": phrase_block,
+            "llm": llm_block,
+            "promoted_learned_phrase": (promoted_block or {}).get("phrase") if promoted_block else None,
+        }
+        note = self._note(method, verdict, evidence, css_block, phrase_block)
+        trace_node(state, "DetectClosedState", "PersistScrape", started, payload=payload, note=note)
+        if promoted_block:
+            # Surface the side-effect as its own ScrapeStatus row so the
+            # trace shows BOTH the verdict AND the learning that came
+            # from it. Useful when auditing whether a learned phrase is
+            # responsible for a later false positive.
+            try:
+                httpx.post(
+                    f"{_api_base()}/api/v1/scrapes/{state.scrape_id}/graph-transition/",
+                    json={
+                        "graph_node": "DetectClosedState",
+                        "graph_payload": {
+                            "routed_to": "PersistScrape",
+                            "duration_ms": 0,
+                            "method": "promote_learned_phrase",
+                            **promoted_block,
+                        },
+                        "note": (
+                            f"Promoted learned phrase to ScrapeProfile "
+                            f"#{promoted_block.get('promoted_to_profile_id')}: "
+                            f"{(promoted_block.get('phrase') or '')[:80]!r}"
+                        ),
+                    },
+                    headers={**_api_headers(), "Content-Type": "application/json"},
+                    timeout=5.0,
+                )
+            except Exception:
+                logger.warning("DetectClosedState: promote-status post failed", exc_info=True)
+        return PersistScrape()
+
+    def _note(
+        self,
+        method: str,
+        verdict: str | None,
+        evidence: str | None,
+        css_block: dict | None,
+        phrase_block: dict | None,
+    ) -> str:
+        if verdict == "closed":
+            if method == "css":
+                sel = (css_block or {}).get("matched_selector") or "?"
+                return f"DetectClosedState: closed via css {sel!r}"
+            if method == "phrase":
+                pat = (phrase_block or {}).get("matched_pattern") or "?"
+                src = (phrase_block or {}).get("source") or "?"
+                return f"DetectClosedState: closed via {src} phrase {pat!r}"
+            if method == "llm":
+                ev = (evidence or "")[:60]
+                return f"DetectClosedState: closed via llm — {ev!r}"
+            return f"DetectClosedState: closed ({method})"
+        if method == "skipped_thin_capture":
+            return "DetectClosedState: open — skipped LLM (capture too thin)"
+        if method == "no_config":
+            return "DetectClosedState: open — no host config, capture too thin for LLM"
+        return f"DetectClosedState: open ({method})"
+
+    def _promote(self, state, phrase: str) -> dict | None:
+        """Append the LLM-validated phrase to the host's
+        ``closed_state_config.learned_phrases`` so future scrapes use
+        the cheap phrase path. PATCH against the api; failure is logged
+        but doesn't fail the node.
+        """
+        from datetime import datetime, timezone
+
+        profile = state.profile if isinstance(state.profile, dict) else {}
+        profile_id = profile.get("id") or profile.get("profile_id")
+        if not profile_id or not phrase:
+            return None
+        css_blob = profile.get("css_selectors") if isinstance(profile.get("css_selectors"), dict) else {}
+        existing_cfg = (css_blob or {}).get("closed_state_config") or {}
+        existing_learned = (existing_cfg.get("learned_phrases") or []) if isinstance(existing_cfg.get("learned_phrases"), list) else []
+        # Idempotency: don't re-append a phrase already learned.
+        for entry in existing_learned:
+            if isinstance(entry, dict) and entry.get("phrase") == phrase:
+                return None
+        new_entry = {
+            "phrase": phrase,
+            "promoted_at": datetime.now(timezone.utc).isoformat(),
+            "from_scrape_id": state.scrape_id,
+        }
+        new_cfg = {**existing_cfg, "learned_phrases": existing_learned + [new_entry]}
+        new_blob = {**(css_blob or {}), "closed_state_config": new_cfg}
+        try:
+            resp = httpx.patch(
+                f"{_api_base()}/api/v1/scrape-profiles/{profile_id}/",
+                json={
+                    "data": {
+                        "type": "scrape-profile",
+                        "id": str(profile_id),
+                        "attributes": {"css_selectors": new_blob},
+                    }
+                },
+                headers={**_api_headers(), "Content-Type": "application/json"},
+                timeout=10.0,
+            )
+            patch_succeeded = resp.status_code < 400
+        except Exception:
+            logger.warning("DetectClosedState: profile patch failed", exc_info=True)
+            patch_succeeded = False
+        return {
+            "phrase": phrase,
+            "promoted_to_profile_id": profile_id,
+            "patch_succeeded": patch_succeeded,
+        }
+
+
+@dataclass
 class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
@@ -804,6 +1061,8 @@ class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
                             "note": (
                                 f"Content delivered ({len(state.job_content or '')} chars)"
                             ),
+                            "detected_posting_status": state.detected_posting_status,
+                            "detected_closed_evidence": state.detected_closed_evidence,
                         },
                     }
                 },

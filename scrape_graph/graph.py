@@ -35,6 +35,7 @@ from .nodes_obstacle import (
 from .nodes_scrape import (
     Capture,
     CheckLinkDedup,
+    DetectClosedState,
     DuplicateShortCircuit,
     ExpandTruncations,
     LoadProfile,
@@ -54,7 +55,7 @@ from .state import ScrapeGraphState
 __all_nodes__ = (
     StartScrape, LoadProfile, Navigate, ResolveFinalUrl, CheckLinkDedup,
     DuplicateShortCircuit, WaitReadySelector, SettleWait, ScrollToLoad,
-    ExpandTruncations, Capture, PersistScrape, DetectObstacle,
+    ExpandTruncations, Capture, DetectClosedState, PersistScrape, DetectObstacle,
     ObstacleRememberMe, ObstacleWaitRetry, ObstacleAgent, ObstacleFail,
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
     EvaluateExtraction, ValidateExtraction, PersistJobPost,
@@ -73,7 +74,7 @@ _SCRAPE_NODES = [
     ResolveFinalUrl, CheckLinkDedup,
     DuplicateShortCircuit, WaitReadySelector, SettleWait, ScrollToLoad,
     ExpandTruncations,
-    Capture, PersistScrape,
+    Capture, DetectClosedState, PersistScrape,
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
     EvaluateExtraction, ValidateExtraction, PersistJobPost,
     ReviewCompleteness, UpdateProfile, ResolveApplyUrl, ExtractFail,
@@ -216,6 +217,24 @@ NODE_META: dict[str, dict[str, str]] = {
             "Reads page.inner_text('body') and page.content() into "
             "state.job_content / state.html. This is the moment the "
             "browser is 'done'."
+        ),
+    },
+    "DetectClosedState": {
+        "group": "scrape", "label": "Detect closed state",
+        "description": (
+            "Probes the captured page for closed-posting signal in "
+            "priority order: per-host CSS selectors against the live "
+            "DOM, then per-host text phrases (curated + learned regex) "
+            "against state.job_content, then a Haiku LLM bootstrap when "
+            "no host config exists and the capture is substantive "
+            "(>= min_chars_for_llm). LLM hits PROMOTE the matched "
+            "phrase back into ScrapeProfile.css_selectors."
+            "closed_state_config.learned_phrases for next time. "
+            "Verdict + evidence land on Scrape.detected_posting_status / "
+            "detected_closed_evidence; downstream JobPostExtractor reads "
+            "those as the priority-1 channel for posting_status flips. "
+            "Always routes to PersistScrape — closed-state is metadata, "
+            "never terminal."
         ),
     },
     "PersistScrape": {
