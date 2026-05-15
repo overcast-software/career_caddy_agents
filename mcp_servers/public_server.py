@@ -540,13 +540,22 @@ async def update_scrape_profile(
     page_structure: Optional[str] = None,
     preferred_tier: Optional[str] = None,
     enabled: Optional[bool] = None,
+    apply_resolver_config: Optional[dict] = None,
+    extension_selectors: Optional[dict] = None,
+    url_rewrites: Optional[list] = None,
 ) -> str:
     """Update a ScrapeProfile's editable fields.
 
-    `css_selectors` is the JSON blob holding all per-host scrape tuning
-    (job_data, ready_selector, interaction_hints, obstacle_click_selector,
-    analyzer_notes, etc.). Pass only the fields you want to update — others
-    are left untouched.
+    ScrapeProfile carries several JSONB blobs by design so per-host tuning
+    can land at runtime without a Django migration. Pass only the fields you
+    want to update — others are left untouched.
+
+    JSONB fields and their consumers:
+      - css_selectors:         hold-poller (browser scraping)
+      - apply_resolver_config: server-side ResolveApplyUrl graph node
+      - extension_selectors:   ccsender browser extension
+      - url_rewrites:          canonicalize_link (dedup canonical forms)
+      - extraction_hints:      Tier1/2/3 LLM extractors (free-text)
     """
     attrs: dict = {}
     if css_selectors is not None:
@@ -559,6 +568,12 @@ async def update_scrape_profile(
         attrs["preferred_tier"] = preferred_tier
     if enabled is not None:
         attrs["enabled"] = enabled
+    if apply_resolver_config is not None:
+        attrs["apply_resolver_config"] = apply_resolver_config
+    if extension_selectors is not None:
+        attrs["extension_selectors"] = extension_selectors
+    if url_rewrites is not None:
+        attrs["url_rewrites"] = url_rewrites
     if not attrs:
         from lib.api_tools import _respond
         return _respond(None, error="No fields provided to update")
