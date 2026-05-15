@@ -154,6 +154,15 @@ TOOL_SHAPES: dict[str, dict[str, Any]] = {
         "kind": "passthrough",
         "notes": "Slim by construction (≤10 candidates, scalar attrs).",
     },
+    "find_duplicate_candidates": {
+        "kind": "passthrough",
+        "notes": (
+            "Composite. Emits {candidates: [...], count} directly — not "
+            "JSON:API — so the slim helpers don't apply. Each candidate is "
+            "{id, title, company_name, match_signals, confidence, "
+            "frontend_url} matching the by-id endpoint's row shape."
+        ),
+    },
 
     # --- Read: list (table) ---
     "get_companies": {
@@ -1214,6 +1223,131 @@ async def get_duplicate_candidates(api: ApiClient, job_post_id: int) -> str:
     return await api.get(
         f"/api/v1/job-posts/{job_post_id}/duplicate-candidates/"
     )
+
+
+async def find_duplicate_candidates(
+    api: ApiClient,
+    title: str,
+    company: Optional[str] = None,
+    link: Optional[str] = None,
+) -> str:
+    """Pre-POST duplicate check for an incoming job posting.
+
+    Composite over existing primitives — no new api endpoint. Stacks:
+      1. If `link`: filter job-posts by exact link match → confidence='high'
+         signal='link'.
+      2. If `company`: resolve company by name (no create) then list its
+         job posts; locally rank against `title`:
+           - exact title (iexact) → confidence='high' signal='title_exact'
+           - prefix/suffix overlap → confidence='medium' signal='title_similarity'
+
+    Required: `title` plus at least one of `link` or `company`. Title alone
+    is too low-signal to query against the global job-posts table and is
+    rejected to avoid noisy results.
+
+    Returns {candidates: [...], count} with each row shaped like the
+    by-id /duplicate-candidates/ endpoint: {id, title, company_name,
+    match_signals, confidence, frontend_url}. Ordered confidence-desc,
+    capped at 10. Visibility is whatever the calling api key sees."""
+    if not title or not isinstance(title, str) or not title.strip():
+        return _respond(None, error="title is required")
+    title = title.strip()
+    if not link and not (company and company.strip()):
+        return _respond(
+            None,
+            error=(
+                "Pass `link` or `company` alongside `title` to find "
+                "candidates. Title alone is too low-signal to query."
+            ),
+        )
+
+    confidence_order = {"low": 0, "medium": 1, "high": 2}
+    # id (str) → {title, company_name, signals: set, confidence}
+    found: dict[str, dict] = {}
+
+    def _add(post_id: Any, title_val: Optional[str],
+             company_name: Optional[str], signal: str, confidence: str) -> None:
+        if post_id is None:
+            return
+        key = str(post_id)
+        entry = found.setdefault(
+            key,
+            {"title": title_val, "company_name": company_name,
+             "signals": set(), "confidence": "low"},
+        )
+        if entry["company_name"] is None and company_name is not None:
+            entry["company_name"] = company_name
+        entry["signals"].add(signal)
+        if confidence_order[confidence] > confidence_order[entry["confidence"]]:
+            entry["confidence"] = confidence
+
+    # Strand 1 — link probe via the same primitive find_job_post_by_link uses.
+    if link:
+        payload, _, _ = await api.get_data(
+            "/api/v1/job-posts/", params={"filter[link]": link}
+        )
+        for post in (payload or {}).get("data", []) or []:
+            attrs = post.get("attributes") or {}
+            _add(post.get("id"), attrs.get("title"), None, "link", "high")
+
+    # Strand 2 — same-company title overlap. Mirrors the api's
+    # compute_duplicate_candidates title_similarity logic, plus an
+    # explicit title_exact signal for the case the api endpoint
+    # excludes (its callers cover that via fingerprint, which we can't
+    # compute pre-POST).
+    if company and company.strip():
+        comp_payload, _, _ = await api.get_data(
+            "/api/v1/companies/", params={"filter[query]": company.strip()}
+        )
+        companies = (comp_payload or {}).get("data", []) or []
+        if companies:
+            first = companies[0]
+            company_id = first.get("id")
+            company_name = (first.get("attributes") or {}).get("name") \
+                or company.strip()
+            jp_payload, _, _ = await api.get_data(
+                "/api/v1/job-posts/",
+                params={
+                    "filter[company_id]": company_id,
+                    "page[size]": 200,
+                },
+            )
+            t_lower = title.lower()
+            for post in (jp_payload or {}).get("data", []) or []:
+                attrs = post.get("attributes") or {}
+                hit_title = (attrs.get("title") or "").strip()
+                if not hit_title:
+                    continue
+                h_lower = hit_title.lower()
+                if h_lower == t_lower:
+                    _add(post.get("id"), hit_title, company_name,
+                         "title_exact", "high")
+                elif (
+                    t_lower.startswith(h_lower) or h_lower.startswith(t_lower)
+                    or t_lower.endswith(h_lower) or h_lower.endswith(t_lower)
+                ):
+                    _add(post.get("id"), hit_title, company_name,
+                         "title_similarity", "medium")
+
+    if not found:
+        return _respond({"candidates": [], "count": 0})
+
+    ordered = sorted(
+        found.items(),
+        key=lambda kv: -confidence_order[kv[1]["confidence"]],
+    )[:10]
+    out_list = [
+        {
+            "id": post_id,
+            "title": entry["title"],
+            "company_name": entry["company_name"],
+            "match_signals": sorted(entry["signals"]),
+            "confidence": entry["confidence"],
+            "frontend_url": f"/job-posts/{post_id}",
+        }
+        for post_id, entry in ordered
+    ]
+    return _respond({"candidates": out_list, "count": len(out_list)})
 
 
 async def get_scrape_graph_trace(api: ApiClient, scrape_id: int) -> str:
