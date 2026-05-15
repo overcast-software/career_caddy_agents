@@ -247,6 +247,34 @@ async def get_duplicate_candidates(job_post_id: int) -> str:
 
 
 @server.tool()
+async def find_duplicate_candidates(
+    title: str,
+    company: Optional[str] = None,
+    link: Optional[str] = None,
+    location: Optional[str] = None,
+) -> str:
+    """List likely-duplicate JobPosts for a posting that does NOT exist yet.
+
+    The collection-level sibling of get_duplicate_candidates: takes the raw
+    fields of an incoming posting instead of a saved job_post_id, so you can
+    check for duplicates BEFORE creating anything. Returns up to 10 peer
+    posts, ordered confidence-desc / recent-first, each with match_signals:
+      - canonical_link (high confidence, exact URL match after
+        tracking-param strip + host rewrites)
+      - fingerprint (high confidence, same company + normalized
+        title + location)
+      - title_similarity (medium, same company + one title is a
+        prefix/suffix of the other — catches suffix-drift cases
+        fingerprint hashing can't)
+    `company` is fuzzy-matched (name OR display_name contains), so "Disney"
+    also surfaces a post filed under "Disney, Inc". Empty list when nothing
+    looks duplicate."""
+    return await api_tools.find_duplicate_candidates(
+        _api(), title, company, link, location
+    )
+
+
+@server.tool()
 async def search_job_posts(
     query: Optional[str] = None,
     title: Optional[str] = None,

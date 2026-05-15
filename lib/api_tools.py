@@ -154,6 +154,10 @@ TOOL_SHAPES: dict[str, dict[str, Any]] = {
         "kind": "passthrough",
         "notes": "Slim by construction (≤10 candidates, scalar attrs).",
     },
+    "find_duplicate_candidates": {
+        "kind": "passthrough",
+        "notes": "Slim by construction (≤10 candidates, scalar attrs).",
+    },
 
     # --- Read: list (table) ---
     "get_companies": {
@@ -1214,6 +1218,31 @@ async def get_duplicate_candidates(api: ApiClient, job_post_id: int) -> str:
     return await api.get(
         f"/api/v1/job-posts/{job_post_id}/duplicate-candidates/"
     )
+
+
+async def find_duplicate_candidates(
+    api: ApiClient,
+    title: str,
+    company: Optional[str] = None,
+    link: Optional[str] = None,
+    location: Optional[str] = None,
+) -> str:
+    """Fetch likely-duplicate JobPosts for raw, not-yet-created fields.
+
+    The collection-level sibling of get_duplicate_candidates — same
+    {id, title, company_name, match_signals, confidence, frontend_url}
+    shape, but keyed off raw incoming fields instead of a saved post id.
+    `company` is fuzzy-matched (name OR display_name contains), so
+    "Disney" still finds a post filed under "Disney, Inc". Visibility-
+    scoped per the calling user. Empty list when nothing looks duplicate."""
+    params: dict[str, str] = {"title": title}
+    if company:
+        params["company"] = company
+    if link:
+        params["link"] = link
+    if location:
+        params["location"] = location
+    return await api.get("/api/v1/job-posts/duplicate-candidates/", params=params)
 
 
 async def get_scrape_graph_trace(api: ApiClient, scrape_id: int) -> str:
