@@ -247,6 +247,36 @@ async def get_duplicate_candidates(job_post_id: int) -> str:
 
 
 @server.tool()
+async def find_duplicate_candidates(
+    title: str,
+    company: Optional[str] = None,
+    link: Optional[str] = None,
+) -> str:
+    """Pre-POST duplicate check — does an incoming posting already exist?
+
+    Use BEFORE creating a job post, when you have the incoming title plus
+    at least one of: a `link` or a `company` name. Composite over the
+    primitives `find_job_post_by_link` + `find_company_by_name` +
+    `search_job_posts`; no api endpoint of its own.
+
+    Strategy:
+      - link, if given → exact match → confidence='high', signal='link'.
+      - company, if given → resolve to company id, list its job posts,
+        compare titles locally:
+          * exact iexact match → confidence='high', signal='title_exact'.
+          * prefix/suffix overlap → confidence='medium',
+            signal='title_similarity'.
+
+    Returns {candidates: [...], count}. Each candidate is
+    {id, title, company_name, match_signals, confidence, frontend_url},
+    same shape as the by-id /duplicate-candidates/ endpoint.
+
+    If neither link nor company is provided, returns an error — title
+    alone is too low-signal."""
+    return await api_tools.find_duplicate_candidates(_api(), title, company, link)
+
+
+@server.tool()
 async def search_job_posts(
     query: Optional[str] = None,
     title: Optional[str] = None,
