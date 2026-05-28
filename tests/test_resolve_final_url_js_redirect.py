@@ -178,3 +178,74 @@ def test_networkidle_timeout_does_not_break_node():
     assert state.final_url == submitted, "frozen Navigate capture preserved on timeout"
     assert state.did_redirect is False
     assert patches == []
+
+
+def test_networkidle_timeout_still_rereads_page_url_when_url_moved_on():
+    """page.url is the source of truth for URL after navigation; the
+    network-idle signal is a separate concern. Tracker-heavy SPAs keep
+    the network perpetually busy via heartbeat / telemetry beacons, so
+    `wait_for_load_state("networkidle")` routinely times out even when
+    the URL has already settled on the post-redirect destination. The
+    old code put `state.final_url = page.url` *inside* the same try
+    as the wait, so a timeout silently skipped the URL re-read and
+    left state.final_url at whatever Navigate captured at
+    domcontentloaded time (i.e. pre-redirect).
+
+    Surfaced in production by scrape 475 = jp 715 (2026-05-28): a
+    LinkedIn login wrapper that ObstacleRememberMe successfully
+    authenticated through — the post-login screenshot at Capture-time
+    proved the browser was on the real /jobs/view/<id> page — but
+    state.final_url stayed pinned to the /uas/login wrapper, so
+    CheckLinkDedup compared the wrong URL and missed the obvious
+    dup against jp 2963. The fix (split the try/except so the URL
+    re-read runs *unconditionally*) is generic: every chatty SPA
+    benefits, not just LinkedIn.
+    """
+    submitted = "https://tracker.example.test/wrap?dest=%2Fjobs%2F42"
+    landed = "https://content.example.test/jobs/42"
+    state = ScrapeGraphState(scrape_id=475, submitted_url=submitted)
+    state.final_url = submitted  # Navigate's pre-redirect capture
+
+    class _PageUrlMovedNetworkNeverIdle:
+        """Browser whose page.url has navigated past the submitted URL
+        but whose network never goes idle (trackers / beacons keep
+        firing). Mirrors the failure mode on any heartbeat-heavy SPA."""
+
+        def __init__(self):
+            self._url = landed
+
+        @property
+        def url(self) -> str:
+            return self._url
+
+        async def wait_for_load_state(self, state_name, timeout=None):
+            raise asyncio.TimeoutError()
+
+    state._browser_page = _PageUrlMovedNetworkNeverIdle()  # type: ignore[attr-defined]
+
+    patches: list[dict] = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        return _FakeResp(201, {"data": {"id": "476"}})
+
+    def fake_patch_status(scrape_id, status, note=None):
+        patches.append({"scrape_id": scrape_id, "status": status, "note": note})
+
+    with patch("scrape_graph.nodes_scrape.httpx.post", side_effect=fake_post), \
+         patch("scrape_graph.nodes_scrape._patch_scrape_status", side_effect=fake_patch_status):
+        next_node = _run(ResolveFinalUrl(), state)
+
+    assert isinstance(next_node, CheckLinkDedup)
+    assert state.final_url == landed, (
+        "page.url must be re-read even when networkidle times out — "
+        "the URL is the source of truth, not the network-idle signal"
+    )
+    assert state.did_redirect is True, (
+        "post-login URL differs from submitted login wrapper — should "
+        "detect the redirect and hand off to a child scrape"
+    )
+    assert state.scrape_id == 476, "child scrape id should be swapped in"
+    assert any(
+        p["status"] == "completed" and "redirected to scrape 476" in (p.get("note") or "")
+        for p in patches
+    ), "parent must be terminal-closed with the redirect note"
