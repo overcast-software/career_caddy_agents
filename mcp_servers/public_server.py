@@ -79,13 +79,35 @@ class ApiKeyTokenVerifier(TokenVerifier):
 
             user_data = resp.json().get("data", resp.json())
             user_id = user_data.get("id", "unknown")
-            logger.info("Authenticated user_id=%s via API key", user_id)
+            # is_staff lives in the JSON:API resource's attributes; flat
+            # dicts (fallback) put it at the top level. The middleware
+            # filter that hides enhancer tools from non-staff sessions
+            # consults `claims["is_staff"]` directly so per-call code
+            # doesn't have to walk into attributes.
+            attrs = user_data.get("attributes") if isinstance(user_data, dict) else None
+            is_staff = bool(
+                (attrs or user_data or {}).get("is_staff")
+                if isinstance(user_data, dict)
+                else False
+            )
+            logger.info(
+                "Authenticated user_id=%s is_staff=%s via API key",
+                user_id, is_staff,
+            )
 
+            # `scopes=["staff"]` mirrors the claim so future hooks can
+            # use either surface; FastMCP scope filtering is the more
+            # canonical channel even though we read claims today.
+            scopes = ["read", "write"] + (["staff"] if is_staff else [])
             return AccessToken(
                 token=token,
                 client_id=str(user_id),
-                scopes=["read", "write"],
-                claims={"user_id": user_id, "user": user_data},
+                scopes=scopes,
+                claims={
+                    "user_id": user_id,
+                    "user": user_data,
+                    "is_staff": is_staff,
+                },
             )
 
 
@@ -104,6 +126,15 @@ server = FastMCP(
         "Use the available tools to look up real data — never guess."
     ),
 )
+
+# Hide the scrape-profile-enhancer tools (inspect_scrape_html /
+# test_url_rewrite / find_selectors_for_text) from non-staff clients'
+# `tools/list` responses. The api enforces authorization on every
+# underlying endpoint these tools call, so this filter is a UX /
+# prompt-context concern — regular users' LLMs shouldn't burn tokens
+# on tool definitions they can't usefully invoke.
+from mcp_servers.staff_tool_filter import StaffOnlyToolFilter  # noqa: E402
+server.add_middleware(StaffOnlyToolFilter())
 
 
 def _api() -> ApiClient:
