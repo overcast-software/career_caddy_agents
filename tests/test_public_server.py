@@ -17,7 +17,9 @@ class TestPublicServerTools:
     def test_tool_count(self):
         # 27→28 when find_duplicate_candidates was added — composite pre-POST
         # check (title + link or company) over existing primitives.
-        assert len(self.tools) == 28
+        # 28→31 when the scrape-profile-enhancer tools landed
+        # (inspect_scrape_html, test_url_rewrite, find_selectors_for_text).
+        assert len(self.tools) == 31
 
     def test_has_all_expected_tools(self):
         expected = {
@@ -33,6 +35,9 @@ class TestPublicServerTools:
             "get_scrape_graph_trace", "get_scrape_statuses",
             "get_scrape_profile", "update_scrape_profile",
             "score_job_post", "get_scores",
+            # scrape-profile-enhancer support (BS4 trim + selector test
+            # + url_rewrites dry-run, all backed by lib/scrape_inspector)
+            "inspect_scrape_html", "test_url_rewrite", "find_selectors_for_text",
         }
         assert self.tool_names == expected
 
