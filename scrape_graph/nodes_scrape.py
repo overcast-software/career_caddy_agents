@@ -354,13 +354,31 @@ class ResolveFinalUrl(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[n
         # page.url here once the network goes idle so the redirect
         # destination is what we hand to _resolve_final_url_body. 5s cap
         # so a hung tracker can't eat the 15s outer budget.
+        #
+        # The page.url re-read is INTENTIONALLY outside the networkidle
+        # try/except. LinkedIn (and other tracker-heavy SPAs) keep the
+        # network perpetually busy with heartbeat / telemetry beacons,
+        # so wait_for_load_state("networkidle") routinely times out even
+        # though navigation completed and the URL is up-to-date. The
+        # 2026-05-28 JP 715 incident: ObstacleRememberMe logged the user
+        # into LinkedIn, the browser navigated to the real job page, the
+        # screenshot at Capture-time confirmed the job content rendered
+        # — but state.final_url stayed at the /uas/login wrapper because
+        # the timeout exception jumped over the page.url read. Result:
+        # CheckLinkDedup compared the login wrapper against existing
+        # canonical_links and missed an obvious dup against JP 2963.
+        # Two separate try/except blocks so networkidle-timeout never
+        # blocks the URL read.
         page = getattr(state, "_browser_page", None)
         if page is not None:
             try:
                 await page.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                pass  # best-effort; the URL read below handles the fallback
+            try:
                 state.final_url = page.url
             except Exception:
-                pass  # best-effort; fall back to Navigate's capture
+                pass  # truly hopeless — keep Navigate's capture as last resort
         # Wrap the sync body in a thread + wait_for so a wedged httpx
         # call (api unreachable, tracker host hanging on a half-open
         # connection) can't park the parent scrape in `running`
