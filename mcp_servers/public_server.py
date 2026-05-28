@@ -614,6 +614,238 @@ async def get_scores(
 
 
 # ---------------------------------------------------------------------------
+# Tools: scrape-profile-enhancer support
+# ---------------------------------------------------------------------------
+# These three tools exist so the scrape-profile-enhancer agent can fill out
+# ScrapeProfile fields (ready_selector, apply_link_selectors, url_rewrites)
+# from real captured HTML without burning context on raw 200KB blobs or
+# making selector decisions blind. Each delegates the actual parsing to
+# `lib/scrape_inspector.py` so the logic is unit-testable end-to-end
+# without spinning up MCP.
+
+
+async def _fetch_scrape_html(scrape_id: int) -> tuple[Optional[str], Optional[str]]:
+    """Return (html, error). Caller decides how to surface the error."""
+    payload, error, status = await _api().get_data(
+        f"/api/v1/scrapes/{scrape_id}/"
+    )
+    if error is not None:
+        return None, error
+    data = (payload or {}).get("data") or {}
+    attrs = data.get("attributes") or {}
+    html = attrs.get("html")
+    if not html:
+        return None, (
+            f"scrape {scrape_id} has no html (status="
+            f"{attrs.get('status')!r}); html is only persisted by the "
+            "browser-driven scrape path, not by paste / email ingest"
+        )
+    return html, None
+
+
+@server.tool()
+async def inspect_scrape_html(
+    scrape_id: int,
+    selector: Optional[str] = None,
+    mode: Optional[Literal["trim", "skeleton", "selector"]] = None,
+    max_chars: Optional[int] = None,
+    max_matches: Optional[int] = None,
+) -> str:
+    """Inspect a scrape's captured HTML with server-side BS4 trim.
+
+    The scrape-profile-enhancer's first stop when designing selectors
+    against a host. Server-side trim drops `<script>` / `<style>` /
+    comments / tracking pixels and inline event handlers so the
+    output is hundreds of times smaller than the raw `scrape.html`
+    blob while preserving every attribute the enhancer might anchor
+    a selector to (id, class, data-testid, aria-*, role).
+
+    Modes (`mode` defaults to `selector` when `selector` is passed,
+    `trim` otherwise):
+      - `trim`     — full trimmed HTML, capped at `max_chars` (≤40k).
+      - `skeleton` — tag/class/id tree with text stripped; best for
+                     first-pass orientation on huge pages.
+      - `selector` — run `selector` against the trimmed HTML and
+                     return matches with an outline path + text
+                     snippet + attrs; cap at `max_matches` (≤100).
+
+    Uses standard CSS3 selectors (BS4 `.select()`). Playwright-engine
+    pseudo-selectors like `h2:has-text("...")` will return an error —
+    use `find_selectors_for_text` for that flow.
+    """
+    from lib.api_tools import _respond
+    from lib.scrape_inspector import (
+        extract_skeleton, query_selector, trim_html,
+    )
+
+    html, error = await _fetch_scrape_html(scrape_id)
+    if error is not None or html is None:
+        return _respond(None, error=error, status_code=404)
+
+    effective_mode = mode or ("selector" if selector else "trim")
+    chars_cap = max_chars or 40_000
+
+    if effective_mode == "skeleton":
+        return _respond({
+            "scrape_id": scrape_id,
+            "mode": "skeleton",
+            "html_size_bytes": len(html),
+            "skeleton": extract_skeleton(html, limit_chars=chars_cap),
+        })
+    if effective_mode == "selector":
+        if not selector:
+            return _respond(
+                None,
+                error="mode='selector' requires a `selector` argument",
+                status_code=400,
+            )
+        try:
+            result = query_selector(
+                html, selector, max_matches=max_matches or 25,
+            )
+        except Exception as exc:
+            return _respond(
+                None,
+                error=f"selector failed to parse: {exc}",
+                status_code=400,
+            )
+        result["scrape_id"] = scrape_id
+        result["html_size_bytes"] = len(html)
+        return _respond(result)
+    return _respond({
+        "scrape_id": scrape_id,
+        "mode": "trim",
+        "html_size_bytes": len(html),
+        "trimmed_html": trim_html(html, limit_chars=chars_cap),
+    })
+
+
+@server.tool()
+async def test_url_rewrite(
+    url: str,
+    hostname: Optional[str] = None,
+) -> str:
+    """Dry-run a host's ScrapeProfile `url_rewrites` against a URL.
+
+    Mirrors what `canonicalize_link` does at JobPost.save() time and
+    what the scrape-graph does at Navigate time. Use it to validate a
+    new `url_rewrites` rule before committing it via
+    `update_scrape_profile`, OR to debug why an incoming URL is (or
+    isn't) collapsing onto an existing canonical_link.
+
+    Resolves the profile by hostname (derived from `url` when not
+    explicitly passed; `www.` stripped). Top-level `url_rewrites` is
+    preferred; falls back to the legacy nested `css_selectors.url_rewrites`
+    location for profiles that haven't been migrated.
+
+    Returns:
+      {"input": <url>, "hostname": <host>, "rule_count": N,
+       "rewritten": <new_url>, "changed": bool, "matched_rule": {...}}
+    """
+    from lib.api_tools import _respond
+    from lib.scrape_inspector import derive_hostname
+
+    host = (hostname or derive_hostname(url) or "").lower()
+    if not host:
+        return _respond(
+            None,
+            error="could not derive a hostname from `url` and none was passed",
+            status_code=400,
+        )
+
+    payload, error, status = await _api().get_data(
+        f"/api/v1/scrape-profiles/?filter[hostname]={host}"
+    )
+    if error is not None:
+        return _respond(None, error=error, status_code=status)
+
+    records = (payload or {}).get("data") or []
+    if not records:
+        return _respond({
+            "input": url, "hostname": host,
+            "rule_count": 0, "rewritten": url, "changed": False,
+            "note": f"no ScrapeProfile exists for {host}",
+        })
+    attrs = (records[0] or {}).get("attributes") or {}
+    rules = attrs.get("url_rewrites")
+    if not rules and isinstance(attrs.get("css_selectors"), dict):
+        rules = attrs["css_selectors"].get("url_rewrites")
+    rules = rules or []
+
+    # Try each rule in order; first one that changes the URL wins.
+    # Mirrors `apply_url_rewrites` exactly so test results match prod.
+    import re
+    rewritten = url
+    matched: Optional[dict] = None
+    for idx, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            continue
+        pattern = rule.get("match")
+        replacement = rule.get("rewrite")
+        if not pattern or replacement is None:
+            continue
+        try:
+            new_url, n = re.subn(pattern, replacement, url)
+        except re.error:
+            continue
+        if n > 0 and new_url != url:
+            rewritten = new_url
+            matched = {"index": idx, "match": pattern, "rewrite": replacement}
+            break
+
+    return _respond({
+        "input": url,
+        "hostname": host,
+        "rule_count": len(rules),
+        "rewritten": rewritten,
+        "changed": rewritten != url,
+        "matched_rule": matched,
+    })
+
+
+@server.tool()
+async def find_selectors_for_text(
+    scrape_id: int,
+    text: str,
+    max_results: Optional[int] = None,
+    case_insensitive: Optional[bool] = None,
+) -> str:
+    """Propose ranked stable selectors anchoring `text` in a scrape's HTML.
+
+    Direct support for `ready_selector` / `apply_button_selectors`
+    design — given the text the enhancer wants to wait for or click
+    ("About the job", "Apply now", "Easy Apply"), return CSS selectors
+    that match it, ordered by stability heuristic:
+
+      data-testid > role > aria-label > stable id > single semantic
+      class > multi-class composite > bare tag
+
+    Hashed-looking ids/classes (`__a1b2c3`, Tailwind atomic classes,
+    css-in-js artifacts) are filtered out — they churn on every deploy
+    and don't anchor reliable selectors. The returned candidates use
+    plain CSS3 syntax so they round-trip through `inspect_scrape_html(...,
+    mode='selector')` for verification before the enhancer commits them
+    to the profile via `update_scrape_profile`.
+    """
+    from lib.api_tools import _respond
+    from lib.scrape_inspector import (
+        find_selectors_for_text as _find,
+    )
+
+    html, error = await _fetch_scrape_html(scrape_id)
+    if error is not None or html is None:
+        return _respond(None, error=error, status_code=404)
+    result = _find(
+        html,
+        text,
+        max_results=max_results or 10,
+        case_insensitive=True if case_insensitive is None else case_insensitive,
+    )
+    result["scrape_id"] = scrape_id
+    return _respond(result)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
