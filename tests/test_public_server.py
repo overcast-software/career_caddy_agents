@@ -11,7 +11,13 @@ class TestPublicServerTools:
     def load_server(self):
         from mcp_servers.public_server import server
         self.server = server
-        self.tools = asyncio.run(server.list_tools())
+        # `_list_tools()` is the internal that BYPASSES middleware — what
+        # we want for the "is every tool registered?" assertion. The
+        # request-handler `list_tools()` goes through the
+        # StaffOnlyToolFilter middleware and would return the filtered
+        # non-staff view; see TestStaffOnlyToolFilter below for that
+        # surface's behavior.
+        self.tools = asyncio.run(server._list_tools())
         self.tool_names = {t.name for t in self.tools}
 
     def test_tool_count(self):
@@ -19,6 +25,8 @@ class TestPublicServerTools:
         # check (title + link or company) over existing primitives.
         # 28→31 when the scrape-profile-enhancer tools landed
         # (inspect_scrape_html, test_url_rewrite, find_selectors_for_text).
+        # Asserts the REGISTERED total, not the filtered surface a
+        # non-staff client sees (see TestStaffOnlyToolFilter for that).
         assert len(self.tools) == 31
 
     def test_has_all_expected_tools(self):
@@ -48,6 +56,74 @@ class TestPublicServerTools:
     def test_no_email_tools(self):
         email_names = {n for n in self.tool_names if "email" in n or "tag" in n or "notmuch" in n}
         assert not email_names
+
+
+class TestStaffOnlyToolFilter:
+    """The StaffOnlyToolFilter middleware hides three enhancer tools
+    from non-staff `tools/list` responses.
+
+    The api enforces authorization on every endpoint these tools call,
+    so the filter is a UX / prompt-context concern — regular users'
+    LLMs shouldn't burn tokens on tool definitions they can't usefully
+    invoke. These tests pin the visibility contract; the api-side
+    authorization is covered by api/job_hunting/tests.
+    """
+
+    @pytest.fixture(autouse=True)
+    def load_server(self):
+        from mcp_servers.public_server import server
+        from mcp_servers.staff_tool_filter import STAFF_ONLY_TOOLS
+        self.server = server
+        self.staff_only = STAFF_ONLY_TOOLS
+
+    def _list_via_middleware(self, *, is_staff: bool) -> set[str]:
+        """Run the request-handler `list_tools()` with a stubbed
+        access token. Returns the visible tool name set.
+        """
+        from unittest.mock import patch
+        from fastmcp.server.auth import AccessToken
+        access = AccessToken(
+            token="jh_stub", client_id="stub",
+            scopes=["read", "write"] + (["staff"] if is_staff else []),
+            claims={"user_id": "stub", "is_staff": is_staff},
+        )
+        # Patch in BOTH the middleware module's import site (where the
+        # filter calls `get_access_token`) AND any other read sites.
+        with patch(
+            "mcp_servers.staff_tool_filter.get_access_token",
+            return_value=access,
+        ):
+            tools = asyncio.run(self.server.list_tools())
+        return {t.name for t in tools}
+
+    def test_non_staff_session_hides_enhancer_tools(self):
+        visible = self._list_via_middleware(is_staff=False)
+        assert not (visible & self.staff_only), (
+            "non-staff client must not see the enhancer tools in tools/list"
+        )
+
+    def test_staff_session_sees_enhancer_tools(self):
+        visible = self._list_via_middleware(is_staff=True)
+        assert self.staff_only <= visible, (
+            "staff client must see all three enhancer tools"
+        )
+
+    def test_filtered_count_drops_by_exactly_three(self):
+        non_staff = self._list_via_middleware(is_staff=False)
+        staff = self._list_via_middleware(is_staff=True)
+        assert len(staff) - len(non_staff) == len(self.staff_only)
+
+    def test_unauthenticated_session_treated_as_non_staff(self):
+        """No AccessToken in scope → defaults to non-staff. The fallback
+        is intentional: an unauthenticated probe shouldn't see the
+        staff-only surface, even though api gates would catch any
+        actual attempt to invoke."""
+        # The base `server.list_tools()` (used by TestPublicServerTools
+        # above through _list_tools) goes through middleware with no
+        # active session — middleware should hide the enhancer tools.
+        tools = asyncio.run(self.server.list_tools())
+        visible = {t.name for t in tools}
+        assert not (visible & self.staff_only)
 
 
 class TestPublicServerSecurity:
