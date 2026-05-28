@@ -277,6 +277,93 @@ class Navigate(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef
         return nodes_obstacle.DetectObstacle()
 
 
+def _propagate_canonical_to_parent_jp(
+    parent_scrape_id: int, resolved_canonical_url: str
+) -> None:
+    """Best-effort: when a parent scrape's URL resolves through a
+    redirect chain, propagate the resolved canonical URL back to the
+    JobPost (if any) that the parent scrape was attached to.
+
+    Motivating case (2026-05-28 jp 3036 / jp 3040 incident): cc_auto's
+    email pipeline created jp 3036 with `link` = SendGrid tracker
+    `u52508838.ct.sendgrid.net/ls/click?upn=…`. SendGrid's `upn` is an
+    opaque hashed token, so canonicalize_link can't decode it — jp
+    3036.canonical_link stayed pinned to the wrapper. Later, scrape
+    477 ran on the resolved destination `hiring.cafe/job/<id>`
+    directly and created a fresh jp 3040 — the two rows represent the
+    same opening but the canonical_link comparison couldn't merge
+    them. Without this propagation step, every wrapped-URL JobPost
+    accumulates an unmerged duplicate the first time the destination
+    is captured directly.
+
+    Behavior:
+    - GET the parent scrape; if no `job_post` relationship, no-op.
+    - GET the JobPost; if its canonical_link already equals the
+      resolved URL (idempotent re-run), no-op.
+    - Otherwise PATCH the JobPost's `canonical_link`. The api's PATCH
+      path leaves `link` alone (audit / wrapper preserved) and the
+      JobPost.save() guard only re-derives canonical_link when it's
+      empty, so the value we send lands verbatim.
+
+    All exceptions are swallowed and logged — this is enhancement
+    for downstream dedupe, not load-bearing for the scrape itself.
+    The redirect-handoff to the child scrape proceeds either way.
+    """
+    try:
+        resp = httpx.get(
+            f"{_api_base()}/api/v1/scrapes/{parent_scrape_id}/",
+            headers=_api_headers(),
+            timeout=5.0,
+        )
+        if resp.status_code != 200:
+            return
+        rel = (
+            ((resp.json() or {}).get("data") or {})
+            .get("relationships", {})
+            .get("job-post")
+            or {}
+        )
+        jp_data = rel.get("data")
+        if not jp_data:
+            return
+        jp_id = jp_data.get("id")
+        if not jp_id:
+            return
+
+        get_resp = httpx.get(
+            f"{_api_base()}/api/v1/job-posts/{jp_id}/",
+            headers=_api_headers(),
+            timeout=5.0,
+        )
+        if get_resp.status_code != 200:
+            return
+        current_canonical = (
+            ((get_resp.json() or {}).get("data") or {})
+            .get("attributes", {})
+            .get("canonical_link")
+        )
+        if current_canonical == resolved_canonical_url:
+            return
+
+        httpx.patch(
+            f"{_api_base()}/api/v1/job-posts/{jp_id}/",
+            json={
+                "data": {
+                    "type": "job-post",
+                    "id": str(jp_id),
+                    "attributes": {"canonical_link": resolved_canonical_url},
+                }
+            },
+            headers={**_api_headers(), "Content-Type": "application/json"},
+            timeout=5.0,
+        )
+    except Exception:
+        logger.warning(
+            "ResolveFinalUrl: canonical_link propagation to parent JobPost failed",
+            exc_info=True,
+        )
+
+
 def _resolve_final_url_body(state: ScrapeGraphState) -> None:
     """Synchronous core of ResolveFinalUrl — split out so we can wrap
     the whole thing in a thread + asyncio.wait_for budget below.
@@ -331,6 +418,15 @@ def _resolve_final_url_body(state: ScrapeGraphState) -> None:
                         f"redirected to scrape {new_id} "
                         f"({state.canonical_url})"
                     ),
+                )
+                # Propagate the resolved canonical_link back to the
+                # JobPost (if any) attached to the parent scrape. Runs
+                # against the still-parent state.scrape_id BEFORE the
+                # swap below. Best-effort — failures don't block the
+                # handoff. See _propagate_canonical_to_parent_jp for
+                # the JP 3036 motivating incident.
+                _propagate_canonical_to_parent_jp(
+                    state.scrape_id, state.canonical_url
                 )
                 state.scrape_id = int(new_id)
     except Exception:
