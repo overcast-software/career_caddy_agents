@@ -4,7 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Career Caddy AI provides browser automation, job extraction, and chat agents for the Career Caddy backend API. Email-based workflows (notmuch classification, email pipeline) have been moved to `career_caddy_automation`.
+Career Caddy AI provides browser automation, job extraction, and chat agents for the Career Caddy backend API. Email-based workflows (notmuch classification, email pipeline) have been moved to the parent's `automation/` submodule (formerly the `career_caddy_automation` sibling repo, promoted to first-class on 2026-05-30).
+
+## Where `agents/` fits in the four-submodule layout
+
+The parent repo (`career_caddy`) has four submodules:
+
+- `api/` — Django REST + MCP backend.
+- `frontend/` — Ember.js 6.x SPA.
+- **`agents/`** (this submodule) — **server-side, service-driven**. Runs as Docker containers in the prod stack for *everyone*: Camoufox + Playwright browser, scrape-graph state machine, prod MCP servers (`chat_server.py` + `public_server.py` at `:8031` + `:8030`), pollers (`hold_poller.py`, `score_poller.py` — both retiring via the django-q2 phased rollout in parent). When the queue migration lands, the scrape worker container also lives here because it needs Camoufox.
+- `automation/` — **user-side, operator-driven**. Email triage pipeline, caddy-web copilot, A2A orchestrator, link traverser, sharpen_profiles. Runs on *one user's* machines (laptop, pibu, home server). HTTP-only contract with the api + public MCP — no Python imports cross.
+
+**The boundary is service vs operator.** When deciding whether a piece of code belongs in `agents/` or `automation/`:
+
+- *Is it a service for everyone?* → `agents/`. Browser/Camoufox, scrape pipeline, prod MCP servers, pollers/workers, anything Docker-shipped to all users.
+- *Is it an operator for one user?* → `automation/`. Email-driven flows, user-side copilot, anything that runs on one human's machine.
+
+Cross-link: parent's `CLAUDE.md` has the same role-split text and is the canonical home for the framing. The full reconstruction plan lives at `career_caddy/notes.org/Plans/Promoting cc_auto → automation/ — first-class submodule`.
 
 ## Environment Setup
 
