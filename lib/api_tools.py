@@ -1165,6 +1165,40 @@ async def get_scrapes(
     )
 
 
+async def claim_next_scrape(
+    api: ApiClient,
+    *,
+    runner_name: Optional[str] = None,
+) -> str:
+    """Atomically claim the next hold scrape for processing.
+
+    POST /api/v1/scrapes/claim-next/ (Plans/Scrape runner Phase 1).
+    Server-side SELECT FOR UPDATE SKIP LOCKED — N concurrent runners
+    never pick up the same row.
+
+    Returns the same shape as get_scrapes for a single record when a
+    scrape was claimed. Returns the sentinel ``{'data': null}`` (or
+    an error payload) when no hold scrapes are available — caller
+    sleeps + retries.
+    """
+    shape = TOOL_SHAPES["get_scrapes"]
+    body: dict = {}
+    if runner_name:
+        body["runner_name"] = runner_name
+    payload, error, status_code = await api.post_data(
+        "/api/v1/scrapes/claim-next/", body
+    )
+    # 204 No Content → empty queue. ApiClient maps this to (None, None, 204).
+    # Surface as data=null so the poller's existing "no scrapes" branch
+    # treats it the same as the legacy get-then-empty-list path.
+    if status_code == 204:
+        return _respond({"data": None})
+    if error is not None:
+        return _respond(None, error=error, status_code=status_code)
+    _slim_payload(payload, shape=shape, is_single=True)
+    return _respond(payload)
+
+
 async def update_scrape(
     api: ApiClient,
     scrape_id: int,

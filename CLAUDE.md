@@ -12,7 +12,7 @@ The parent repo (`career_caddy`) has four submodules:
 
 - `api/` — Django REST + MCP backend.
 - `frontend/` — Ember.js 6.x SPA.
-- **`agents/`** (this submodule) — **server-side, service-driven**. Runs as Docker containers in the prod stack for *everyone*: Camoufox + Playwright browser, scrape-graph state machine, prod MCP servers (`chat_server.py` + `public_server.py` at `:8031` + `:8030`), pollers (`hold_poller.py`, `score_poller.py` — both retiring via the django-q2 phased rollout in parent). When the queue migration lands, the scrape worker container also lives here because it needs Camoufox.
+- **`agents/`** (this submodule) — **server-side, service-driven**. Runs as Docker containers in the prod stack for *everyone*: Camoufox + Playwright browser, scrape-graph state machine, prod MCP servers (`chat_server.py` + `public_server.py` at `:8031` + `:8030`), the scrape runner (`runners/scrape_runner.py` — formerly `pollers/hold_poller.py`, renamed 2026-05-30; claims hold scrapes via `POST /api/v1/scrapes/claim-next/` with `SELECT FOR UPDATE SKIP LOCKED` so N concurrent runners coexist safely), the score poller (`pollers/score_poller.py`, retiring via the django-q2 phased rollout in parent).
 - `automation/` — **user-side, operator-driven**. Email triage pipeline, caddy-web copilot, A2A orchestrator, link traverser, sharpen_profiles. Runs on *one user's* machines (laptop, pibu, home server). HTTP-only contract with the api + public MCP — no Python imports cross.
 
 **The boundary is service vs operator.** When deciding whether a piece of code belongs in `agents/` or `automation/`:
@@ -90,7 +90,7 @@ Two engines are available — select via `--engine` CLI flag or `BROWSER_ENGINE`
 python mcp_servers/browser_server.py --engine chrome --headless
 
 # Hold poller (Raspberry Pi)
-uv run caddy-poller --engine chrome --headless
+uv run caddy-runner --engine chrome --headless
 
 # Manual login (always headed)
 python tools/manual_login.py --engine chrome linkedin.com
@@ -130,8 +130,9 @@ See `mcp_servers/README.md` for the canonical table (prod vs local-only, transpo
 synchronous flow — api `Scraper.dispatch()` POSTing to a browser-MCP
 HTTP endpoint (`/scrape_job` on `localhost:3012`) — is gone. Every
 scrape created through `POST /api/v1/scrapes/` defaults to
-`status="hold"`; the hold-poller picks them up, drives extraction
-through the scrape-graph, and patches the row when done.
+`status="hold"`; the scrape runner (`runners/scrape_runner.py`)
+claims them via `POST /api/v1/scrapes/claim-next/`, drives
+extraction through the scrape-graph, and patches the row when done.
 `browser_server.py`'s `scrape_page` MCP tool stays for ad-hoc
 exploration (paste-form fallback, manual debugging) but no api code
 calls it anymore.
@@ -190,7 +191,7 @@ Resolution order: role-specific env var → `CADDY_DEFAULT_MODEL` → hardcoded 
 | `BROWSER_SCRAPER_MODEL` | browser scraper | gpt-4o-mini |
 | `CADDY_DEFAULT_MODEL` | fallback for all roles | gpt-4o-mini |
 
-The hold poller (`pollers/hold_poller.py`) skips the browser_scraper LLM entirely — it calls `scrape_page()` directly as a Python function, then hands content to the job extractor.
+The scrape runner (`runners/scrape_runner.py`) skips the browser_scraper LLM entirely — it calls `scrape_page()` directly as a Python function, then hands content to the job extractor.
 
 ## Scrape Graph (Phase 1b skeleton)
 
