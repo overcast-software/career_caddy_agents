@@ -1,4 +1,4 @@
-from pollers.hold_poller import format_scrape_label
+from runners.scrape_runner import format_scrape_label
 
 
 def test_no_swap_renders_single_id():

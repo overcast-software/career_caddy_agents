@@ -14,8 +14,10 @@ agents/                         (this repo)
 │   └── career_caddy_server.py  #   local-only stdio — CRUD against the Career Caddy REST API
 ├── browser/                    # Browser engine, sessions, credentials (local-only)
 ├── scrape_graph/               # pydantic-graph state machine for scrape + extract
-├── pollers/                    # Long-running daemons
-│   ├── hold_poller.py          #   caddy-poller — production worker
+├── runners/                    # External workers that claim work via the api
+│   └── scrape_runner.py        #   caddy-runner — claims hold scrapes via /scrapes/claim-next/
+├── pollers/                    # Periodic / scheduled-sweep daemons
+│   ├── hold_poller.py          #   deprecation shim — re-exports runners.scrape_runner; drop after one release
 │   └── score_poller.py         #   caddy-score
 ├── tools/                      # One-shot operator scripts
 │   ├── manual_login.py
@@ -35,7 +37,8 @@ agents/                         (this repo)
 | Command | Module | What it does |
 |---|---|---|
 | `caddy-pipeline` | `agents.job_email_to_caddy:run` | Scrape one URL → extract → post to Career Caddy |
-| `caddy-poller` | `pollers.hold_poller:main_sync` | Production hold-poller daemon |
+| `caddy-runner` | `runners.scrape_runner:main_sync` | Scrape runner — claims hold scrapes via `POST /scrapes/claim-next/` |
+| `caddy-poller` | `pollers.hold_poller:main_sync` | Deprecated alias for `caddy-runner`; drop after one release |
 | `caddy-score` | `pollers.score_poller:run` | Score/rank scrapes (heuristic, no LLM) |
 | `caddy-public` | `mcp_servers.public_server:main` | Public MCP gateway (prod entrypoint) |
 | `caddy-chat` | `mcp_servers.chat_server:main` | SSE chat service (prod entrypoint) |
@@ -45,14 +48,14 @@ agents/                         (this repo)
 
 ## Deploy posture
 
-The Docker image runs as **two prod services** (`caddy-public` and `caddy-chat`) under different entrypoints — no browser, no Camoufox. The browser-mcp server, hold-poller, and score-poller are **local-only**, intended to run on a desktop or Raspberry Pi.
+The Docker image runs as **two prod services** (`caddy-public` and `caddy-chat`) under different entrypoints — no browser, no Camoufox. The browser-mcp server, scrape runner, and score-poller are **local-only**, intended to run on a desktop or Raspberry Pi. N scrape runners coexist safely on the same api — `POST /scrapes/claim-next/` uses `SELECT FOR UPDATE SKIP LOCKED` to hand each scrape to exactly one runner.
 
 | Surface | Where it runs |
 |---|---|
 | `mcp_servers/public_server.py` | Prod VPS (`:8030`, `mcp.careercaddy.online`) |
 | `mcp_servers/chat_server.py` | Prod VPS (`:8031`, internal-only behind api proxy) |
 | `mcp_servers/browser_server.py` | Local dev / Pi (`:3004`) |
-| `pollers/hold_poller.py` | Local dev / Pi (drives the production scrape path) |
+| `runners/scrape_runner.py` | Local dev / Pi / omarchy / pibu (drives the production scrape path) |
 
 ## Setup
 
