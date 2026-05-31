@@ -29,6 +29,8 @@ Dependencies are managed via `pyproject.toml` with `uv`. Environment variables c
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | `CC_API_TOKEN` | Yes | Career Caddy backend auth token |
+| `CC_API_BASE_URL` | No | API base URL (default: `https://careercaddy.online`; set to `http://localhost:8000` for local dev) |
+| `CC_RUNNER_NAME` | No | Runner identifier recorded in `Scrape.claimed_by`. Default: `socket.gethostname()`. Set per host when running multi-runner (`omarchy`, `pibu`, …) so logfire / db queries can attribute work to the right box. |
 | `OPENAI_API_KEY` | Yes* | LLM provider (* or use ANTHROPIC_API_KEY) |
 | `ANTHROPIC_API_KEY` | No | Alternative LLM provider |
 | `FASTMCP_HOST` | No | MCP server bind host (default: `0.0.0.0`) |
@@ -89,7 +91,7 @@ Two engines are available — select via `--engine` CLI flag or `BROWSER_ENGINE`
 # Browser MCP server
 python mcp_servers/browser_server.py --engine chrome --headless
 
-# Hold poller (Raspberry Pi)
+# Scrape runner (Raspberry Pi) — see Multi-Runner Deployment below
 uv run caddy-runner --engine chrome --headless
 
 # Manual login (always headed)
@@ -176,6 +178,166 @@ linkedin.com:
 ```
 
 Domain lookup normalizes subdomains automatically (`www.linkedin.com` → `linkedin.com`).
+
+## Multi-Runner Deployment
+
+N scrape runners can point at the same Career Caddy api and split
+the `status='hold'` queue without coordinating with each other. The
+canonical deployment is omarchy (workstation) + pibu (Raspberry Pi),
+but the same pattern extends to any host with outbound HTTPS to the
+api and a Camoufox or Chromium install.
+
+### Why it's safe
+
+Three pieces have to line up — all shipped:
+
+1. **Atomic claim** (api Phase 1, `POST /api/v1/scrapes/claim-next/`).
+   Wrapped in `SELECT FOR UPDATE SKIP LOCKED` against the oldest
+   `status='hold'` row. Concurrent runners see different rows; the
+   loser in a race picks up the next one down the queue, never the
+   same row twice.
+2. **Heartbeat on every non-terminal write** (api Phase 1, in
+   `_log_scrape_status`). Each status update (`running`,
+   `extracting`, `updating_profile`, …) bumps `claimed_at = NOW()`,
+   so a long-running scrape doesn't look stale to the sweep.
+   Terminal writes (`completed`, `failed`) clear `claimed_at` +
+   `claimed_by` so post-mortem queries can tell finished work from
+   in-flight work.
+3. **Lease sweep** (api Phase 2, `sweep_stale_scrape_claims`).
+   django-q2 schedule, every 5 min, resets non-terminal rows whose
+   `claimed_at` is older than 15 min back to `status='hold'` with
+   `claimed_at=NULL`. Catches OOM kills, host reboots, network
+   splits, anything that severs a runner mid-scrape. The 15 min
+   default lives in `api/job_hunting/lib/tasks.py::_DEFAULT_LEASE_MINUTES`
+   — bump it via the schedule arg if you have a profile that
+   legitimately takes longer.
+
+The combined invariant: **a Scrape row is either claimable
+(`hold` + `claimed_at IS NULL`), actively being heartbeat-ed by a
+live runner (non-terminal + `claimed_at` recent), or done
+(`completed`/`failed` + `claimed_at NULL`)**. No fourth state, no
+manual cleanup needed.
+
+### Runner naming
+
+Set `CC_RUNNER_NAME` per host. The runner uses
+`os.environ.get("CC_RUNNER_NAME") or socket.gethostname()` and
+passes it as `runner_name` on the claim POST; api stores it on
+`Scrape.claimed_by`. Naming matters because:
+
+- Logfire spans tag the runner via the same value.
+- Blame attribution when the sweep resets a stale claim ("runner
+  `pibu` lost claim on scrape 4271 after 18 min").
+- Local `claimed_by` queries (`SELECT claimed_by, COUNT(*) FROM
+  scrapes WHERE status='running' GROUP BY 1`) tell you which runner
+  is hot.
+
+Stick to short, host-shaped names (`omarchy`, `pibu`, `pibu-2`).
+Avoid PIDs or timestamps — the value persists past the runner's
+lifetime in the audit row.
+
+### Omarchy (existing workstation runner)
+
+Already deployed. The only change required for multi-runner is
+setting the name:
+
+```bash
+# .envrc on omarchy
+export CC_RUNNER_NAME=omarchy
+```
+
+Then re-run via the existing entry:
+
+```bash
+make runner                              # camoufox, headless, against prod
+make runner ARGS="--engine chrome"       # chromium + stealth
+make runner ARGS="--attended"            # headed; one resident window, ephemeral tabs
+make runner-local                        # against http://localhost:8000
+```
+
+### Pibu (Raspberry Pi runner)
+
+Pibu has ~400Mi RAM headroom under steady state; Camoufox eats
+200–400Mi while a scrape is open, so the box can host exactly one
+runner. Use Chromium (`--engine chrome`) — Camoufox is x86_64-only.
+
+```bash
+# One-time on pibu
+ssh pibu 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+ssh pibu 'git clone --depth=1 git@github.com:overcast-software/career_caddy_agents.git ~/Projects/career_caddy_agents'
+ssh pibu 'cd ~/Projects/career_caddy_agents && uv sync && uv run caddy-fetch-chromium'
+
+# Per-host env (~/.config/environment.d/career-caddy.conf or .envrc)
+CC_API_BASE_URL=https://careercaddy.online
+CC_API_TOKEN=<long-lived jh_* key>
+CC_RUNNER_NAME=pibu
+BROWSER_ENGINE=chrome
+BROWSER_HEADLESS=true
+```
+
+Systemd-user unit (`~/.config/systemd/user/caddy-runner.service`):
+
+```ini
+[Unit]
+Description=Career Caddy scrape runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/career_caddy_agents
+EnvironmentFile=%h/.config/environment.d/career-caddy.conf
+ExecStart=%h/.local/bin/uv run caddy-runner --engine chrome --headless
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+ssh pibu systemctl --user daemon-reload
+ssh pibu systemctl --user enable --now caddy-runner.service
+ssh pibu journalctl --user -fu caddy-runner.service
+```
+
+### Verifying the split
+
+After both runners are live, queue up two-plus scrapes via the UI
+or `POST /api/v1/scrapes/` and check that they fan out:
+
+```sql
+-- Inside the api container: docker compose exec db psql -U postgres -d job_hunting
+SELECT id, status, claimed_by, claimed_at
+FROM job_hunting_scrape
+WHERE claimed_at > NOW() - interval '15 minutes'
+ORDER BY claimed_at DESC;
+```
+
+Both `omarchy` and `pibu` should appear in `claimed_by`. If only
+one host ever shows, the other runner isn't claiming — check its
+journal for auth errors (`CC_API_TOKEN` revoked) or DNS/HTTPS
+reachability to the api.
+
+For real-time visibility, logfire's runner spans tag
+`runner_name` — query by attribute in the dashboard to see per-host
+throughput.
+
+### What's deferred
+
+- **Admin dashboard surface** (per-runner claim counts, last-seen,
+  current scrape) — deferred to *Plans/Scrape runner Phase 5 —
+  operational surface*. The SQL above is the interim view.
+- **Capability routing** (route X-host scrapes to a specific
+  runner) — intentionally out of scope. The plan rejected
+  PeerTube's job-runner protocol for being heavier than we need;
+  any scrape can run on any runner. If a domain breaks under
+  Chromium, fix it in `ScrapeProfile` rather than pinning to
+  Camoufox runners.
+- **Runner-scoped API keys** (a `runner` scope distinct from staff
+  keys) — Phase 4 nice-to-have noted in the claim-next view
+  docstring; defer until there's an actual privilege boundary to
+  enforce.
 
 ## LLM Configuration
 
