@@ -29,7 +29,7 @@ Dependencies are managed via `pyproject.toml` with `uv`. Environment variables c
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | `CC_API_TOKEN` | Yes | Career Caddy backend auth token |
-| `CC_API_BASE_URL` | No | API base URL (default: `https://careercaddy.online`; set to `http://localhost:8000` for local dev) |
+| `CC_API_BASE_URL` | No | API base URL (default: `https://api.careercaddy.online`; set to `http://localhost:8000` for local dev) |
 | `CC_RUNNER_NAME` | No | Runner identifier recorded in `Scrape.claimed_by`. Default: `socket.gethostname()`. Set per host when running multi-runner (`omarchy`, `pibu`, …) so logfire / db queries can attribute work to the right box. |
 | `OPENAI_API_KEY` | Yes* | LLM provider (* or use ANTHROPIC_API_KEY) |
 | `ANTHROPIC_API_KEY` | No | Alternative LLM provider |
@@ -264,11 +264,11 @@ runner. Use Chromium (`--engine chrome`) — Camoufox is x86_64-only.
 ```bash
 # One-time on pibu
 ssh pibu 'curl -LsSf https://astral.sh/uv/install.sh | sh'
-ssh pibu 'git clone --depth=1 git@github.com:overcast-software/career_caddy_agents.git ~/Projects/career_caddy_agents'
+ssh pibu 'git clone --depth=1 https://github.com/overcast-software/career_caddy_agents.git ~/Projects/career_caddy_agents'
 ssh pibu 'cd ~/Projects/career_caddy_agents && uv sync && uv run caddy-fetch-chromium'
 
 # Per-host env (~/.config/environment.d/career-caddy.conf or .envrc)
-CC_API_BASE_URL=https://careercaddy.online
+CC_API_BASE_URL=https://api.careercaddy.online
 CC_API_TOKEN=<long-lived jh_* key>
 CC_RUNNER_NAME=pibu
 BROWSER_ENGINE=chrome
