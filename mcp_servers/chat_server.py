@@ -51,6 +51,7 @@ from agents.agent_factory import get_agent, register_defaults  # noqa: E402
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+import logfire  # noqa: E402
 from lib.logfire_setup import setup_logfire  # noqa: E402
 
 setup_logfire("chat_server")
@@ -840,8 +841,10 @@ async def chat(request: Request):
       - name: "reload"       value: {"resource": "<ember-type>"}
       - name: "session_meta" value: {"conversation_id": "...", "usage": {...}}
     """
+    logfire.info("chat: handler entered")
     try:
-        body = await request.json()
+        with logfire.span("chat: parse request body"):
+            body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
@@ -866,34 +869,74 @@ async def chat(request: Request):
     if not token:
         return JSONResponse({"error": "token is required"}, status_code=400)
 
+    # Parent span scopes the entire chat turn under one trace so timing
+    # gaps between SSE stream start, /me/ fetch, agent build, and the
+    # first model token are all attributable to a specific phase. The
+    # 2026-06-04 post-reboot timeout investigation could not pinpoint
+    # which phase ate the 10 seconds before this span existed.
+    turn_span = logfire.span(
+        "chat turn",
+        conversation_id=conversation_id,
+        token_prefix=(token[:8] + "…") if token else "",
+        page_route=(page_context or {}).get("route") if page_context else None,
+        smart=smart,
+    )
+
     async def event_stream():
-        encoder = EventEncoder()
-        # Fetch user context BEFORE entering the main try-block so failures
-        # here get a dedicated RunErrorEvent. Previously the fetch ran
-        # unwrapped, raising past the generator's first yield and ending
-        # the SSE stream with zero events — which the frontend rendered as
-        # a bare "(no response from agent)" fallback. See parent todo.org
-        # "chat_server httpx.ReadTimeout on api v1 me — root cause for
-        # no-response fallback".
-        try:
-            user_profile, is_staff = await _fetch_user_context(token)
-        except httpx.HTTPError:
-            logger.exception("Chat user-context fetch failed")
-            yield encoder.encode(
-                RunErrorEvent(
-                    message=(
-                        "Could not reach the chat backend right now. "
-                        "Please try again in a moment."
+        with turn_span:
+            encoder = EventEncoder()
+            logfire.info(
+                "chat: event_stream entered — about to fetch user context",
+                conversation_id=conversation_id,
+            )
+            # Fetch user context BEFORE entering the main try-block so
+            # failures here get a dedicated RunErrorEvent. Previously the
+            # fetch ran unwrapped, raising past the generator's first yield
+            # and ending the SSE stream with zero events — which the
+            # frontend rendered as a bare "(no response from agent)"
+            # fallback. See parent todo.org "chat_server httpx.ReadTimeout
+            # on api v1 me — root cause for no-response fallback".
+            try:
+                with logfire.span(
+                    "chat: fetch user context",
+                    conversation_id=conversation_id,
+                ):
+                    user_profile, is_staff = await _fetch_user_context(token)
+            except httpx.HTTPError as exc:
+                logger.exception("Chat user-context fetch failed")
+                logfire.error(
+                    "chat: user-context fetch raised httpx.HTTPError",
+                    conversation_id=conversation_id,
+                    exception_type=type(exc).__name__,
+                    exception_message=str(exc),
+                )
+                yield encoder.encode(
+                    RunErrorEvent(
+                        message=(
+                            "Could not reach the chat backend right now. "
+                            "Please try again in a moment. "
+                            f"(conversation {conversation_id})"
+                        )
                     )
                 )
+                return
+            logfire.info(
+                "chat: user-context fetched, building agent",
+                conversation_id=conversation_id,
+                is_staff=is_staff,
+                profile_chars=len(user_profile),
             )
-            return
-        agent = _build_agent(
-            user_profile,
-            page_context=page_context,
-            onboarding=onboarding,
-            smart=smart,
-        )
+            with logfire.span(
+                "chat: build agent",
+                conversation_id=conversation_id,
+                smart=smart,
+            ):
+                agent = _build_agent(
+                    user_profile,
+                    page_context=page_context,
+                    onboarding=onboarding,
+                    smart=smart,
+                )
         if smart:
             logger.info("chat: smart model requested for this turn")
         deps = CareerCaddyDeps(
@@ -1085,6 +1128,10 @@ async def chat(request: Request):
             logger.exception("Chat agent error")
             yield encoder.encode(RunErrorEvent(message=str(e)))
 
+    logfire.info(
+        "chat: returning StreamingResponse — Starlette will start iterating event_stream next",
+        conversation_id=conversation_id,
+    )
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
