@@ -1,6 +1,31 @@
-# CLAUDE.md
+# agents/CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in `agents/`. This file is a
+pointer; the canonical state lives in `agents/notes.org`.
+
+## Source of truth — read FIRST
+
+- **`agents/notes.org`** (drill via `claude/cag-*`) — scrape-graph
+  state machine, MCP server boundary (prod vs local), agent-memory-
+  does-not-flow-to-production rule, ScrapeProfile as source of truth,
+  selector-engine boundary, runner safety invariants.
+- **Parent `todo.org`** (drill via `claude/cc-*`) — agents
+  work-items are filed under the parent `Inbox`; there is no
+  `agents/todo.org`.
+
+Boot sequence (every cc-agents / scrape-profile-enhancer session):
+
+```
+emacsclient --eval '(claude/cag-help)'
+emacsclient --eval '(claude/cag-notes-toc)'
+emacsclient --eval '(claude/cag-notes-read "Architecture/Scrape-graph state machine")'
+emacsclient --eval '(claude/cag-notes-read "Architecture/MCP server boundary")'
+emacsclient --eval '(claude/cag-notes-read "Architecture/Agent memory does not flow to production")'
+```
+
+For ScrapeProfile / selector / hint work, also read
+`Architecture/ScrapeProfile as source of truth` and
+`Architecture/Selector-engine boundary`.
 
 ## What This Is
 

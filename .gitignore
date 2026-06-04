@@ -31,3 +31,7 @@ wheels/
 #  Usually these files are█
 screenshots
 .claude
+
+# Operator wiki (kept local — claude/cag-* helpers consume it)
+notes.org
+notes.org_archive
