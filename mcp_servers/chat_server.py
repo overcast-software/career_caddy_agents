@@ -468,14 +468,34 @@ navigate action to /settings/profile:
 """
 
 
-async def _fetch_user_is_staff(api_key: str) -> bool:
-    """Identity-only lookup: does this token belong to a staff user?
+# httpx default read timeout is 5s. Two sequential /me/ calls per chat turn
+# occasionally hit it (logfire: chat_server httpx.ReadTimeout 5.04s, 3x in
+# 48h) which kills the SSE stream before any event is yielded, manifesting
+# in the frontend as a bare "(no response from agent)". Bump read budget;
+# keep connect tight.
+_USER_CONTEXT_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 
-    Kept separate from `_fetch_user_profile` so authorization state doesn't
-    bleed into a function whose contract is "string for the system prompt".
-    Returns False on any non-200 — fails closed.
+
+async def _fetch_user_context(api_key: str) -> tuple[str, bool]:
+    """Single /api/v1/me/ call returns (profile_string, is_staff_bool).
+
+    Replaces the earlier `_fetch_user_profile` + `_fetch_user_is_staff`
+    pair — both fields ride on the same JSON:API resource, so one request
+    is sufficient and cuts the per-turn failure surface in half.
+
+    Failure modes:
+
+    - Non-200: degraded tuple ("Could not load user profile.", False).
+      The chat agent still runs; system prompt sees the missing profile.
+      Matches the prior fail-closed behavior.
+    - httpx error (ReadTimeout, connection refused, …): RAISES the
+      original httpx exception. Caller (`event_stream`) wraps this and
+      emits a RunErrorEvent so the SSE stream doesn't silently end with
+      zero events.
     """
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=_USER_CONTEXT_TIMEOUT
+    ) as client:
         resp = await client.get(
             f"{API_BASE_URL}/api/v1/me/",
             headers={
@@ -483,54 +503,39 @@ async def _fetch_user_is_staff(api_key: str) -> bool:
                 "X-Forwarded-Proto": "https",
             },
         )
-        if resp.status_code != 200:
-            return False
-        data = resp.json().get("data", resp.json())
-        attrs = data.get("attributes", data)
-        return bool(attrs.get("is_staff") or attrs.get("is-staff"))
-
-
-async def _fetch_user_profile(api_key: str) -> str:
-    """Fetch the authenticated user's profile from the API."""
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        resp = await client.get(
+    if resp.status_code != 200:
+        logger.warning(
+            "Profile fetch failed: status=%s url=%s",
+            resp.status_code,
             f"{API_BASE_URL}/api/v1/me/",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "X-Forwarded-Proto": "https",
-            },
         )
-        if resp.status_code != 200:
-            logger.warning(
-                "Profile fetch failed: status=%s url=%s",
-                resp.status_code,
-                f"{API_BASE_URL}/api/v1/me/",
-            )
-            return "Could not load user profile."
-        data = resp.json().get("data", resp.json())
-        attrs = data.get("attributes", data)
-        # Always emit every field. Empty fields become "(blank)" so the agent
-        # can see exactly what's missing rather than inferring from omitted
-        # lines. This is load-bearing for the AW rule about naming the
-        # specific missing profile fields.
-        def _field(label, value):
-            v = (value or "").strip() if isinstance(value, str) else (value or "")
-            return f"{label}: {v if v else '(blank)'}"
+        return "Could not load user profile.", False
+    data = resp.json().get("data", resp.json())
+    attrs = data.get("attributes", data)
+    is_staff = bool(attrs.get("is_staff") or attrs.get("is-staff"))
 
-        parts = [
-            _field("First name", attrs.get("first_name")),
-            _field("Last name", attrs.get("last_name")),
-            _field("Username", attrs.get("username")),
-            _field("Email", attrs.get("email")),
-            _field("Phone", attrs.get("phone")),
-            _field("Address", attrs.get("address")),
-            _field("LinkedIn", attrs.get("linkedin")),
-            _field("GitHub", attrs.get("github")),
-        ]
-        if attrs.get("links"):
-            parts.append(f"Links: {attrs['links']}")
-        logger.info("Resolved user profile: %s", parts[0])
-        return "\n".join(parts)
+    # Always emit every field. Empty fields become "(blank)" so the agent
+    # can see exactly what's missing rather than inferring from omitted
+    # lines. This is load-bearing for the AW rule about naming the
+    # specific missing profile fields.
+    def _field(label, value):
+        v = (value or "").strip() if isinstance(value, str) else (value or "")
+        return f"{label}: {v if v else '(blank)'}"
+
+    parts = [
+        _field("First name", attrs.get("first_name")),
+        _field("Last name", attrs.get("last_name")),
+        _field("Username", attrs.get("username")),
+        _field("Email", attrs.get("email")),
+        _field("Phone", attrs.get("phone")),
+        _field("Address", attrs.get("address")),
+        _field("LinkedIn", attrs.get("linkedin")),
+        _field("GitHub", attrs.get("github")),
+    ]
+    if attrs.get("links"):
+        parts.append(f"Links: {attrs['links']}")
+    logger.info("Resolved user profile: %s", parts[0])
+    return "\n".join(parts), is_staff
 
 
 register_defaults()
@@ -863,8 +868,26 @@ async def chat(request: Request):
 
     async def event_stream():
         encoder = EventEncoder()
-        user_profile = await _fetch_user_profile(token)
-        is_staff = await _fetch_user_is_staff(token)
+        # Fetch user context BEFORE entering the main try-block so failures
+        # here get a dedicated RunErrorEvent. Previously the fetch ran
+        # unwrapped, raising past the generator's first yield and ending
+        # the SSE stream with zero events — which the frontend rendered as
+        # a bare "(no response from agent)" fallback. See parent todo.org
+        # "chat_server httpx.ReadTimeout on api v1 me — root cause for
+        # no-response fallback".
+        try:
+            user_profile, is_staff = await _fetch_user_context(token)
+        except httpx.HTTPError:
+            logger.exception("Chat user-context fetch failed")
+            yield encoder.encode(
+                RunErrorEvent(
+                    message=(
+                        "Could not reach the chat backend right now. "
+                        "Please try again in a moment."
+                    )
+                )
+            )
+            return
         agent = _build_agent(
             user_profile,
             page_context=page_context,

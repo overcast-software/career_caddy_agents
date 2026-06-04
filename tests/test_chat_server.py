@@ -2,6 +2,10 @@
 
 import ast
 import importlib
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pytest
 
 
 class TestChatServerSecurity:
@@ -90,3 +94,139 @@ class TestChatSystemPromptDuplicateRule:
         body = self._prompt()
         assert "409" in body
         assert "existing_job_post_id" in body
+
+
+class TestFetchUserContext:
+    """The merged /me/ fetch returns (profile_string, is_staff_bool).
+
+    Replaces the earlier `_fetch_user_profile` + `_fetch_user_is_staff` pair
+    which hit /me/ twice per chat turn and doubled the failure surface.
+    Regression target: see todo "chat_server httpx.ReadTimeout on api v1 me
+    — root cause for no-response fallback".
+    """
+
+    @staticmethod
+    def _async_client_returning(resp_mock=None, raises=None):
+        """Build a context-manager async client whose .get() returns RESP_MOCK
+        or raises RAISES (one of the two; not both)."""
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        if raises is not None:
+            mock_client.get = AsyncMock(side_effect=raises)
+        else:
+            mock_client.get = AsyncMock(return_value=resp_mock)
+        return mock_client
+
+    @pytest.mark.asyncio
+    async def test_returns_tuple_with_profile_and_is_staff(self):
+        chat_server = importlib.import_module("mcp_servers.chat_server")
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "data": {
+                "id": "1",
+                "type": "user",
+                "attributes": {
+                    "first_name": "Ada",
+                    "last_name": "Lovelace",
+                    "username": "ada",
+                    "email": "ada@example.com",
+                    "phone": "",
+                    "address": "",
+                    "linkedin": "",
+                    "github": "",
+                    "is_staff": True,
+                },
+            }
+        }
+        client = self._async_client_returning(resp_mock=resp)
+        with patch.object(chat_server.httpx, "AsyncClient", return_value=client):
+            profile, is_staff = await chat_server._fetch_user_context("jh_test")
+        assert "First name: Ada" in profile
+        assert "Email: ada@example.com" in profile
+        # Empty fields are present as "(blank)" — load-bearing for the AW rule.
+        assert "Phone: (blank)" in profile
+        assert is_staff is True
+
+    @pytest.mark.asyncio
+    async def test_non_200_returns_degraded_tuple(self):
+        chat_server = importlib.import_module("mcp_servers.chat_server")
+        resp = MagicMock()
+        resp.status_code = 401
+        client = self._async_client_returning(resp_mock=resp)
+        with patch.object(chat_server.httpx, "AsyncClient", return_value=client):
+            profile, is_staff = await chat_server._fetch_user_context("jh_test")
+        assert profile == "Could not load user profile."
+        assert is_staff is False
+
+    @pytest.mark.asyncio
+    async def test_httpx_error_propagates_to_caller(self):
+        chat_server = importlib.import_module("mcp_servers.chat_server")
+        client = self._async_client_returning(raises=httpx.ReadTimeout("simulated"))
+        with patch.object(chat_server.httpx, "AsyncClient", return_value=client):
+            with pytest.raises(httpx.HTTPError):
+                await chat_server._fetch_user_context("jh_test")
+
+    @pytest.mark.asyncio
+    async def test_hyphenated_is_staff_key_recognized(self):
+        """JSON:API serializers sometimes emit `is-staff` instead of
+        `is_staff`. Both must round-trip."""
+        chat_server = importlib.import_module("mcp_servers.chat_server")
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "data": {
+                "id": "1",
+                "type": "user",
+                "attributes": {
+                    "first_name": "Grace",
+                    "last_name": "Hopper",
+                    "username": "ghopper",
+                    "email": "grace@example.com",
+                    "is-staff": True,
+                },
+            }
+        }
+        client = self._async_client_returning(resp_mock=resp)
+        with patch.object(chat_server.httpx, "AsyncClient", return_value=client):
+            _, is_staff = await chat_server._fetch_user_context("jh_test")
+        assert is_staff is True
+
+
+class TestChatEndpointEmitsRunErrorOnFetchFailure:
+    """When `_fetch_user_context` raises httpx.HTTPError, the /chat
+    StreamingResponse must emit a RunErrorEvent — NOT end the SSE stream
+    silently with zero events.
+
+    Pre-fix, an httpx.ReadTimeout on /me/ killed the generator before any
+    yield, so the frontend saw `done=true` with empty `accumulated` and
+    rendered the bare "(no response from agent)" fallback. Regression
+    coverage for the parent todo "chat_server httpx.ReadTimeout on api v1
+    me — root cause for no-response fallback".
+    """
+
+    def test_run_error_event_emitted_on_fetch_timeout(self, monkeypatch):
+        from starlette.testclient import TestClient
+
+        chat_server = importlib.import_module("mcp_servers.chat_server")
+
+        async def _raising_fetch(_token):
+            raise httpx.ReadTimeout("simulated")
+
+        monkeypatch.setattr(chat_server, "_fetch_user_context", _raising_fetch)
+
+        client = TestClient(chat_server.app)
+        response = client.post(
+            "/chat",
+            json={"message": "hello", "token": "jh_test"},
+        )
+
+        assert response.status_code == 200
+        body = response.text
+        # The user-facing message is the actionable string from event_stream.
+        # The frontend reads SSE events as `data: {json}` lines; assert on
+        # the substring to stay tolerant of the ag_ui encoder's exact shape.
+        assert "try again" in body.lower()
+        # No content events — the stream errored out before the agent ran.
+        assert "TEXT_MESSAGE_CONTENT" not in body
