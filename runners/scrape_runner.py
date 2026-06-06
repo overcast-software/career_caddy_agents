@@ -124,6 +124,16 @@ async def process_scrape(api: ApiClient, scrape: dict) -> bool:
     attrs = scrape.get("attributes", {})
     url = attrs.get("url")
     skip_extract = bool(attrs.get("skip_extract"))
+    # Phase B — Extension direct-POST plan. The api's claim-next response
+    # serializes both source_mode (CharField, default 'browser') and
+    # captured_payload (JSONField, nullable). When source_mode is
+    # 'extension-direct' and the payload is present, the scrape-graph's
+    # StartScrape node branches to SkipBrowserTier so no browser-tier
+    # node ever runs. The Phase-A api-side validator already enforced
+    # title/company/description presence at write time; the graph
+    # double-checks defensively before branching.
+    source_mode = attrs.get("source_mode") or "browser"
+    captured_payload = attrs.get("captured_payload")
 
     if not url:
         logger.warning("Scrape %s has no URL, skipping", scrape_id)
@@ -135,7 +145,10 @@ async def process_scrape(api: ApiClient, scrape: dict) -> bool:
         logger.info("Scrape %s: unwrapped tracker URL\n  from: %s\n  to:   %s", scrape_id, url, unwrapped)
         url = unwrapped
 
-    logger.info("Processing scrape %s: %s", scrape_id, url)
+    logger.info(
+        "Processing scrape %s: %s (source_mode=%s)",
+        scrape_id, url, source_mode,
+    )
 
     hostname = _parse_hostname(url)
     profile = await _fetch_profile(api, hostname)
@@ -145,7 +158,10 @@ async def process_scrape(api: ApiClient, scrape: dict) -> bool:
         logger.info("Scrape %s: no profile for %s", scrape_id, hostname)
 
     await update_scrape(api, scrape_id, status="running", note="Poller picked up")
-    return await _run_graph(api, scrape_id, url, hostname, profile, skip_extract)
+    return await _run_graph(
+        api, scrape_id, url, hostname, profile, skip_extract,
+        source_mode=source_mode, captured_payload=captured_payload,
+    )
 
 
 async def _run_graph(
@@ -155,6 +171,9 @@ async def _run_graph(
     hostname: str,
     profile: dict | None,
     skip_extract: bool = False,
+    *,
+    source_mode: str = "browser",
+    captured_payload: dict | None = None,
 ) -> bool:
     """Run the pydantic-graph against a live Playwright page."""
     from scrape_graph import ScrapeGraphState
@@ -175,6 +194,8 @@ async def _run_graph(
         profile=css_selectors,
         source="poller",
         skip_extract=skip_extract,
+        source_mode=source_mode,
+        captured_payload=captured_payload,
     )
 
     # Hard cap on a single graph run. Without this, a node that hangs
@@ -186,6 +207,15 @@ async def _run_graph(
     GRAPH_RUN_TIMEOUT_S = 240.0
 
     async def _drive() -> None:
+        # Phase B fast-path: extension-direct scrapes never need a
+        # browser page — StartScrape branches to SkipBrowserTier and the
+        # graph runs persistence only. Skip the entire browser launch
+        # so a Camoufox/Chromium process is never spawned for these
+        # scrapes. has_browser=True keeps the entry at StartScrape (the
+        # extract-only graph would skip past StartScrape entirely).
+        if source_mode == "extension-direct":
+            await run_scrape_graph(state, browser_page=None, has_browser=True)
+            return
         if _RESIDENT is not None:
             page = await _RESIDENT.open_tab(domain=hostname, seed_cookies=cookies)
             try:

@@ -90,6 +90,10 @@ class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):
     pass
 
 
+class SkipBrowserTier(BaseNode[ScrapeGraphState, None, dict]):
+    pass
+
+
 # Obstacle-side forward refs live in nodes_obstacle; import at run time.
 
 
@@ -169,15 +173,69 @@ def _api_headers() -> dict[str, str]:
 # Real node implementations. Each class shadows the forward-ref stub above.
 # ---------------------------------------------------------------------------
 
+_EXTENSION_DIRECT_REQUIRED_FIELDS = ("title", "company", "description")
+
+
+def _captured_payload_is_complete(payload) -> bool:
+    """Mirror of api-side ScrapeSerializer's extension-direct gate
+    (validate_scrape_source_mode_payload). Returns True when the payload
+    is a dict whose required fields (title / company / description) are
+    each non-empty strings.
+
+    Defense-in-depth: Phase A's serializer rejects an incomplete payload
+    at write time, so a claimed source_mode='extension-direct' Scrape
+    should always satisfy this check. The guard exists for the case
+    where the api gate regresses or a hand-rolled curl sneaks past it —
+    we route to ExtractFail rather than silently degrading to the
+    browser tier (which would defeat the whole point of source_mode).
+    """
+    if not isinstance(payload, dict):
+        return False
+    for field_name in _EXTENSION_DIRECT_REQUIRED_FIELDS:
+        value = payload.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            return False
+    return True
+
+
 @dataclass
 class StartScrape(BaseNode[ScrapeGraphState, None, dict]):
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> LoadProfile:
+    ) -> Union[LoadProfile, "SkipBrowserTier", "ExtractFail"]:  # noqa: F821 — ExtractFail resolved via graph.py namespace
         started = time.time()
         state = ctx.state
         if not state.original_scrape_id:
             state.original_scrape_id = state.scrape_id
+        if state.source_mode == "extension-direct":
+            if _captured_payload_is_complete(state.captured_payload):
+                trace_node(
+                    state, "StartScrape", "SkipBrowserTier", started,
+                    {"source_mode": state.source_mode, "fast_path": True},
+                )
+                return SkipBrowserTier()
+            # Defensive bail — incomplete payload on a claimed extension-direct
+            # scrape means the api-side validator regressed. We refuse to
+            # silently degrade to the browser tier because the user already
+            # rendered the page and the extension promised the payload; if
+            # we re-fetch with Camoufox we may land on an auth wall or
+            # different content, polluting the JobPost. ExtractFail
+            # produces a debug artifact + leaves the scrape in
+            # status='failed' for operator inspection.
+            from . import nodes_extract
+            state.failure_reason = (
+                "extension-direct: captured_payload missing required "
+                "title/company/description"
+            )
+            trace_node(
+                state, "StartScrape", "ExtractFail", started,
+                {
+                    "source_mode": state.source_mode,
+                    "payload_present": state.captured_payload is not None,
+                    "reason": "incomplete_captured_payload",
+                },
+            )
+            return nodes_extract.ExtractFail()
         trace_node(state, "StartScrape", "LoadProfile", started)
         return LoadProfile()
 
@@ -1198,6 +1256,114 @@ class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
         return nodes_extract.StartExtract()
 
 
+@dataclass
+class SkipBrowserTier(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
+    """Fast-path entry for source_mode='extension-direct' scrapes.
+
+    The extension content-script already extracted title + company +
+    description from the user-rendered DOM (and optionally apply_url +
+    location + extraction_hints). This node copies those fields onto
+    state.parsed (the ParsedJobData shape PersistJobPost POSTs to the
+    api's /persist-extraction/ endpoint) so the dedupe-first invariant
+    is preserved — the api's JobPostExtractor.parse_scrape still owns
+    canonical_link / fingerprint / sticky-closed handling. No browser
+    tier nodes run.
+
+    Routing — per the canonical plan ("Calls ResolveApplyUrl ONLY if
+    captured_payload.apply_url is null"):
+    - apply_url present in payload → route to PersistJobPost directly
+      (the apply_url rides through as parsed['link'], and the JobPost's
+      apply_url column is populated by ParsedJobData persistence).
+    - apply_url null → route to ResolveApplyUrl, which on the fast path
+      no-ops (no browser page) and chains into PersistJobPost so the
+      JobPost still lands.
+
+    PATCHes /scrapes/:id/ to status='extracting' before routing so the
+    state machine matches the browser-tier path's transition into the
+    persistence phase.
+    """
+
+    async def run(
+        self, ctx: GraphRunContext[ScrapeGraphState, None]
+    ) -> "Union[PersistJobPost, ResolveApplyUrl]":  # noqa: F821 — resolved via graph.py namespace
+        from . import nodes_extract
+        started = time.time()
+        state = ctx.state
+        payload = state.captured_payload or {}
+
+        # Map captured_payload → ParsedJobData. The api's ParsedJobData
+        # uses company_name / link / description; the extension's
+        # payload uses company / apply_url for clarity. Translate here
+        # so persist-extraction never sees the extension's vocabulary.
+        parsed: dict = {
+            "title": (payload.get("title") or "").strip(),
+            "company_name": (payload.get("company") or "").strip(),
+            "description": (payload.get("description") or "").strip(),
+        }
+        if payload.get("location"):
+            parsed["location"] = payload["location"]
+        apply_url = payload.get("apply_url")
+        if apply_url:
+            # ParsedJobData stores the apply destination under `link`.
+            parsed["link"] = apply_url
+        state.parsed = parsed
+
+        # PATCH the scrape status to 'extracting' so the row reflects
+        # progress past the (skipped) capture phase. Mirrors what
+        # PersistScrape does for the browser-tier path; the status
+        # state machine still expects this transition before
+        # /persist-extraction/ writes the JobPost.
+        try:
+            httpx.patch(
+                f"{_api_base()}/api/v1/scrapes/{state.scrape_id}/",
+                json={
+                    "data": {
+                        "type": "scrape",
+                        "id": str(state.scrape_id),
+                        "attributes": {
+                            "status": "extracting",
+                            "note": (
+                                "extension-direct fast path: captured "
+                                f"{len(parsed.get('description') or '')} desc chars"
+                            ),
+                        },
+                    }
+                },
+                headers={**_api_headers(), "Content-Type": "application/json"},
+                timeout=15.0,
+            )
+        except Exception:
+            logger.warning(
+                "SkipBrowserTier: status PATCH failed scrape_id=%s",
+                state.scrape_id, exc_info=True,
+            )
+
+        # Branch: apply_url known → straight to PersistJobPost.
+        # apply_url null → ResolveApplyUrl (which on fast path no-ops
+        # because there's no browser page, then chains to PersistJobPost).
+        if apply_url:
+            trace_node(
+                state, "SkipBrowserTier", "PersistJobPost", started,
+                {
+                    "source_mode": state.source_mode,
+                    "payload_fields": sorted(payload.keys()),
+                    "apply_url_present": True,
+                    "routed_through_resolve_apply": False,
+                },
+            )
+            return nodes_extract.PersistJobPost()
+        trace_node(
+            state, "SkipBrowserTier", "ResolveApplyUrl", started,
+            {
+                "source_mode": state.source_mode,
+                "payload_fields": sorted(payload.keys()),
+                "apply_url_present": False,
+                "routed_through_resolve_apply": True,
+            },
+        )
+        return nodes_extract.ResolveApplyUrl()
+
+
 def _patch_scrape_status(scrape_id: int, status: str, note: str | None = None) -> None:
     """Helper used by terminal nodes to close out the scrape row with
     the frontend-visible status the poller-polling UI watches for
@@ -1237,4 +1403,5 @@ __all__ = [
     "ExpandTruncations",
     "Capture",
     "PersistScrape",
+    "SkipBrowserTier",
 ]

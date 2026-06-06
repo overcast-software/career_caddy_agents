@@ -80,6 +80,27 @@ class ScrapeGraphState:
     # leaves extraction to a future explicit pass. Loaded from the
     # Scrape's `skip_extract` attribute by the hold-poller.
     skip_extract: bool = False
+    # Phase B — Extension direct-POST plan. How this scrape was captured.
+    # "browser" (default) → full scrape sub-graph (Navigate → Capture → …).
+    # "extension-direct" → the extension content-script already extracted
+    # title + company + description from the user-rendered DOM and POSTed
+    # them via `captured_payload`. StartScrape branches to SkipBrowserTier
+    # so no browser-tier node ever runs.
+    source_mode: str = "browser"
+    # Phase B — Extension direct-POST plan. Set by the runner from the
+    # claimed Scrape attribute when source_mode='extension-direct'. Shape
+    # is the Phase-A contract enforced by ScrapeSerializer:
+    #     {
+    #       "title": str,            # required, non-empty
+    #       "company": str,          # required, non-empty
+    #       "description": str,      # required, non-empty
+    #       "apply_url": str | None, # optional
+    #       "location": str | None,  # optional
+    #       "extraction_hints": dict | None,  # optional
+    #     }
+    # SkipBrowserTier maps these fields onto state.parsed (ParsedJobData
+    # shape) and feeds them to PersistJobPost.
+    captured_payload: Optional[dict] = None
 
     # URL resolution
     final_url: Optional[str] = None

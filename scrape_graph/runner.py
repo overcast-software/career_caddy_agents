@@ -25,12 +25,25 @@ async def run_scrape_graph(
     When browser_page is None (or has_browser=False) we skip the scrape
     sub-graph and enter at StartExtract. The scrape nodes access the
     page via state (set by the caller prior to run_scrape_graph).
+
+    Exception — Phase B extension-direct fast path: when
+    state.source_mode='extension-direct', enter at StartScrape even
+    without a browser page so the StartScrape gate can branch to
+    SkipBrowserTier. The fast path needs no browser; routing it through
+    StartExtract would run the tier nodes against an empty job_content
+    and fail validation.
     """
     # Attach browser page so nodes_scrape can reach it via state attr.
     state._browser_page = browser_page  # type: ignore[attr-defined]
     state._has_browser = has_browser  # type: ignore[attr-defined]
 
-    if not has_browser or browser_page is None:
+    fast_path = state.source_mode == "extension-direct"
+
+    if fast_path:
+        graph = build_scrape_graph()
+        from .nodes_scrape import StartScrape
+        entry = StartScrape()
+    elif not has_browser or browser_page is None:
         graph = build_extract_graph()
         from .nodes_extract import StartExtract
         entry = StartExtract()
