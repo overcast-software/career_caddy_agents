@@ -396,7 +396,8 @@ class ValidateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
 class PersistJobPost(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> Union[ReviewCompleteness, ExtractFail]:
+    ) -> Union[ReviewCompleteness, ExtractFail, End[dict]]:
+        from .nodes_scrape import _patch_scrape_status
         started = time.time()
         state = ctx.state
         try:
@@ -414,6 +415,36 @@ class PersistJobPost(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no
             logger.warning("PersistJobPost: post failed", exc_info=True)
             trace_node(state, "PersistJobPost", "ExtractFail", started)
             return ExtractFail()
+        # Fast-path terminal: extension-direct scrapes skip the
+        # ReviewCompleteness → UpdateProfile → ResolveApplyUrl tail,
+        # because UpdateProfile probes browser-tier selector candidates
+        # (none on this path) and ResolveApplyUrl needs a browser page
+        # (we already ran it as a no-op upstream when apply_url was
+        # null). Close the scrape row and End.
+        if state.source_mode == "extension-direct":
+            state.outcome = (
+                "duplicate" if state.was_duplicate else "success"
+            )
+            note = (
+                f"extension-direct: job_post {state.job_post_id}"
+                if state.job_post_id
+                else "extension-direct: persisted"
+            )
+            _patch_scrape_status(state.scrape_id, "completed", note=note)
+            trace_node(
+                state, "PersistJobPost", "End", started,
+                payload={
+                    "outcome": state.outcome,
+                    "fast_path": True,
+                    "job_post_id": state.job_post_id,
+                },
+            )
+            return End({
+                "outcome": state.outcome,
+                "job_post_id": state.job_post_id,
+                "scrape_id": state.scrape_id,
+                "fast_path": True,
+            })
         trace_node(state, "PersistJobPost", "ReviewCompleteness", started)
         return ReviewCompleteness()
 
@@ -670,13 +701,18 @@ class ResolveApplyUrl(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[n
     posting's "Apply" button). Reads ``profile.apply_resolver_config``
     and tries internal markers → link selectors → button selectors. The
     result PATCHes ``/scrapes/{id}/apply-url/`` which writes through to
-    the JobPost. Always terminates the graph with End — apply
-    resolution is best-effort, never a hard failure.
+    the JobPost.
+
+    Routing: on the browser-tier path (default), terminates the graph
+    with End. On the extension-direct fast path (source_mode=
+    'extension-direct'), routes to PersistJobPost instead — apply_url
+    is null in the payload so we resolve it best-effort first, then
+    persist the JobPost. No-op when state._browser_page is None.
     """
 
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> End[dict]:
+    ) -> Union[End[dict], PersistJobPost]:
         from .nodes_scrape import _patch_scrape_status
         from .apply_resolver import resolve_apply_url, scan_apply_candidates
 
@@ -740,6 +776,22 @@ class ResolveApplyUrl(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[n
                     "ResolveApplyUrl PATCH errored scrape_id=%s",
                     state.scrape_id, exc_info=True,
                 )
+
+        # Fast-path branch: extension-direct scrapes route through
+        # ResolveApplyUrl (no-op when no browser page) on their way to
+        # PersistJobPost, which terminates the graph. Don't terminal-
+        # close the scrape here — PersistJobPost handles status closeout
+        # on the fast path.
+        if state.source_mode == "extension-direct":
+            trace_node(
+                state, "ResolveApplyUrl", "PersistJobPost", started,
+                payload={
+                    "apply_url_status": result.get("apply_url_status"),
+                    "reason": result.get("reason"),
+                    "fast_path": True,
+                },
+            )
+            return PersistJobPost()
 
         state.outcome = "success"
         note = (

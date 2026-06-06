@@ -44,6 +44,7 @@ from .nodes_scrape import (
     ResolveFinalUrl,
     ScrollToLoad,
     SettleWait,
+    SkipBrowserTier,
     StartScrape,
     WaitReadySelector,
 )
@@ -60,6 +61,7 @@ __all_nodes__ = (
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
     EvaluateExtraction, ValidateExtraction, PersistJobPost,
     ReviewCompleteness, UpdateProfile, ResolveApplyUrl, ExtractFail,
+    SkipBrowserTier,
 )
 
 
@@ -78,6 +80,7 @@ _SCRAPE_NODES = [
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
     EvaluateExtraction, ValidateExtraction, PersistJobPost,
     ReviewCompleteness, UpdateProfile, ResolveApplyUrl, ExtractFail,
+    SkipBrowserTier,
 ]
 _EXTRACT_NODES = [
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
@@ -243,6 +246,20 @@ NODE_META: dict[str, dict[str, str]] = {
             "PATCHes the scrape with job_content + html + "
             "status='extracting'. Marks the handoff from browser side "
             "to extract side."
+        ),
+    },
+    "SkipBrowserTier": {
+        "group": "scrape", "label": "Skip browser tier",
+        "description": (
+            "Fast-path entry for source_mode='extension-direct' scrapes. "
+            "The extension content-script already extracted title + "
+            "company + description from the user-rendered DOM; this "
+            "node copies those fields onto state.parsed (ParsedJobData "
+            "shape) and routes straight to PersistJobPost. Browser-tier "
+            "nodes (Navigate → Capture → Tier*) never run. When the "
+            "payload carries apply_url, routes directly to PersistJobPost; "
+            "otherwise routes through ResolveApplyUrl (no-op without a "
+            "browser page) and into PersistJobPost."
         ),
     },
     # Obstacle-side
