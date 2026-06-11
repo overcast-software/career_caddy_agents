@@ -146,3 +146,60 @@ class TestPublicServerSecurity:
         for line in code_lines:
             if "CC_API_TOKEN" in line and "os.environ" in line:
                 pytest.fail(f"Reads CC_API_TOKEN from env: {line.strip()}")
+
+
+class TestApiKeyTokenVerifierResilience:
+    """The verifier must NEVER leak exceptions as uvicorn 500. Any
+    crash (network failure, OOM mid-call, malformed upstream response)
+    has to degrade to a clean 401 by returning None.
+
+    See cc todo Inbox/Bug/mcp public_server returns 500 from uvicorn
+    on initialize with valid bearer — this test pins the contract that
+    incident exposed.
+    """
+
+    def _verifier(self):
+        from mcp_servers.public_server import ApiKeyTokenVerifier
+        return ApiKeyTokenVerifier(api_base_url="http://test-api")
+
+    def test_rejects_non_jh_prefix_without_calling_upstream(self):
+        """Cheap sanity check — short-circuit path returns None and
+        never touches httpx."""
+        result = asyncio.run(self._verifier().verify_token("not_a_jh_token"))
+        assert result is None
+
+    def test_upstream_network_failure_returns_none_not_raises(self):
+        from unittest.mock import patch
+        import httpx
+
+        class _ExplodingClient:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            async def get(self, *args, **kwargs):
+                raise httpx.ConnectError("simulated upstream down")
+
+        with patch("mcp_servers.public_server.httpx.AsyncClient", _ExplodingClient):
+            result = asyncio.run(self._verifier().verify_token("jh_test_token"))
+        assert result is None
+
+    def test_malformed_upstream_json_returns_none_not_raises(self):
+        from unittest.mock import patch
+
+        class _BadJsonResponse:
+            status_code = 200
+            def json(self):
+                raise ValueError("not json")
+
+        class _BadJsonClient:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            async def get(self, *args, **kwargs):
+                return _BadJsonResponse()
+
+        with patch("mcp_servers.public_server.httpx.AsyncClient", _BadJsonClient):
+            result = asyncio.run(self._verifier().verify_token("jh_test_token"))
+        assert result is None
