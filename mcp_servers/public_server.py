@@ -61,54 +61,65 @@ class ApiKeyTokenVerifier(TokenVerifier):
         if not token.startswith("jh_"):
             return None
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{self.api_base_url}/api/v1/me/",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "X-Forwarded-Proto": "https",
-                },
-            )
-            if resp.status_code != 200:
-                logger.warning(
-                    "Token verify upstream non-200: status=%s url=%s",
-                    resp.status_code,
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
                     f"{self.api_base_url}/api/v1/me/",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "X-Forwarded-Proto": "https",
+                    },
                 )
-                return None
+                if resp.status_code != 200:
+                    logger.warning(
+                        "Token verify upstream non-200: status=%s url=%s",
+                        resp.status_code,
+                        f"{self.api_base_url}/api/v1/me/",
+                    )
+                    return None
 
-            user_data = resp.json().get("data", resp.json())
-            user_id = user_data.get("id", "unknown")
-            # is_staff lives in the JSON:API resource's attributes; flat
-            # dicts (fallback) put it at the top level. The middleware
-            # filter that hides enhancer tools from non-staff sessions
-            # consults `claims["is_staff"]` directly so per-call code
-            # doesn't have to walk into attributes.
-            attrs = user_data.get("attributes") if isinstance(user_data, dict) else None
-            is_staff = bool(
-                (attrs or user_data or {}).get("is_staff")
-                if isinstance(user_data, dict)
-                else False
-            )
-            logger.info(
-                "Authenticated user_id=%s is_staff=%s via API key",
-                user_id, is_staff,
-            )
+                user_data = resp.json().get("data", resp.json())
+                user_id = user_data.get("id", "unknown")
+                # is_staff lives in the JSON:API resource's attributes; flat
+                # dicts (fallback) put it at the top level. The middleware
+                # filter that hides enhancer tools from non-staff sessions
+                # consults `claims["is_staff"]` directly so per-call code
+                # doesn't have to walk into attributes.
+                attrs = user_data.get("attributes") if isinstance(user_data, dict) else None
+                is_staff = bool(
+                    (attrs or user_data or {}).get("is_staff")
+                    if isinstance(user_data, dict)
+                    else False
+                )
+                logger.info(
+                    "Authenticated user_id=%s is_staff=%s via API key",
+                    user_id, is_staff,
+                )
 
-            # `scopes=["staff"]` mirrors the claim so future hooks can
-            # use either surface; FastMCP scope filtering is the more
-            # canonical channel even though we read claims today.
-            scopes = ["read", "write"] + (["staff"] if is_staff else [])
-            return AccessToken(
-                token=token,
-                client_id=str(user_id),
-                scopes=scopes,
-                claims={
-                    "user_id": user_id,
-                    "user": user_data,
-                    "is_staff": is_staff,
-                },
-            )
+                # `scopes=["staff"]` mirrors the claim so future hooks can
+                # use either surface; FastMCP scope filtering is the more
+                # canonical channel even though we read claims today.
+                scopes = ["read", "write"] + (["staff"] if is_staff else [])
+                return AccessToken(
+                    token=token,
+                    client_id=str(user_id),
+                    scopes=scopes,
+                    claims={
+                        "user_id": user_id,
+                        "user": user_data,
+                        "is_staff": is_staff,
+                    },
+                )
+        except Exception:
+            # Any verifier exception (httpx network failure, JSON parse,
+            # OOM-driven worker death mid-call, etc.) MUST NOT leak as
+            # uvicorn 500 — that pattern silently masks the underlying
+            # bug and shows up as "MCP broken" to clients. Logging here
+            # surfaces the real cause; returning None yields a clean 401
+            # with a proper WWW-Authenticate challenge so the client
+            # retries instead of giving up.
+            logger.exception("Verifier crashed; returning None → 401")
+            return None
 
 
 # ---------------------------------------------------------------------------
