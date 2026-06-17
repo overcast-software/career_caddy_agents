@@ -306,17 +306,24 @@ NODE_META: dict[str, dict[str, str]] = {
     "StartExtract": {
         "group": "extract", "label": "Start extract",
         "description": (
-            "Entry point for the extract-only sub-graph. Used by paste / "
-            "email / chat ingest, and by the full pipeline once "
-            "PersistScrape lands."
+            "Entry point for the extract sub-graph. Routes on the "
+            "per-host profile's preferred_tier so a known-good domain "
+            "enters at the tier it needs: '0'/'auto'/missing → Tier0CSS "
+            "($0 deterministic), '1' → Tier1Mini, '2' → Tier2Haiku, "
+            "'3' → Tier3Sonnet. Used by paste / email / chat ingest and "
+            "by the full pipeline after PersistScrape."
         ),
     },
     "Tier0CSS": {
         "group": "extract", "label": "Tier 0 CSS",
         "description": (
-            "Phase 1b placeholder: deferred to server-side parse_scrape "
-            "until the api ships /tier0-extract/. Records a soft skip and "
-            "lets Tier 1 handle it."
+            "Deterministic, $0 CSS extraction tier. When the profile "
+            "carries graduated css_selectors.job_data AND captured HTML "
+            "is present, parses title/company/description/location with "
+            "bs4 (no LLM); a complete parse routes to EvaluateExtraction, "
+            "a miss or absent job_data falls through to Tier1Mini so the "
+            "api learning loop can auto-demote preferred_tier after "
+            "sustained tier0 misses."
         ),
     },
     "Tier1Mini": {

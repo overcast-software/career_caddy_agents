@@ -9,12 +9,73 @@ primitives this file covers.
 from __future__ import annotations
 
 from lib.scrape_inspector import (
+    css_extract_job_data,
     derive_hostname,
     extract_skeleton,
     find_selectors_for_text,
     query_selector,
     trim_html,
 )
+
+
+_JOB_PAGE_HTML = """
+<html><body>
+  <h1 class="job-title">Senior Backend Engineer</h1>
+  <div class="company-name">Acme Corp</div>
+  <section class="job-description">
+    We are looking for a backend engineer with 5+ years of experience
+    building distributed systems. Responsibilities include API design.
+  </section>
+  <span class="job-location">Remote — US</span>
+  <script>var x = 1;</script>
+</body></html>
+"""
+
+
+def test_css_extract_job_data_full_parse():
+    out = css_extract_job_data(
+        _JOB_PAGE_HTML,
+        {
+            "title": "h1.job-title",
+            "company_name": ".company-name",
+            "description": ".job-description",
+            "location": ".job-location",
+        },
+    )
+    assert out["title"] == "Senior Backend Engineer"
+    assert out["company_name"] == "Acme Corp"
+    assert out["description"].startswith("We are looking for a backend engineer")
+    assert out["location"] == "Remote — US"
+
+
+def test_css_extract_job_data_company_alias():
+    """job_data authored with the extension's 'company' key still maps to
+    the ParsedJobData 'company_name' field."""
+    out = css_extract_job_data(
+        _JOB_PAGE_HTML, {"company": ".company-name"},
+    )
+    assert out["company_name"] == "Acme Corp"
+
+
+def test_css_extract_job_data_missing_selector_yields_empty():
+    out = css_extract_job_data(
+        _JOB_PAGE_HTML,
+        {"title": "h1.job-title", "description": ".does-not-exist"},
+    )
+    assert out["title"] == "Senior Backend Engineer"
+    assert out["description"] == ""
+    assert out["company_name"] == ""  # key absent → empty, no crash
+
+
+def test_css_extract_job_data_bad_selector_does_not_crash():
+    # Playwright-only pseudo-class is invalid CSS3 → field stays empty.
+    out = css_extract_job_data(_JOB_PAGE_HTML, {"title": "h1:has-text('x')"})
+    assert out["title"] == ""
+
+
+def test_css_extract_job_data_empty_inputs():
+    assert css_extract_job_data("", {"title": "h1"})["title"] == ""
+    assert css_extract_job_data(_JOB_PAGE_HTML, None)["title"] == ""
 
 
 # A trimmed-down LinkedIn-shaped page that exercises the noise-strip
