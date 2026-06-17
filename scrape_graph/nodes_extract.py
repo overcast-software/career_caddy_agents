@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic_graph import BaseNode, End, GraphRunContext
 
+from lib.scrape_inspector import css_extract_job_data
 from .state import ScrapeGraphState, TierAttempt
 from .tracing import trace_node
 
@@ -95,6 +96,38 @@ def _call_llm_extract(
     return parsed_dict
 
 
+def _preferred_tier(state: ScrapeGraphState) -> str:
+    """Normalized per-host extract entry tier from the loaded profile.
+
+    Returns one of ``'0'/'1'/'2'/'3'/'auto'``. The api stores
+    ``ScrapeProfile.preferred_tier`` as a top-level attribute (an int
+    tier or the string ``'auto'``); LoadProfile surfaces it on
+    ``state.profile``. We coerce to a comparable lowercased string and
+    default to ``'auto'`` for a missing / unrecognized value so it lands
+    on the Tier0→Tier1 ladder.
+    """
+    profile = state.profile if isinstance(state.profile, dict) else {}
+    raw = profile.get("preferred_tier")
+    if raw is None:
+        return "auto"
+    val = str(raw).strip().lower()
+    return val if val in ("0", "1", "2", "3", "auto") else "auto"
+
+
+def _profile_job_data(state: ScrapeGraphState) -> dict:
+    """The per-host ``css_selectors.job_data`` selector map, or ``{}``.
+
+    LoadProfile flattens the ``css_selectors`` JSONB blob onto
+    ``state.profile``, so the discovered job_data selectors live at
+    ``state.profile['job_data']`` (the same access pattern
+    DetectClosedState / _discover_selectors use). Returns ``{}`` when the
+    map is absent or malformed.
+    """
+    profile = state.profile if isinstance(state.profile, dict) else {}
+    job_data = profile.get("job_data")
+    return job_data if isinstance(job_data, dict) and job_data else {}
+
+
 # Forward refs
 class Tier0CSS(BaseNode[ScrapeGraphState, None, dict]):
     pass
@@ -142,27 +175,100 @@ class ExtractFail(BaseNode[ScrapeGraphState, None, dict]):
 
 @dataclass
 class StartExtract(BaseNode[ScrapeGraphState, None, dict]):
+    """Entry point for the extract sub-graph. Routes on the per-host
+    profile's ``preferred_tier`` so a domain the learning loop already
+    knows enters at the tier it needs instead of always paying the
+    Tier0→Tier1 ladder:
+
+        '0' / 'auto' / missing → Tier0CSS  (deterministic CSS, $0)
+        '1'                    → Tier1Mini  (gpt-4o-mini)
+        '2'                    → Tier2Haiku (claude-haiku)
+        '3'                    → Tier3Sonnet (claude-sonnet)
+
+    A higher pin only skips the *cheaper* tiers on entry; escalation
+    above the entry tier still flows through EvaluateExtraction's gates.
+    """
+
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> Tier0CSS:
+    ) -> Union[Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet]:
         started = time.time()
-        trace_node(ctx.state, "StartExtract", "Tier0CSS", started)
-        return Tier0CSS()
+        state = ctx.state
+        tier = _preferred_tier(state)
+        routes = {
+            "1": ("Tier1Mini", Tier1Mini),
+            "2": ("Tier2Haiku", Tier2Haiku),
+            "3": ("Tier3Sonnet", Tier3Sonnet),
+        }
+        target_name, target_cls = routes.get(tier, ("Tier0CSS", Tier0CSS))
+        trace_node(
+            state, "StartExtract", target_name, started,
+            {"preferred_tier": tier},
+        )
+        return target_cls()
 
 
 @dataclass
 class Tier0CSS(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
+    """Deterministic, $0 CSS extraction tier.
+
+    When the per-host profile carries graduated ``css_selectors.job_data``
+    selectors AND the captured HTML is present, parse the four core
+    fields with bs4 (``lib.scrape_inspector``) — no LLM, no cost. A
+    complete parse (title + company + description) records a tier0 hit
+    and hands straight to EvaluateExtraction. A miss (selectors present
+    but the parse came up short) or an absent ``job_data`` map records
+    ``produced_output=False`` and falls through to Tier1Mini, so the api
+    update-from-outcome loop can auto-demote ``preferred_tier`` after
+    sustained tier0 misses rather than hard-failing the scrape.
+    """
+
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> Tier1Mini:
-        # Phase 1b: Tier0 is still done server-side via legacy
-        # parse_scrape; graph skips it and lets Tier1 start. Replace
-        # when the api's /tier0-extract/ endpoint ships.
+    ) -> Union[Tier1Mini, EvaluateExtraction]:
         started = time.time()
-        ctx.state.tier_attempts.append(
+        state = ctx.state
+        job_data = _profile_job_data(state)
+        html = state.html or ""
+
+        if job_data and html:
+            parsed = css_extract_job_data(html, job_data)
+            title = (parsed.get("title") or "").strip()
+            company = (parsed.get("company_name") or "").strip()
+            description = (parsed.get("description") or "").strip()
+            if title and company and description:
+                state.parsed = parsed
+                state.tier_attempts.append(
+                    TierAttempt(
+                        tier="tier0", model=None,
+                        cost_usd=0.0, produced_output=True,
+                    )
+                )
+                trace_node(
+                    state, "Tier0CSS", "EvaluateExtraction", started,
+                    {"fields": sorted(k for k, v in parsed.items() if v)},
+                )
+                return EvaluateExtraction()
+            # Selectors present but the parse came up short — record the
+            # miss so UpdateProfile reports tier0_hit=False and the api
+            # learning loop can demote preferred_tier after enough misses.
+            state.tier_attempts.append(
+                TierAttempt(
+                    tier="tier0", model=None,
+                    cost_usd=0.0, produced_output=False,
+                )
+            )
+            trace_node(
+                state, "Tier0CSS", "Tier1Mini", started, {"tier0_miss": True},
+            )
+            return Tier1Mini()
+
+        # No job_data selectors (or no captured HTML) — preserve the
+        # Phase-1b skeleton behavior: soft skip, let Tier1 handle it.
+        state.tier_attempts.append(
             TierAttempt(tier="tier0", produced_output=False, model=None)
         )
-        trace_node(ctx.state, "Tier0CSS", "Tier1Mini", started)
+        trace_node(state, "Tier0CSS", "Tier1Mini", started)
         return Tier1Mini()
 
 

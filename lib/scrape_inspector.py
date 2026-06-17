@@ -231,6 +231,66 @@ def query_selector(
     }
 
 
+# ParsedJobData field → the css_selectors.job_data keys that can supply
+# it. Selector discovery (browser_server._discover_job_selectors) keys
+# the company field as "company_name"; the browser extension's
+# captured_payload keys it as "company". Accept either so a profile
+# authored by either side resolves to the ParsedJobData "company_name"
+# the extract tiers read.
+_JOB_DATA_FIELD_SOURCES: dict[str, tuple[str, ...]] = {
+    "title": ("title",),
+    "company_name": ("company_name", "company"),
+    "description": ("description",),
+    "location": ("location",),
+}
+
+
+def css_extract_job_data(html: str, selectors: dict) -> dict:
+    """Deterministically extract job fields from `html` using a per-host
+    ``css_selectors.job_data`` selector map (field name → CSS3 selector).
+
+    Returns a dict in ParsedJobData vocabulary —
+    ``{"title", "company_name", "description", "location"}`` — where each
+    value is the collapsed visible text of the first matching element, or
+    ``""`` when the selector key is absent or matches nothing.
+
+    This is the Tier-0 ($0, no-LLM) extraction primitive: when a domain's
+    profile already carries graduated ``job_data`` selectors, the
+    scrape-graph parses the captured HTML here instead of paying for an
+    LLM tier.
+
+    Pure function over a string of HTML — no network, no Playwright. CSS3
+    only (BS4 ``.select_one``), the same dialect the browser extension
+    used to discover these selectors; Playwright pseudo-classes such as
+    ``:has-text()`` are unsupported and raise, in which case that field
+    yields ``""`` rather than crashing the caller.
+    """
+    out = {"title": "", "company_name": "", "description": "", "location": ""}
+    if not html or not isinstance(selectors, dict):
+        return out
+    soup = BeautifulSoup(html, "html.parser")
+    _strip_noise(soup)
+    for field, source_keys in _JOB_DATA_FIELD_SOURCES.items():
+        selector = next(
+            (
+                selectors[k]
+                for k in source_keys
+                if isinstance(selectors.get(k), str) and selectors[k].strip()
+            ),
+            None,
+        )
+        if not selector:
+            continue
+        try:
+            match = soup.select_one(selector)
+        except Exception:
+            # Bad/Playwright-only selector — skip the field, don't crash.
+            continue
+        if match is not None:
+            out[field] = " ".join(match.get_text(" ", strip=True).split())
+    return out
+
+
 def _selector_candidates_for(tag: Tag) -> Iterable[tuple[int, str]]:
     """Yield (stability_score, selector) pairs anchoring `tag`.
 
