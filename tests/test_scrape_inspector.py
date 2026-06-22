@@ -13,6 +13,7 @@ from lib.scrape_inspector import (
     derive_hostname,
     extract_skeleton,
     find_selectors_for_text,
+    jsonld_extract_job_data,
     query_selector,
     trim_html,
 )
@@ -250,6 +251,238 @@ def test_find_selectors_dedupes_across_multiple_hits():
     result = find_selectors_for_text(html, "About the job")
     selectors = [c["selector"] for c in result["candidates"]]
     assert len(selectors) == len(set(selectors)), "selectors must be unique"
+
+
+# --- jsonld_extract_job_data --------------------------------------------------
+
+
+# NEOGOV / governmentjobs.com emits a full schema.org JobPosting node.
+# `description` is HTML (here with literal tags) to exercise the
+# tag-stripping; `baseSalary` is annual; `jobLocation.address` is a
+# PostalAddress with locality + region.
+_NEOGOV_JSONLD_HTML = """
+<html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "JobPosting",
+  "title": "Civil Engineer II",
+  "description": "<p>The City seeks a <strong>Civil Engineer</strong>.</p><ul><li>Design roadways</li><li>Review plans</li></ul>",
+  "datePosted": "2026-06-18",
+  "hiringOrganization": {"@type": "Organization", "name": "City of Springfield"},
+  "jobLocation": {
+    "@type": "Place",
+    "address": {
+      "@type": "PostalAddress",
+      "addressLocality": "Springfield",
+      "addressRegion": "IL",
+      "addressCountry": "US"
+    }
+  },
+  "baseSalary": {
+    "@type": "MonetaryAmount",
+    "currency": "USD",
+    "value": {
+      "@type": "QuantitativeValue",
+      "minValue": 78000,
+      "maxValue": 96000,
+      "unitText": "YEAR"
+    }
+  }
+}
+</script>
+</head><body><h1>Civil Engineer II</h1></body></html>
+"""
+
+
+def test_jsonld_extract_full_neogov_posting():
+    out = jsonld_extract_job_data(_NEOGOV_JSONLD_HTML)
+    assert out["title"] == "Civil Engineer II"
+    assert out["company_name"] == "City of Springfield"
+    # HTML stripped to plain text, list items kept as text.
+    assert out["description"].startswith("The City seeks a Civil Engineer")
+    assert "Design roadways" in out["description"]
+    assert "<p>" not in out["description"] and "<li>" not in out["description"]
+    assert out["location"] == "Springfield, IL"
+    assert out["salary_min"] == 78000
+    assert out["salary_max"] == 96000
+    assert out["posted_date"] == "2026-06-18"
+
+
+_GRAPH_WRAPPED_HTML = """
+<html><head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {"@type": "WebSite", "name": "Acme Careers", "url": "https://acme.com"},
+    {"@type": "BreadcrumbList", "itemListElement": []},
+    {
+      "@type": "JobPosting",
+      "title": "Staff Platform Engineer",
+      "description": "Own the platform.",
+      "hiringOrganization": {"@type": "Organization", "name": "Acme Corp"},
+      "jobLocation": {"address": {"addressLocality": "Austin", "addressRegion": "TX"}}
+    }
+  ]
+}
+</script>
+</head><body></body></html>
+"""
+
+
+def test_jsonld_extract_handles_graph_wrapper():
+    out = jsonld_extract_job_data(_GRAPH_WRAPPED_HTML)
+    assert out["title"] == "Staff Platform Engineer"
+    assert out["company_name"] == "Acme Corp"
+    assert out["location"] == "Austin, TX"
+
+
+_MULTI_BLOCK_HTML = """
+<html><head>
+<script type="application/ld+json">
+{"@context": "https://schema.org", "@type": "BreadcrumbList", "itemListElement": []}
+</script>
+<script type="application/ld+json">
+{"@context": "https://schema.org", "@type": "Organization", "name": "Not A Job"}
+</script>
+<script type="application/ld+json">
+[
+  {"@type": "WebPage", "name": "irrelevant"},
+  {
+    "@type": ["JobPosting", "WebPage"],
+    "title": "Data Analyst",
+    "description": "Crunch numbers all day in a great team.",
+    "hiringOrganization": "Globex"
+  }
+]
+</script>
+</head><body></body></html>
+"""
+
+
+def test_jsonld_extract_picks_jobposting_among_many_blocks():
+    """Only one of several ld+json blocks is a JobPosting; its @type is a
+    list and hiringOrganization is a bare string."""
+    out = jsonld_extract_job_data(_MULTI_BLOCK_HTML)
+    assert out["title"] == "Data Analyst"
+    assert out["company_name"] == "Globex"
+    assert out["description"].startswith("Crunch numbers")
+
+
+def test_jsonld_extract_malformed_block_returns_empty_no_raise():
+    """A truncated / invalid JSON block must not raise — return {}."""
+    html = (
+        '<html><head>'
+        '<script type="application/ld+json">{ "@type": "JobPosting", "title": </script>'
+        '</head><body></body></html>'
+    )
+    assert jsonld_extract_job_data(html) == {}
+
+
+def test_jsonld_extract_skips_bad_block_uses_valid_one():
+    """A malformed block ahead of a valid JobPosting block is skipped, not
+    fatal — the scanner keeps going."""
+    html = (
+        '<html><head>'
+        '<script type="application/ld+json">{bad json</script>'
+        '<script type="application/ld+json">'
+        '{"@type": "JobPosting", "title": "QA Engineer",'
+        ' "description": "Break things professionally for a living.",'
+        ' "hiringOrganization": {"name": "Initech"}}'
+        '</script>'
+        '</head><body></body></html>'
+    )
+    out = jsonld_extract_job_data(html)
+    assert out["title"] == "QA Engineer"
+    assert out["company_name"] == "Initech"
+
+
+def test_jsonld_extract_no_jobposting_returns_empty():
+    html = (
+        '<html><head>'
+        '<script type="application/ld+json">'
+        '{"@type": "Organization", "name": "Acme"}</script>'
+        '</head><body></body></html>'
+    )
+    assert jsonld_extract_job_data(html) == {}
+
+
+def test_jsonld_extract_no_script_returns_empty():
+    assert jsonld_extract_job_data("<html><body><h1>Job</h1></body></html>") == {}
+
+
+def test_jsonld_extract_empty_input_returns_empty():
+    assert jsonld_extract_job_data("") == {}
+    assert jsonld_extract_job_data(None) == {}  # type: ignore[arg-type]
+
+
+def test_jsonld_extract_partial_node_returns_partial():
+    """A JobPosting with only a title still returns a dict (the core keys
+    present, missing ones empty) — partial, not {} — so the Tier-0 gate
+    can decide it's incomplete and fall through."""
+    html = (
+        '<html><head>'
+        '<script type="application/ld+json">'
+        '{"@type": "JobPosting", "title": "Lonely Title"}</script>'
+        '</head><body></body></html>'
+    )
+    out = jsonld_extract_job_data(html)
+    assert out["title"] == "Lonely Title"
+    assert out["company_name"] == ""
+    assert out["description"] == ""
+    assert out["location"] == ""
+    assert "salary_min" not in out
+
+
+def test_jsonld_extract_hourly_salary_is_dropped():
+    """JobPostData.salary_min/max are annual integers with no unit — an
+    hourly baseSalary must NOT be mapped (would read as a $42 salary)."""
+    html = (
+        '<html><head>'
+        '<script type="application/ld+json">'
+        '{"@type": "JobPosting", "title": "Barista",'
+        ' "description": "Make coffee and smile at the customers.",'
+        ' "hiringOrganization": {"name": "Cafe"},'
+        ' "baseSalary": {"@type": "MonetaryAmount", "value":'
+        ' {"@type": "QuantitativeValue", "value": 42, "unitText": "HOUR"}}}'
+        '</script></head><body></body></html>'
+    )
+    out = jsonld_extract_job_data(html)
+    assert "salary_min" not in out
+    assert "salary_max" not in out
+
+
+def test_jsonld_extract_single_annual_value_fills_min_and_max():
+    html = (
+        '<html><head>'
+        '<script type="application/ld+json">'
+        '{"@type": "JobPosting", "title": "Engineer",'
+        ' "description": "Engineer things in a collaborative environment.",'
+        ' "hiringOrganization": {"name": "Acme"},'
+        ' "baseSalary": {"@type": "MonetaryAmount", "value":'
+        ' {"@type": "QuantitativeValue", "value": 120000, "unitText": "YEAR"}}}'
+        '</script></head><body></body></html>'
+    )
+    out = jsonld_extract_job_data(html)
+    assert out["salary_min"] == 120000
+    assert out["salary_max"] == 120000
+
+
+def test_jsonld_extract_multi_site_joblocation_array():
+    """jobLocation as an array (multi-site posting) → first usable site."""
+    html = (
+        '<html><head>'
+        '<script type="application/ld+json">'
+        '{"@type": "JobPosting", "title": "Sales Rep",'
+        ' "description": "Sell the product to enterprise customers nationwide.",'
+        ' "hiringOrganization": {"name": "Globex"},'
+        ' "jobLocation": [{"address": {"addressLocality": "Denver", "addressRegion": "CO"}},'
+        ' {"address": {"addressLocality": "Reno", "addressRegion": "NV"}}]}'
+        '</script></head><body></body></html>'
+    )
+    out = jsonld_extract_job_data(html)
+    assert out["location"] == "Denver, CO"
 
 
 # --- derive_hostname ----------------------------------------------------------

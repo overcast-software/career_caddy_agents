@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic_graph import BaseNode, End, GraphRunContext
 
-from lib.scrape_inspector import css_extract_job_data
+from lib.scrape_inspector import css_extract_job_data, jsonld_extract_job_data
 from .state import ScrapeGraphState, TierAttempt
 from .tracing import trace_node
 
@@ -128,6 +128,20 @@ def _profile_job_data(state: ScrapeGraphState) -> dict:
     return job_data if isinstance(job_data, dict) and job_data else {}
 
 
+def _tier0_fields_complete(parsed: dict) -> bool:
+    """The Tier-0 success gate: title + company + description all present.
+
+    Shared by both deterministic Tier-0 paths (JSON-LD and CSS) so they
+    agree on what "good enough to skip the LLM tiers" means. ``location``
+    and the JSON-LD-only extras (``salary_*`` / ``posted_date``) are
+    bonuses, not gate conditions — same fields EvaluateExtraction checks.
+    """
+    title = (parsed.get("title") or "").strip()
+    company = (parsed.get("company_name") or "").strip()
+    description = (parsed.get("description") or "").strip()
+    return bool(title and company and description)
+
+
 # Forward refs
 class Tier0CSS(BaseNode[ScrapeGraphState, None, dict]):
     pass
@@ -208,19 +222,33 @@ class StartExtract(BaseNode[ScrapeGraphState, None, dict]):
         return target_cls()
 
 
+def _record_tier0(state: ScrapeGraphState, *, hit: bool) -> None:
+    state.tier_attempts.append(
+        TierAttempt(tier="tier0", model=None, cost_usd=0.0, produced_output=hit)
+    )
+
+
 @dataclass
 class Tier0CSS(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
-    """Deterministic, $0 CSS extraction tier.
+    """Deterministic, $0 extraction tier — two structured paths, no LLM.
 
-    When the per-host profile carries graduated ``css_selectors.job_data``
-    selectors AND the captured HTML is present, parse the four core
-    fields with bs4 (``lib.scrape_inspector``) — no LLM, no cost. A
-    complete parse (title + company + description) records a tier0 hit
-    and hands straight to EvaluateExtraction. A miss (selectors present
-    but the parse came up short) or an absent ``job_data`` map records
-    ``produced_output=False`` and falls through to Tier1Mini, so the api
-    update-from-outcome loop can auto-demote ``preferred_tier`` after
-    sustained tier0 misses rather than hard-failing the scrape.
+    Tried in fidelity order against the captured HTML:
+
+      1. **schema.org JobPosting JSON-LD** (``jsonld_extract_job_data``) —
+         needs only the HTML, no per-host profile, and survives the CSS
+         churn that rots ``css_selectors.job_data`` (NEOGOV /
+         governmentjobs.com, Greenhouse, Lever, most ATS emit it). It
+         also carries ``salary_*`` / ``posted_date`` the CSS path can't.
+      2. **per-host CSS selectors** (``css_extract_job_data``) — when the
+         profile carries graduated ``css_selectors.job_data`` selectors.
+
+    A complete parse from either path (title + company + description)
+    records a tier0 hit and hands straight to EvaluateExtraction. When
+    neither path produces a complete parse — a selector/JSON-LD miss, or
+    no structured data at all — record ``produced_output=False`` and fall
+    through to Tier1Mini, so the api update-from-outcome loop can
+    auto-demote ``preferred_tier`` after sustained tier0 misses rather
+    than hard-failing the scrape.
     """
 
     async def run(
@@ -228,46 +256,52 @@ class Tier0CSS(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef
     ) -> Union[Tier1Mini, EvaluateExtraction]:
         started = time.time()
         state = ctx.state
-        job_data = _profile_job_data(state)
         html = state.html or ""
+        job_data = _profile_job_data(state)
 
-        if job_data and html:
-            parsed = css_extract_job_data(html, job_data)
-            title = (parsed.get("title") or "").strip()
-            company = (parsed.get("company_name") or "").strip()
-            description = (parsed.get("description") or "").strip()
-            if title and company and description:
-                state.parsed = parsed
-                state.tier_attempts.append(
-                    TierAttempt(
-                        tier="tier0", model=None,
-                        cost_usd=0.0, produced_output=True,
-                    )
-                )
+        if html:
+            # Path 1: schema.org JSON-LD — highest fidelity, profile-free.
+            jsonld = jsonld_extract_job_data(html)
+            if _tier0_fields_complete(jsonld):
+                state.parsed = jsonld
+                _record_tier0(state, hit=True)
                 trace_node(
                     state, "Tier0CSS", "EvaluateExtraction", started,
-                    {"fields": sorted(k for k, v in parsed.items() if v)},
+                    {
+                        "method": "jsonld",
+                        "fields": sorted(k for k, v in jsonld.items() if v),
+                    },
                 )
                 return EvaluateExtraction()
-            # Selectors present but the parse came up short — record the
-            # miss so UpdateProfile reports tier0_hit=False and the api
-            # learning loop can demote preferred_tier after enough misses.
-            state.tier_attempts.append(
-                TierAttempt(
-                    tier="tier0", model=None,
-                    cost_usd=0.0, produced_output=False,
-                )
-            )
-            trace_node(
-                state, "Tier0CSS", "Tier1Mini", started, {"tier0_miss": True},
-            )
-            return Tier1Mini()
 
-        # No job_data selectors (or no captured HTML) — preserve the
-        # Phase-1b skeleton behavior: soft skip, let Tier1 handle it.
-        state.tier_attempts.append(
-            TierAttempt(tier="tier0", produced_output=False, model=None)
-        )
+            # Path 2: per-host CSS selectors.
+            if job_data:
+                parsed = css_extract_job_data(html, job_data)
+                if _tier0_fields_complete(parsed):
+                    state.parsed = parsed
+                    _record_tier0(state, hit=True)
+                    trace_node(
+                        state, "Tier0CSS", "EvaluateExtraction", started,
+                        {
+                            "method": "css",
+                            "fields": sorted(k for k, v in parsed.items() if v),
+                        },
+                    )
+                    return EvaluateExtraction()
+                # Selectors present but the parse came up short — record
+                # the miss so UpdateProfile reports tier0_hit=False and the
+                # api learning loop can demote after enough misses.
+                _record_tier0(state, hit=False)
+                trace_node(
+                    state, "Tier0CSS", "Tier1Mini", started,
+                    {"tier0_miss": True},
+                )
+                return Tier1Mini()
+
+        # No captured HTML, or HTML with neither a JobPosting JSON-LD node
+        # nor job_data selectors — preserve the Phase-1b skeleton behavior:
+        # soft skip, let Tier1 handle it.
+        _record_tier0(state, hit=False)
         trace_node(state, "Tier0CSS", "Tier1Mini", started)
         return Tier1Mini()
 
