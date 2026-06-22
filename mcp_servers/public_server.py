@@ -17,6 +17,7 @@ Security invariants:
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -40,6 +41,15 @@ logger = logging.getLogger(__name__)
 
 API_BASE_URL = os.environ.get("CC_API_BASE_URL", "http://localhost:8000")
 
+# How long a successful token verification is reused before re-hitting
+# /me/. jh_* keys are long-lived, so a 5-min cache means a revocation
+# propagates within <=5 min — acceptable — and it makes the MCP resilient
+# to api flap / rate-limits: one good verify at connect is reused across
+# the burst of tools/list + tool calls that follow, instead of one extra
+# /me/ round-trip per MCP request (the failure mode where a transient
+# /me/ non-200 surfaced to clients as a bogus "invalid_token" 401).
+_VERIFY_CACHE_TTL_S = 300
+
 
 # ---------------------------------------------------------------------------
 # Auth: API key pass-through via TokenVerifier
@@ -56,10 +66,37 @@ class ApiKeyTokenVerifier(TokenVerifier):
     def __init__(self, api_base_url: str, **kwargs):
         super().__init__(**kwargs)
         self.api_base_url = api_base_url
+        # token -> (AccessToken, expiry_monotonic). Only successful
+        # verifications are cached; failures are never stored so a
+        # transient /me/ error retries on the next call instead of
+        # sticking. Concurrent cache misses double-calling /me/ are
+        # harmless (idempotent GET), so no lock is needed.
+        self._cache: dict[str, tuple[AccessToken, float]] = {}
+
+    def _prune_expired(self, now: float) -> None:
+        """Drop expired cache entries to bound memory growth."""
+        expired = [tok for tok, (_, exp) in self._cache.items() if now >= exp]
+        for tok in expired:
+            self._cache.pop(tok, None)
 
     async def verify_token(self, token: str) -> AccessToken | None:
         if not token.startswith("jh_"):
             return None
+
+        # Reuse a recent successful verification instead of re-hitting
+        # /me/ on every MCP request. Without this, a client that connects
+        # (one verify) and immediately calls tools/list (another verify)
+        # turns any api flap on the second call into a spurious
+        # "invalid_token" 401 that drops the whole session.
+        now = time.monotonic()
+        self._prune_expired(now)
+        cached = self._cache.get(token)
+        if cached is not None:
+            access_token, expiry = cached
+            if now < expiry:
+                return access_token
+            # Expired — fall through to re-verify against /me/.
+            self._cache.pop(token, None)
 
         try:
             async with httpx.AsyncClient() as client:
@@ -100,7 +137,7 @@ class ApiKeyTokenVerifier(TokenVerifier):
                 # use either surface; FastMCP scope filtering is the more
                 # canonical channel even though we read claims today.
                 scopes = ["read", "write"] + (["staff"] if is_staff else [])
-                return AccessToken(
+                access = AccessToken(
                     token=token,
                     client_id=str(user_id),
                     scopes=scopes,
@@ -110,6 +147,12 @@ class ApiKeyTokenVerifier(TokenVerifier):
                         "is_staff": is_staff,
                     },
                 )
+                # Cache only on success; expiry is monotonic so it is
+                # immune to wall-clock jumps.
+                self._cache[token] = (
+                    access, time.monotonic() + _VERIFY_CACHE_TTL_S,
+                )
+                return access
         except Exception:
             # Any verifier exception (httpx network failure, JSON parse,
             # OOM-driven worker death mid-call, etc.) MUST NOT leak as
