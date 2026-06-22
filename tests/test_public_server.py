@@ -203,3 +203,126 @@ class TestApiKeyTokenVerifierResilience:
         with patch("mcp_servers.public_server.httpx.AsyncClient", _BadJsonClient):
             result = asyncio.run(self._verifier().verify_token("jh_test_token"))
         assert result is None
+
+
+class TestApiKeyTokenVerifierCache:
+    """A successful verification is cached for _VERIFY_CACHE_TTL_S so the
+    verifier does NOT re-hit /me/ on every MCP request. Without the cache
+    a client that connects (one verify) then immediately calls tools/list
+    (another verify) turned any transient /me/ failure on the second call
+    into a bogus 'invalid_token' 401 that dropped the session.
+
+    Failures (non-200 or exception) are never cached, so a transient
+    upstream error retries on the next call rather than sticking.
+    """
+
+    def _verifier(self):
+        from mcp_servers.public_server import ApiKeyTokenVerifier
+        return ApiKeyTokenVerifier(api_base_url="http://test-api")
+
+    def _ok_client_factory(self, calls: list):
+        """An httpx.AsyncClient stand-in whose GET returns a valid /me/
+        200 and records each call into `calls`."""
+        class _OkResponse:
+            status_code = 200
+            def json(self):
+                return {"data": {"id": "42", "attributes": {"is_staff": False}}}
+
+        class _OkClient:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            async def get(self, *args, **kwargs):
+                calls.append(1)
+                return _OkResponse()
+
+        return _OkClient
+
+    def test_second_verify_within_ttl_hits_me_only_once(self):
+        from unittest.mock import patch
+        calls: list = []
+        verifier = self._verifier()
+        with patch(
+            "mcp_servers.public_server.httpx.AsyncClient",
+            self._ok_client_factory(calls),
+        ):
+            first = asyncio.run(verifier.verify_token("jh_cached"))
+            second = asyncio.run(verifier.verify_token("jh_cached"))
+        assert first is not None
+        # Same cached object returned, /me/ called exactly once.
+        assert second is first
+        assert len(calls) == 1
+
+    def test_non_200_is_not_cached(self):
+        from unittest.mock import patch
+        calls: list = []
+
+        class _Resp401:
+            status_code = 401
+            def json(self):
+                return {}
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            async def get(self, *args, **kwargs):
+                calls.append(1)
+                return _Resp401()
+
+        verifier = self._verifier()
+        with patch("mcp_servers.public_server.httpx.AsyncClient", _Client):
+            r1 = asyncio.run(verifier.verify_token("jh_bad"))
+            r2 = asyncio.run(verifier.verify_token("jh_bad"))
+        assert r1 is None
+        assert r2 is None
+        # Failure must NOT be cached → both calls re-hit /me/.
+        assert len(calls) == 2
+
+    def test_exception_is_not_cached(self):
+        from unittest.mock import patch
+        import httpx
+        calls: list = []
+
+        class _ExplodingClient:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                return False
+            async def get(self, *args, **kwargs):
+                calls.append(1)
+                raise httpx.ConnectError("simulated upstream down")
+
+        verifier = self._verifier()
+        with patch(
+            "mcp_servers.public_server.httpx.AsyncClient", _ExplodingClient
+        ):
+            r1 = asyncio.run(verifier.verify_token("jh_flap"))
+            r2 = asyncio.run(verifier.verify_token("jh_flap"))
+        assert r1 is None
+        assert r2 is None
+        assert len(calls) == 2
+
+    def test_expired_cache_entry_revalidates(self):
+        from unittest.mock import patch
+        calls: list = []
+        clock = {"t": 1000.0}
+
+        def _fake_monotonic():
+            return clock["t"]
+
+        verifier = self._verifier()
+        with patch(
+            "mcp_servers.public_server.httpx.AsyncClient",
+            self._ok_client_factory(calls),
+        ), patch(
+            "mcp_servers.public_server.time.monotonic", _fake_monotonic
+        ):
+            asyncio.run(verifier.verify_token("jh_exp"))
+            # Advance past the 300s TTL so the entry is stale.
+            clock["t"] += 301
+            asyncio.run(verifier.verify_token("jh_exp"))
+        # Expired entry → second verify re-hits /me/.
+        assert len(calls) == 2
