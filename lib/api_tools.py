@@ -1169,6 +1169,7 @@ async def claim_next_scrape(
     api: ApiClient,
     *,
     runner_name: Optional[str] = None,
+    attended: bool = False,
 ) -> str:
     """Atomically claim the next hold scrape for processing.
 
@@ -1176,13 +1177,21 @@ async def claim_next_scrape(
     Server-side SELECT FOR UPDATE SKIP LOCKED — N concurrent runners
     never pick up the same row.
 
+    ``attended`` partitions the hold queue: the api claims only rows whose
+    ``attended`` flag matches the body. A default (non-attended) runner
+    sends ``attended=False`` and therefore never grabs scrapes marked for
+    attended handling; an attended runner (``--attended``) sends
+    ``attended=True`` and claims only those. Absent is treated as False by
+    the api, but we always send the boolean to keep the wire contract
+    explicit.
+
     Returns the same shape as get_scrapes for a single record when a
     scrape was claimed. Returns the sentinel ``{'data': null}`` (or
     an error payload) when no hold scrapes are available — caller
     sleeps + retries.
     """
     shape = TOOL_SHAPES["get_scrapes"]
-    body: dict = {}
+    body: dict = {"attended": bool(attended)}
     if runner_name:
         body["runner_name"] = runner_name
     payload, error, status_code = await api.post_data(
