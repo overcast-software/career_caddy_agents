@@ -286,7 +286,7 @@ def _is_headless() -> bool:
     return bool(get_headless())
 
 
-async def poll_once(api: ApiClient) -> int:
+async def poll_once(api: ApiClient, *, attended: bool = False) -> int:
     """Claim and process hold scrapes one at a time via the runner-safe
     POST /api/v1/scrapes/claim-next/ endpoint (Plans/Scrape runner
     Phase 1). Each call atomically picks the oldest hold row, flips it
@@ -294,13 +294,19 @@ async def poll_once(api: ApiClient) -> int:
     means N concurrent runners on different hosts (omarchy + pibu +
     future) split the queue without racing.
 
+    ``attended`` partitions the hold queue at the api: an attended runner
+    (launched with ``--attended``) claims only scrapes flagged for attended
+    handling, and a default runner claims only the rest. A normal runner
+    therefore never grabs an attended scrape out from under the human who
+    queued it to solve a captcha/login in the resident window.
+
     Loops until the api returns 204 (queue empty). Returns count
     processed.
     """
     runner_name = os.environ.get("CC_RUNNER_NAME") or socket.gethostname()
     processed = 0
     while True:
-        raw = await claim_next_scrape(api, runner_name=runner_name)
+        raw = await claim_next_scrape(api, runner_name=runner_name, attended=attended)
         data = yaml.safe_load(raw)
 
         if not isinstance(data, dict) or data.get("error"):
@@ -364,10 +370,10 @@ async def _preflight_auth(api: ApiClient) -> bool:
     return True
 
 
-async def _run_poll_loop(api: ApiClient, running_flag):
+async def _run_poll_loop(api: ApiClient, running_flag, *, attended: bool = False):
     while running_flag():
         try:
-            count = await poll_once(api)
+            count = await poll_once(api, attended=attended)
             if count:
                 logger.info("Processed %d scrape(s)", count)
         except Exception:
@@ -442,7 +448,7 @@ async def main():
                     "live tab as scrapes arrive."
                 )
                 try:
-                    await _run_poll_loop(api, lambda: running)
+                    await _run_poll_loop(api, lambda: running, attended=bool(args.attended))
                 finally:
                     try:
                         saved = await _RESIDENT.save_sessions()
@@ -461,7 +467,7 @@ async def main():
             # already on disk; no user-visible loss.
             logger.info("Attended: browser shutdown finished with: %s", exc)
     else:
-        await _run_poll_loop(api, lambda: running)
+        await _run_poll_loop(api, lambda: running, attended=bool(args.attended))
 
 
 def main_sync():
