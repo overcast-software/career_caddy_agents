@@ -1219,6 +1219,46 @@ class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
         from . import nodes_extract
         started = time.time()
         state = ctx.state
+
+        # Last-chance DOM capture. Capture sets `state.html` from
+        # `page.content()`, but that call can fail (frame detached,
+        # "execution context destroyed" on a still-navigating SPA) while
+        # the `inner_text("body")` read just before it succeeds — leaving
+        # `state.html` empty but `state.job_content` populated. The Fail
+        # path recovers via `_artifacts.capture_debug_artifact`'s re-grab;
+        # the success path had no such recovery, so a browser scrape whose
+        # `Capture` content() hiccuped persisted null html and the DOM that
+        # `inspect_scrape_html` / `find_selectors_for_text` read was lost.
+        # Re-grab here from the still-live page (now settled past
+        # navigation) so every browser scrape that reaches PersistScrape
+        # lands its raw HTML at least once. Best-effort: never raises.
+        page = getattr(state, "_browser_page", None)
+        if not state.html and page is not None:
+            try:
+                state.html = await page.content()
+            except Exception:
+                logger.debug(
+                    "PersistScrape: html re-grab failed scrape_id=%s",
+                    state.scrape_id, exc_info=True,
+                )
+
+        attributes: dict = {
+            "job_content": state.job_content,
+            "status": "extracting",
+            "note": (
+                f"Content delivered ({len(state.job_content or '')} chars)"
+            ),
+            "detected_posting_status": state.detected_posting_status,
+            "detected_closed_evidence": state.detected_closed_evidence,
+        }
+        # Only send `html` when we actually captured a non-empty DOM.
+        # Sending an empty html would clobber a DOM persisted on an earlier
+        # run (lease-sweep re-dispatch) or by the debug-artifact backfill.
+        # Composes with the api anti-clobber guard (which drops a falsy
+        # `html` from PATCHes) without relying on it.
+        if state.html:
+            attributes["html"] = state.html
+
         try:
             httpx.patch(
                 f"{_api_base()}/api/v1/scrapes/{state.scrape_id}/",
@@ -1226,16 +1266,7 @@ class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
                     "data": {
                         "type": "scrape",
                         "id": str(state.scrape_id),
-                        "attributes": {
-                            "job_content": state.job_content,
-                            "html": state.html,
-                            "status": "extracting",
-                            "note": (
-                                f"Content delivered ({len(state.job_content or '')} chars)"
-                            ),
-                            "detected_posting_status": state.detected_posting_status,
-                            "detected_closed_evidence": state.detected_closed_evidence,
-                        },
+                        "attributes": attributes,
                     }
                 },
                 headers={**_api_headers(), "Content-Type": "application/json"},
