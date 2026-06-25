@@ -15,6 +15,7 @@ from lib.scrape_inspector import (
     derive_hostname,
     extract_skeleton,
     find_selectors_for_text,
+    jsonld_extract_job_data,
     query_selector,
     trim_html,
 )
@@ -287,3 +288,265 @@ def test_derive_hostname_handles_none_and_garbage():
     assert derive_hostname(None) is None
     assert derive_hostname("") is None
     assert derive_hostname("not a url") is None
+
+
+# --- jsonld_extract_job_data --------------------------------------------------
+
+
+def _jsonld_page(block: str) -> str:
+    """Wrap a JSON-LD body in a minimal HTML page with the ld+json script."""
+    return (
+        "<html><head>"
+        f'<script type="application/ld+json">{block}</script>'
+        "</head><body><h1>noise</h1></body></html>"
+    )
+
+
+_CLEAN_JOBPOSTING = """
+{
+  "@context": "https://schema.org",
+  "@type": "JobPosting",
+  "title": "Senior Backend Engineer",
+  "description": "<p>We are looking for a backend engineer with 5+ years building distributed systems.</p><ul><li>Python</li></ul>",
+  "hiringOrganization": {"@type": "Organization", "name": "Acme Corp"},
+  "jobLocation": {"@type": "Place", "address": {"@type": "PostalAddress", "addressLocality": "Austin", "addressRegion": "TX", "addressCountry": "US"}},
+  "baseSalary": {"@type": "MonetaryAmount", "currency": "USD", "value": {"@type": "QuantitativeValue", "minValue": 120000, "maxValue": 160000, "unitText": "YEAR"}},
+  "datePosted": "2026-06-01",
+  "employmentType": "FULL_TIME",
+  "validThrough": "2026-07-01",
+  "identifier": "REQ-42"
+}
+"""
+
+
+def test_jsonld_clean_jobposting_full_parse():
+    out = jsonld_extract_job_data(_jsonld_page(_CLEAN_JOBPOSTING))
+    assert out["title"] == "Senior Backend Engineer"
+    assert out["company_name"] == "Acme Corp"
+    # Description is collapsed PLAIN TEXT — HTML markup stripped.
+    assert out["description"].startswith("We are looking for a backend engineer")
+    assert "<p>" not in out["description"]
+    assert "Python" in out["description"]
+    assert out["location"] == "Austin, TX"
+    assert out["salary_min"] == 120000
+    assert out["salary_max"] == 160000
+    assert out["posted_date"] == "2026-06-01"
+    assert out["employment_type"] == "FULL_TIME"
+    # No model home for validThrough / identifier → not emitted.
+    assert "valid_through" not in out
+    assert "identifier" not in out
+
+
+def test_jsonld_graph_array_wrapper():
+    """A JobPosting nested in a top-level @graph array is found."""
+    block = """
+    {
+      "@context": "https://schema.org",
+      "@graph": [
+        {"@type": "Organization", "name": "Board Inc"},
+        {"@type": "JobPosting", "title": "Data Scientist",
+         "description": "Build models and pipelines for the analytics team.",
+         "hiringOrganization": {"name": "DataCo"}}
+      ]
+    }
+    """
+    out = jsonld_extract_job_data(_jsonld_page(block))
+    assert out["title"] == "Data Scientist"
+    assert out["company_name"] == "DataCo"
+
+
+def test_jsonld_multiple_blocks_one_non_jobposting():
+    """Scan every ld+json block; pick the JobPosting-typed one."""
+    html = (
+        "<html><head>"
+        '<script type="application/ld+json">'
+        '{"@type": "WebSite", "name": "Careers Portal"}'
+        "</script>"
+        '<script type="application/ld+json">'
+        '{"@type": "JobPosting", "title": "QA Engineer",'
+        ' "description": "Own the test suite and CI quality gates here.",'
+        ' "hiringOrganization": {"name": "TestCo"}}'
+        "</script>"
+        "</head><body></body></html>"
+    )
+    out = jsonld_extract_job_data(html)
+    assert out["title"] == "QA Engineer"
+    assert out["company_name"] == "TestCo"
+
+
+def test_jsonld_type_as_list():
+    block = """
+    {"@type": ["JobPosting", "Thing"], "title": "Platform Engineer",
+     "description": "Run the platform and own reliability for the org.",
+     "hiringOrganization": {"name": "PlatCo"}}
+    """
+    out = jsonld_extract_job_data(_jsonld_page(block))
+    assert out["title"] == "Platform Engineer"
+    assert out["company_name"] == "PlatCo"
+
+
+def test_jsonld_type_as_schema_url():
+    block = """
+    {"@type": "https://schema.org/JobPosting", "title": "SRE",
+     "description": "Keep the lights on and the pagers quiet for the team.",
+     "hiringOrganization": {"name": "UrlCo"}}
+    """
+    out = jsonld_extract_job_data(_jsonld_page(block))
+    assert out["title"] == "SRE"
+    assert out["company_name"] == "UrlCo"
+
+
+def test_jsonld_missing_optional_fields():
+    """Only the core trio present → core keys filled, extras omitted."""
+    block = """
+    {"@type": "JobPosting", "title": "Designer",
+     "description": "Craft delightful interfaces across the product surface.",
+     "hiringOrganization": {"name": "PixelCo"}}
+    """
+    out = jsonld_extract_job_data(_jsonld_page(block))
+    assert out["title"] == "Designer"
+    assert out["company_name"] == "PixelCo"
+    assert out["location"] == ""
+    assert "salary_min" not in out
+    assert "salary_max" not in out
+    assert "posted_date" not in out
+    assert "employment_type" not in out
+
+
+def test_jsonld_invalid_block_is_skipped_valid_block_wins():
+    """A malformed ld+json block is skipped fail-soft; a valid sibling
+    block is still parsed."""
+    html = (
+        "<html><head>"
+        '<script type="application/ld+json">{ not: valid json,,, }</script>'
+        '<script type="application/ld+json">'
+        '{"@type": "JobPosting", "title": "Recovered Role",'
+        ' "description": "This block is valid and should be extracted fine.",'
+        ' "hiringOrganization": {"name": "RecoverCo"}}'
+        "</script>"
+        "</head><body></body></html>"
+    )
+    out = jsonld_extract_job_data(html)
+    assert out["title"] == "Recovered Role"
+    assert out["company_name"] == "RecoverCo"
+
+
+def test_jsonld_no_jobposting_returns_empty_core():
+    block = '{"@type": "WebSite", "name": "Just a site"}'
+    out = jsonld_extract_job_data(_jsonld_page(block))
+    assert out == {
+        "title": "", "company_name": "", "description": "", "location": "",
+    }
+
+
+def test_jsonld_no_script_blocks_returns_empty_core():
+    out = jsonld_extract_job_data("<html><body><h1>No structured data</h1></body></html>")
+    assert out["title"] == ""
+    assert out["company_name"] == ""
+
+
+def test_jsonld_empty_html_returns_empty_core():
+    out = jsonld_extract_job_data("")
+    assert out == {
+        "title": "", "company_name": "", "description": "", "location": "",
+    }
+
+
+def test_jsonld_company_as_bare_string():
+    block = """
+    {"@type": "JobPosting", "title": "Analyst",
+     "description": "Analyze the numbers and brief the leadership team weekly.",
+     "hiringOrganization": "Acme String Co"}
+    """
+    out = jsonld_extract_job_data(_jsonld_page(block))
+    assert out["company_name"] == "Acme String Co"
+
+
+def test_jsonld_salary_single_annual_value_fills_both():
+    block = """
+    {"@type": "JobPosting", "title": "PM",
+     "description": "Own the roadmap and ship outcomes with the product squad.",
+     "hiringOrganization": {"name": "RoadCo"},
+     "baseSalary": {"@type": "MonetaryAmount",
+       "value": {"value": 150000, "unitText": "YEAR"}}}
+    """
+    out = jsonld_extract_job_data(_jsonld_page(block))
+    assert out["salary_min"] == 150000
+    assert out["salary_max"] == 150000
+
+
+def test_jsonld_salary_hourly_is_dropped():
+    """JobPostData has no pay-period field, so non-annual salary is
+    dropped rather than stored as a misleading bare int."""
+    block = """
+    {"@type": "JobPosting", "title": "Barista",
+     "description": "Pull shots and keep the morning rush moving smoothly.",
+     "hiringOrganization": {"name": "CafeCo"},
+     "baseSalary": {"@type": "MonetaryAmount",
+       "value": {"minValue": 18, "maxValue": 24, "unitText": "HOUR"}}}
+    """
+    out = jsonld_extract_job_data(_jsonld_page(block))
+    assert "salary_min" not in out
+    assert "salary_max" not in out
+
+
+def test_jsonld_salary_string_amount_with_commas():
+    block = """
+    {"@type": "JobPosting", "title": "Lead",
+     "description": "Lead the team and grow the people on it deliberately.",
+     "hiringOrganization": {"name": "LeadCo"},
+     "baseSalary": {"@type": "MonetaryAmount",
+       "value": {"minValue": "$120,000", "maxValue": "$180,000", "unitText": "YEAR"}}}
+    """
+    out = jsonld_extract_job_data(_jsonld_page(block))
+    assert out["salary_min"] == 120000
+    assert out["salary_max"] == 180000
+
+
+def test_jsonld_html_entity_escaped_description():
+    """Entity-escaped markup in the description is decoded then stripped
+    to plain text."""
+    block = """
+    {"@type": "JobPosting", "title": "Writer",
+     "description": "&lt;p&gt;Great &amp; bold role for a strong communicator&lt;/p&gt;",
+     "hiringOrganization": {"name": "WordCo"}}
+    """
+    out = jsonld_extract_job_data(_jsonld_page(block))
+    assert out["description"] == "Great & bold role for a strong communicator"
+    assert "<p>" not in out["description"]
+
+
+def test_jsonld_location_array_takes_first_site():
+    block = """
+    {"@type": "JobPosting", "title": "Engineer",
+     "description": "Work across multiple offices and ship features fast.",
+     "hiringOrganization": {"name": "MultiCo"},
+     "jobLocation": [
+       {"@type": "Place", "address": {"addressLocality": "NYC", "addressRegion": "NY"}},
+       {"@type": "Place", "address": {"addressLocality": "SF", "addressRegion": "CA"}}
+     ]}
+    """
+    out = jsonld_extract_job_data(_jsonld_page(block))
+    assert out["location"] == "NYC, NY"
+
+
+def test_jsonld_location_country_fallback():
+    block = """
+    {"@type": "JobPosting", "title": "Remote Engineer",
+     "description": "Fully remote role building services for a global team.",
+     "hiringOrganization": {"name": "RemoteCo"},
+     "jobLocation": {"address": {"addressCountry": {"@type": "Country", "name": "USA"}}}}
+    """
+    out = jsonld_extract_job_data(_jsonld_page(block))
+    assert out["location"] == "USA"
+
+
+def test_jsonld_employment_type_list_joined():
+    block = """
+    {"@type": "JobPosting", "title": "Contractor",
+     "description": "Short-term engagement helping ship a focused deliverable.",
+     "hiringOrganization": {"name": "GigCo"},
+     "employmentType": ["CONTRACTOR", "PART_TIME"]}
+    """
+    out = jsonld_extract_job_data(_jsonld_page(block))
+    assert out["employment_type"] == "CONTRACTOR, PART_TIME"

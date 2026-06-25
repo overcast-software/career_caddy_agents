@@ -25,6 +25,8 @@ from a maintenance script or test fixture).
 """
 from __future__ import annotations
 
+import json
+from html import unescape
 from typing import Iterable, Optional
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
@@ -297,6 +299,334 @@ def css_extract_job_data(html: str, selectors: dict) -> dict:
         if match is not None:
             out[field] = " ".join(match.get_text(" ", strip=True).split())
     return out
+
+
+# schema.org MonetaryAmount.unitText / UN/CEFACT unitCode values that
+# denote an ANNUAL figure. JobPostData.salary_min/max are bare annual
+# ints with no period qualifier, so only annual amounts map cleanly;
+# HOUR / WEEK / MONTH are intentionally dropped — storing "$42/hr" as
+# salary_min=42 would read as a $42 salary. "ANN" is the UN/CEFACT code
+# for year; "P1Y" is the ISO-8601 duration some emitters use.
+_JSONLD_ANNUAL_UNITS = frozenset(
+    {"YEAR", "YEARLY", "ANNUAL", "ANNUALLY", "ANNUM", "ANN", "P1Y"}
+)
+
+
+def jsonld_extract_job_data(html: str) -> dict:
+    """Deterministically extract job fields from schema.org/JobPosting
+    JSON-LD embedded in ``html`` as ``<script type="application/ld+json">``.
+
+    Returns a dict in the same ParsedJobData vocabulary as
+    ``css_extract_job_data`` — the four core keys are ALWAYS present
+    (``""`` when not found):
+
+        ``{"title", "company_name", "description", "location"}``
+
+    plus JSON-LD-only extras, included ONLY when a value was parsed:
+
+        ``{"salary_min", "salary_max", "posted_date", "employment_type"}``
+
+    This is the second deterministic Tier-0 ($0, no-LLM) extraction
+    primitive. Unlike the per-host CSS path it needs NO ScrapeProfile —
+    ``schema.org/JobPosting`` is the industry-standard structured-data
+    vocabulary (Google for Jobs runs on it), widely emitted by
+    NEOGOV/governmentjobs, Greenhouse, Lever, Workday, iCIMS and
+    LinkedIn — so it can fire on first contact with a domain and is
+    robust to the per-host CSS-selector rot that motivated CC-27.
+
+    Fail-soft, never raises: a malformed ``ld+json`` block is skipped and
+    the scan continues; if no JobPosting node is found anywhere the
+    all-empty core dict is returned. The caller (Tier0CSS) decides
+    whether the parse is complete enough to skip the LLM tiers.
+
+    Field-mapping notes:
+      - ``description`` is collapsed PLAIN TEXT (HTML entities decoded,
+        tags stripped) so it matches what ``css_extract_job_data``
+        stores and hands EvaluateExtraction the same shape.
+      - ``hiringOrganization.name`` → ``company_name``. CAVEAT: on
+        aggregator boards this is often the board, not the employer —
+        extracted but not over-trusted.
+      - ``baseSalary`` (MonetaryAmount) → annual ``salary_min`` /
+        ``salary_max`` only (see ``_JSONLD_ANNUAL_UNITS``).
+    """
+    out = {"title": "", "company_name": "", "description": "", "location": ""}
+    if not html:
+        return out
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return out
+
+    node = _find_job_posting_node(soup)
+    if not node:
+        return out
+
+    title = _jsonld_str(node.get("title"))
+    if title:
+        out["title"] = title
+
+    company = _jsonld_company(node.get("hiringOrganization"))
+    if company:
+        out["company_name"] = company
+
+    description = _jsonld_html_to_text(node.get("description"))
+    if description:
+        out["description"] = description
+
+    location = _jsonld_location(node.get("jobLocation"))
+    if location:
+        out["location"] = location
+
+    salary_min, salary_max = _jsonld_salary(node.get("baseSalary"))
+    if salary_min is not None:
+        out["salary_min"] = salary_min
+    if salary_max is not None:
+        out["salary_max"] = salary_max
+
+    posted = _jsonld_str(node.get("datePosted"))
+    if posted:
+        out["posted_date"] = posted
+
+    employment = _jsonld_employment_type(node.get("employmentType"))
+    if employment:
+        out["employment_type"] = employment
+
+    return out
+
+
+def _iter_jsonld_blocks(soup: BeautifulSoup) -> Iterable[object]:
+    """Yield each successfully-parsed JSON value from every
+    ``<script type="application/ld+json">`` block. Blocks whose body is
+    empty or not valid JSON are skipped (fail-soft) so one bad block
+    never starves a valid sibling."""
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = script.string
+        if raw is None:
+            # Multiple children / comments → .string is None; fall back to
+            # the concatenated text. (html.parser treats <script> content
+            # as raw text, so JSON escapes survive intact.)
+            raw = script.get_text() or ""
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            yield json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+
+
+def _iter_jsonld_nodes(value: object) -> Iterable[dict]:
+    """Walk a parsed JSON-LD value, yielding candidate dict nodes:
+    items of top-level arrays, items of a ``@graph`` array, and the dict
+    itself. ``@graph`` children are yielded before the wrapper so a
+    JobPosting nested in ``@graph`` is found first."""
+    if isinstance(value, dict):
+        graph = value.get("@graph")
+        if isinstance(graph, list):
+            for item in graph:
+                yield from _iter_jsonld_nodes(item)
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_jsonld_nodes(item)
+
+
+def _is_job_posting(node: object) -> bool:
+    """True when ``node['@type']`` is (or includes) ``JobPosting``.
+    ``@type`` may be a string or a list, and may be a bare name or a
+    schema.org URL (``https://schema.org/JobPosting``); compare on the
+    trailing path/fragment segment, case-insensitively."""
+    if not isinstance(node, dict):
+        return False
+    raw_type = node.get("@type")
+    types = raw_type if isinstance(raw_type, list) else [raw_type]
+    for entry in types:
+        if not isinstance(entry, str):
+            continue
+        seg = entry.rstrip("/").rsplit("/", 1)[-1].rsplit("#", 1)[-1]
+        if seg.lower() == "jobposting":
+            return True
+    return False
+
+
+def _find_job_posting_node(soup: BeautifulSoup) -> Optional[dict]:
+    """Return the first JobPosting-typed node across all ld+json blocks,
+    or None."""
+    for block in _iter_jsonld_blocks(soup):
+        for node in _iter_jsonld_nodes(block):
+            if _is_job_posting(node):
+                return node
+    return None
+
+
+def _jsonld_str(value: object) -> str:
+    """Coerce a JSON-LD scalar to a clean string; ``""`` for anything
+    non-stringy. Unwraps the ``{"@value": ...}`` form schema.org uses for
+    language-tagged literals; renders bare numbers (e.g. an integer
+    identifier) as their string form."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        inner = value.get("@value")
+        if isinstance(inner, str):
+            return inner.strip()
+        if isinstance(inner, (int, float)) and not isinstance(inner, bool):
+            return str(inner)
+    return ""
+
+
+def _jsonld_html_to_text(value: object) -> str:
+    """``JobPosting.description`` → collapsed PLAIN TEXT, matching what
+    ``css_extract_job_data`` stores (the CSS path calls ``get_text`` on
+    the matched element). schema.org descriptions are commonly HTML
+    markup, sometimes entity-escaped (``&lt;p&gt;...``); decode entities
+    first, then strip tags, so both Tier-0 paths hand EvaluateExtraction
+    the same shape."""
+    text = _jsonld_str(value)
+    if not text:
+        return ""
+    inner = BeautifulSoup(unescape(text), "html.parser")
+    return " ".join(inner.get_text(" ", strip=True).split())
+
+
+def _jsonld_company(org: object) -> str:
+    """``hiringOrganization.name`` → company. schema.org models this as a
+    nested Organization object; tolerate a bare string and a list (take
+    the first that yields a name)."""
+    if isinstance(org, dict):
+        return _jsonld_str(org.get("name"))
+    if isinstance(org, str):
+        return org.strip()
+    if isinstance(org, list):
+        for item in org:
+            name = _jsonld_company(item)
+            if name:
+                return name
+    return ""
+
+
+def _jsonld_country(value: object) -> str:
+    """``addressCountry`` may be a string ("US") or a nested Country
+    object ``{"@type": "Country", "name": "USA"}``."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        return _jsonld_str(value.get("name"))
+    return ""
+
+
+def _jsonld_location(loc: object) -> str:
+    """``jobLocation.address`` (PostalAddress) → ``"City, Region"``,
+    falling back to country, then a Place-level name. ``jobLocation`` may
+    be a single Place or an array (multi-site posting) — take the first
+    that yields a non-empty string."""
+    if isinstance(loc, list):
+        for item in loc:
+            text = _jsonld_location(item)
+            if text:
+                return text
+        return ""
+    if isinstance(loc, str):
+        return loc.strip()
+    if not isinstance(loc, dict):
+        return ""
+
+    address = loc.get("address")
+    if isinstance(address, list):
+        address = next(
+            (a for a in address if isinstance(a, (dict, str))), None
+        )
+    if isinstance(address, str):
+        return address.strip()
+    if isinstance(address, dict):
+        locality = _jsonld_str(address.get("addressLocality"))
+        region = _jsonld_str(address.get("addressRegion"))
+        parts = [p for p in (locality, region) if p]
+        if parts:
+            return ", ".join(parts)
+        country = _jsonld_country(address.get("addressCountry"))
+        if country:
+            return country
+    # No structured address — fall back to a Place-level name.
+    return _jsonld_str(loc.get("name"))
+
+
+def _coerce_salary_int(value: object) -> Optional[int]:
+    """Best-effort parse a salary figure to a non-negative int. Tolerates
+    ``"$120,000"`` / ``"120000.0"`` / numeric types; rejects bools, junk,
+    and negatives (returns None)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        num = int(value)
+        return num if num >= 0 else None
+    if isinstance(value, str):
+        cleaned = value.replace(",", "").replace("$", "").strip()
+        if not cleaned:
+            return None
+        try:
+            num = int(float(cleaned))
+        except ValueError:
+            return None
+        return num if num >= 0 else None
+    return None
+
+
+def _is_annual_unit(unit: object) -> bool:
+    if not isinstance(unit, str):
+        return False
+    return unit.strip().upper() in _JSONLD_ANNUAL_UNITS
+
+
+def _jsonld_salary(base_salary: object) -> tuple[Optional[int], Optional[int]]:
+    """``baseSalary`` (MonetaryAmount) → ``(salary_min, salary_max)`` as
+    ANNUAL ints, or ``(None, None)``.
+
+    The amount lives in the nested QuantitativeValue under ``value``
+    (``value`` / ``minValue`` / ``maxValue`` + ``unitText``); a flat
+    ``baseSalary`` carrying those keys directly is tolerated too. Only
+    annual ``unitText`` / ``unitCode`` maps (see ``_JSONLD_ANNUAL_UNITS``)
+    — hourly/weekly/monthly is dropped because JobPostData has no pay-
+    period field. A single ``value`` fills both min and max. Guards the
+    model's ``salary_min <= salary_max`` invariant by swapping if needed.
+    """
+    if not isinstance(base_salary, dict):
+        return (None, None)
+    value_obj = base_salary.get("value")
+    if isinstance(value_obj, dict):
+        unit = value_obj.get("unitText") or value_obj.get("unitCode")
+        amount = value_obj.get("value")
+        min_v = value_obj.get("minValue")
+        max_v = value_obj.get("maxValue")
+    else:
+        unit = base_salary.get("unitText") or base_salary.get("unitCode")
+        amount = base_salary.get("value")
+        min_v = base_salary.get("minValue")
+        max_v = base_salary.get("maxValue")
+
+    if not _is_annual_unit(unit):
+        return (None, None)
+
+    smin = _coerce_salary_int(min_v if min_v is not None else amount)
+    smax = _coerce_salary_int(max_v if max_v is not None else amount)
+    if smin is not None and smax is not None and smin > smax:
+        smin, smax = smax, smin
+    return (smin, smax)
+
+
+def _jsonld_employment_type(value: object) -> str:
+    """``employmentType`` → JobPostData.employment_type. schema.org allows
+    a string (``"FULL_TIME"``) or an array; join an array on ``", "``."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = [v.strip() for v in value if isinstance(v, str) and v.strip()]
+        return ", ".join(parts)
+    return ""
 
 
 def _selector_candidates_for(tag: Tag) -> Iterable[tuple[int, str]]:
