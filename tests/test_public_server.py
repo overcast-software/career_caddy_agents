@@ -25,15 +25,18 @@ class TestPublicServerTools:
         # check (title + link or company) over existing primitives.
         # 28→31 when the scrape-profile-enhancer tools landed
         # (inspect_scrape_html, test_url_rewrite, find_selectors_for_text).
+        # 31→33 when the ActivityPub publish/unpublish tools landed
+        # (publish_job_post, unpublish_job_post — CC-60).
         # Asserts the REGISTERED total, not the filtered surface a
         # non-staff client sees (see TestStaffOnlyToolFilter for that).
-        assert len(self.tools) == 31
+        assert len(self.tools) == 33
 
     def test_has_all_expected_tools(self):
         expected = {
             "create_company", "find_company_by_name", "search_companies", "get_companies",
             "create_job_post_with_company_check", "find_job_post_by_link",
             "search_job_posts", "get_job_posts", "update_job_post",
+            "publish_job_post", "unpublish_job_post",
             "get_duplicate_candidates", "find_duplicate_candidates",
             "create_job_application", "get_job_applications",
             "get_applications_for_job_post", "update_job_application",

@@ -299,6 +299,18 @@ TOOL_SHAPES: dict[str, dict[str, Any]] = {
     },
 
     # --- Action ---
+    "publish_job_post": {
+        "kind": "single",
+        "attrs": None,
+        "relationships": "counts",
+        "notes": "Returns the updated job-post after the publish audience flip.",
+    },
+    "unpublish_job_post": {
+        "kind": "single",
+        "attrs": None,
+        "relationships": "counts",
+        "notes": "Returns the updated job-post after the unpublish audience flip.",
+    },
     "score_job_post": {
         "kind": "passthrough",
         "notes": "202 + pending status. Already small.",
@@ -928,6 +940,39 @@ async def update_job_post(
     return await _shaped_patch(
         api, f"/api/v1/job-posts/{job_post_id}/", body,
         shape=TOOL_SHAPES["update_job_post"],
+    )
+
+
+async def publish_job_post(api: ApiClient, job_post_id: int) -> str:
+    """Publish a job post to the fediverse (ActivityPub) — owner-only.
+
+    Thin wrapper over POST /api/v1/job-posts/<id>/publish/ (empty body). The
+    api adds the AS2 Public URI to the post's `audience`; the private->public
+    transition fans out a Create to followers. Idempotent: an already-public
+    post is a no-op (no duplicate Create). Returns the updated job-post
+    resource. A 403 (caller is not the owner) or 404 (no such post) from the
+    api is surfaced as an error result.
+    """
+    return await _shaped_post(
+        api, f"/api/v1/job-posts/{job_post_id}/publish/", {},
+        shape=TOOL_SHAPES["publish_job_post"],
+    )
+
+
+async def unpublish_job_post(api: ApiClient, job_post_id: int) -> str:
+    """Unpublish a job post from the fediverse (ActivityPub) — owner-only.
+
+    Thin wrapper over POST /api/v1/job-posts/<id>/unpublish/ (empty body).
+    The api removes the AS2 Public URI from `audience` (preserving any other
+    entries), flipping the post back to private; the public->private
+    transition emits nothing (no Withdraw in V1). Idempotent: an
+    already-private post is a no-op. Returns the updated job-post resource. A
+    403 (caller is not the owner) or 404 (no such post) from the api is
+    surfaced as an error result.
+    """
+    return await _shaped_post(
+        api, f"/api/v1/job-posts/{job_post_id}/unpublish/", {},
+        shape=TOOL_SHAPES["unpublish_job_post"],
     )
 
 
