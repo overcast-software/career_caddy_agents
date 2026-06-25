@@ -425,6 +425,31 @@ async def update_job_post(
     )
 
 
+@server.tool()
+async def publish_job_post(job_post_id: int) -> str:
+    """Publish a job post to the fediverse (ActivityPub). Owner-only.
+
+    Marks the post public by adding the AS2 Public URI to its audience; the
+    private->public transition fans out a Create to your followers.
+    Idempotent — publishing an already-public post does nothing (no
+    duplicate Create). A 403 (you don't own this post) or 404 (no such post)
+    is returned as an error.
+    """
+    return await api_tools.publish_job_post(_api(), job_post_id)
+
+
+@server.tool()
+async def unpublish_job_post(job_post_id: int) -> str:
+    """Unpublish a job post from the fediverse (ActivityPub). Owner-only.
+
+    Removes the AS2 Public URI from the post's audience, flipping it back to
+    private. No Withdraw is emitted (V1). Idempotent — unpublishing an
+    already-private post does nothing. A 403 (you don't own this post) or
+    404 (no such post) is returned as an error.
+    """
+    return await api_tools.unpublish_job_post(_api(), job_post_id)
+
+
 # ---------------------------------------------------------------------------
 # Job Applications
 # ---------------------------------------------------------------------------
