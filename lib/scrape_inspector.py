@@ -200,7 +200,7 @@ def query_selector(
         "matches": [
           {"outline": "html > body > main > h2.foo",
            "text_snippet": "About the job",
-           "attrs": {"class": ["foo", "bar"], "data-testid": "..."}},
+           "attrs": {"class": "foo bar", "data-testid": "..."}},
           ...
         ],
       }
@@ -222,7 +222,15 @@ def query_selector(
         matches.append({
             "outline": _outline_path(tag),
             "text_snippet": _text_snippet(tag),
-            "attrs": {k: v for k, v in tag.attrs.items()},
+            # BS4 returns multi-valued attrs (class, rel, …) as an
+            # AttributeValueList (a list subclass). yaml.safe_dump in
+            # api_tools._respond has no representer for it and raises
+            # RepresenterError. HTML token-list attrs are space-separated,
+            # so join them back into the canonical string form.
+            "attrs": {
+                k: (" ".join(v) if isinstance(v, list) else v)
+                for k, v in tag.attrs.items()
+            },
         })
     return {
         "selector": selector,
