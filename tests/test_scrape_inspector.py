@@ -8,6 +8,8 @@ primitives this file covers.
 """
 from __future__ import annotations
 
+import yaml
+
 from lib.scrape_inspector import (
     css_extract_job_data,
     derive_hostname,
@@ -190,6 +192,27 @@ def test_query_selector_returns_attrs_on_match():
     )
     assert result["match_count"] == 1
     assert result["matches"][0]["attrs"]["data-testid"] == "job-details"
+
+
+def test_query_selector_multi_class_attr_is_space_joined_and_yaml_safe():
+    """Regression: BS4 4.14 returns multi-valued attrs (class, rel, …) as an
+    AttributeValueList (list subclass). The previous impl put that raw list in
+    the attrs dict, and api_tools._respond's yaml.safe_dump had no representer
+    for it → RepresenterError ('cannot represent an object', [<class list>]) —
+    crashing mode=selector on every Tailwind / styled-components page.
+
+    The attr must be coerced to its canonical space-joined string, and the
+    whole result must survive the same serializer the MCP layer uses.
+    """
+    html = '<h2 class="font-extrabold text-3xl" data-testid="t">About</h2>'
+    result = query_selector(html, "h2")
+    match = result["matches"][0]
+    # Space-joined string, not a list.
+    assert match["attrs"]["class"] == "font-extrabold text-3xl"
+    assert isinstance(match["attrs"]["class"], str)
+    # The assertion that actually reproduced the original crash: safe_dump
+    # (exactly what api_tools._respond uses) must not raise.
+    yaml.safe_dump(result)
 
 
 # --- find_selectors_for_text --------------------------------------------------
