@@ -4,6 +4,7 @@ import asyncio
 import inspect
 
 import pytest
+import yaml
 
 
 class TestPublicServerTools:
@@ -329,3 +330,172 @@ class TestApiKeyTokenVerifierCache:
             asyncio.run(verifier.verify_token("jh_exp"))
         # Expired entry → second verify re-hits /me/.
         assert len(calls) == 2
+
+
+# Every staff/CRUD tool param that addresses a NanoID-keyed resource.
+# CC-77 swapped these models' integer PKs to opaque 10-char NanoID strings
+# (Company, JobPost, JobApplication, Scrape, ScrapeProfile, Score). The MCP
+# client validates outbound args against each tool's JSON schema, so an
+# `int`-typed hint here makes the client strip a NanoID string like
+# "JHTQQNggMp" before the call leaves the client (args collapse to empty) —
+# the CC-87 regression. These params MUST resolve to JSON-schema "string".
+_NANOID_ID_PARAMS = {
+    "get_companies": ["id"],
+    "get_duplicate_candidates": ["job_post_id"],
+    "search_job_posts": ["company_id"],
+    "get_job_posts": ["id"],
+    "update_job_post": ["job_post_id", "company_id"],
+    "publish_job_post": ["job_post_id"],
+    "unpublish_job_post": ["job_post_id"],
+    "create_job_application": ["job_post_id"],
+    "get_job_applications": ["id"],
+    "get_applications_for_job_post": ["job_post_id"],
+    "update_job_application": ["application_id", "company_id"],
+    "create_scrape": ["job_post_id", "company_id"],
+    "get_scrapes": ["id"],
+    "update_scrape": ["scrape_id"],
+    "list_scrape_screenshots": ["scrape_id"],
+    "get_scrape_graph_trace": ["scrape_id"],
+    "get_scrape_statuses": ["scrape_id"],
+    "fetch_scrape_screenshot": ["scrape_id"],
+    "update_scrape_profile": ["profile_id"],
+    "score_job_post": ["job_post_id"],
+    "get_scores": ["id", "job_post_id"],
+    "inspect_scrape_html": ["scrape_id"],
+    "find_selectors_for_text": ["scrape_id"],
+}
+
+# Params that legitimately stayed `int` — pagination / value fields keyed to
+# nothing NanoID. Pinned so a future swap can't over-broaden int → str.
+_INT_PARAMS = {
+    "get_scrapes": ["page", "per_page"],
+    "get_job_posts": ["page", "per_page"],
+    "inspect_scrape_html": ["max_chars", "max_matches"],
+    "create_job_post_with_company_check": ["salary_min", "salary_max"],
+    "find_selectors_for_text": ["max_results"],
+}
+
+
+def _schema_types(prop: dict) -> set:
+    """Collect every JSON-schema 'type' declared on a property, walking
+    anyOf/oneOf so Optional[...] (type | null) unions are handled."""
+    types = set()
+    if isinstance(prop.get("type"), str):
+        types.add(prop["type"])
+    for branch in (prop.get("anyOf") or []) + (prop.get("oneOf") or []):
+        if isinstance(branch, dict) and isinstance(branch.get("type"), str):
+            types.add(branch["type"])
+    return types
+
+
+class TestNanoIdParamSchema:
+    """CC-87 regression: id params keyed to NanoID resources must surface as
+    JSON-schema `string`, never `integer`. If they revert to `integer`, the
+    MCP client strips the NanoID before the request is sent and every
+    inspect-or-mutate-by-id op against prod breaks (the scrape-profile
+    enhancer / sharpen / manual recon)."""
+
+    @pytest.fixture(autouse=True)
+    def load_tools(self):
+        from mcp_servers.public_server import server
+        # `_list_tools()` bypasses the staff filter so the enhancer tools
+        # (inspect_scrape_html / find_selectors_for_text) are present.
+        tools = asyncio.run(server._list_tools())
+        self.props = {t.name: t.parameters["properties"] for t in tools}
+
+    def test_nanoid_id_params_are_string_typed(self):
+        offenders = []
+        for tool_name, params in _NANOID_ID_PARAMS.items():
+            for param in params:
+                types = _schema_types(self.props[tool_name][param])
+                if "string" not in types or "integer" in types:
+                    offenders.append((tool_name, param, sorted(types)))
+        assert not offenders, (
+            "NanoID id params must be JSON-schema string, not integer: "
+            f"{offenders}"
+        )
+
+    def test_pagination_and_value_params_stay_integer(self):
+        # Guards against an over-broad str swap that would break paging /
+        # salary / cap inputs the LLM passes as real integers.
+        for tool_name, params in _INT_PARAMS.items():
+            for param in params:
+                types = _schema_types(self.props[tool_name][param])
+                assert "integer" in types, (
+                    f"{tool_name}.{param} should stay integer, got {sorted(types)}"
+                )
+                assert "string" not in types, (
+                    f"{tool_name}.{param} should not be string, got {sorted(types)}"
+                )
+
+
+class TestNanoIdRoundTrip:
+    """CC-87: a NanoID-shaped id reaches the api client unchanged — it is not
+    stripped or coerced en route. Mocks the api client (mirrors
+    test_publish_job_post_tools / test_api_tools _fake_api). The three tools
+    the ticket calls out — update_scrape_profile (write), inspect_scrape_html
+    + find_selectors_for_text (enhancer reads) — must carry the NanoID into
+    the outbound URL / body."""
+
+    NANOID = "JHTQQNggMp"
+
+    def test_update_scrape_profile_forwards_nanoid_in_url_and_body(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import mcp_servers.public_server as ps
+
+        fake = MagicMock()
+        fake.patch_data = AsyncMock(return_value=(
+            {"data": {"type": "scrape-profile", "id": self.NANOID,
+                      "attributes": {}}},
+            None, 200,
+        ))
+        with patch.object(ps, "_api", return_value=fake):
+            asyncio.run(ps.update_scrape_profile(
+                profile_id=self.NANOID,
+                preferred_tier="anthropic:claude-haiku",
+            ))
+        path, body = fake.patch_data.await_args.args
+        assert self.NANOID in path, path
+        assert body["data"]["id"] == self.NANOID
+
+    def test_inspect_scrape_html_forwards_nanoid_in_url(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import mcp_servers.public_server as ps
+
+        fake = MagicMock()
+        fake.get_data = AsyncMock(return_value=(
+            {"data": {"attributes": {
+                "html": "<html><body><h1>About the job</h1></body></html>",
+                "status": "completed",
+            }}},
+            None, 200,
+        ))
+        with patch.object(ps, "_api", return_value=fake):
+            out = asyncio.run(ps.inspect_scrape_html(scrape_id=self.NANOID))
+        path = fake.get_data.await_args.args[0]
+        assert self.NANOID in path, path
+        # The NanoID was accepted, not rejected as a bad id.
+        assert "error" not in (yaml.safe_load(out) or {})
+
+    def test_find_selectors_for_text_forwards_nanoid_in_url(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import mcp_servers.public_server as ps
+
+        fake = MagicMock()
+        fake.get_data = AsyncMock(return_value=(
+            {"data": {"attributes": {
+                "html": (
+                    "<html><body>"
+                    "<h2 data-testid='jd'>About the job</h2>"
+                    "</body></html>"
+                ),
+                "status": "completed",
+            }}},
+            None, 200,
+        ))
+        with patch.object(ps, "_api", return_value=fake):
+            asyncio.run(ps.find_selectors_for_text(
+                scrape_id=self.NANOID, text="About the job",
+            ))
+        path = fake.get_data.await_args.args[0]
+        assert self.NANOID in path, path
