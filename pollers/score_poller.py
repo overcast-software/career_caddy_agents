@@ -107,7 +107,7 @@ async def _collect_candidates(api: ApiClient, limit: int) -> list[int]:
     return out
 
 
-async def _score_one(api: ApiClient, job_post_id: int) -> bool:
+async def _score_one(api: ApiClient, job_post_id: str) -> bool:
     try:
         raw = await score_job_post(api, job_post_id)
         resp = yaml.safe_load(raw)

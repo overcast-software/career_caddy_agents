@@ -46,7 +46,7 @@ class JobPostCreate(BaseModel):
 
     title: str = Field(..., min_length=1, max_length=200, description="Job title")
     description: Optional[str] = Field(None, description="Job description")
-    company_id: int = Field(..., gt=0, description="Company ID")
+    company_id: str = Field(..., min_length=1, description="Company ID (NanoID)")
     location: Optional[str] = Field(None, max_length=100, description="Job location")
     salary_min: Optional[int] = Field(None, ge=0, description="Minimum salary")
     salary_max: Optional[int] = Field(None, ge=0, description="Maximum salary")

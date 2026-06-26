@@ -42,7 +42,9 @@ class CompanyData(BaseModel):
 class JobPostCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
-    company_id: int = Field(..., gt=0)
+    # NanoID string PK since CC-77 (was int gt=0). Companies are addressed
+    # by opaque 10-char ids, so no numeric constraint applies.
+    company_id: str = Field(..., min_length=1)
     location: Optional[str] = Field(None, max_length=100)
     salary_min: Optional[int] = Field(None, ge=0)
     salary_max: Optional[int] = Field(None, ge=0)
@@ -688,7 +690,7 @@ async def search_companies(
     )
 
 
-async def get_companies(api: ApiClient, id: Optional[int] = None) -> str:
+async def get_companies(api: ApiClient, id: Optional[str] = None) -> str:
     """Fetch companies. Pass id to retrieve a single company; omit for the full list."""
     shape = TOOL_SHAPES["get_companies"]
     if id is not None:
@@ -775,7 +777,7 @@ async def create_job_post_with_company_check(
         company_id = None
         existing_companies = (company_search_payload or {}).get("data", []) or []
         if existing_companies:
-            company_id = int(existing_companies[0].get("id"))
+            company_id = existing_companies[0].get("id")
 
         # Create company if not found
         if company_id is None:
@@ -794,7 +796,7 @@ async def create_job_post_with_company_check(
             if create_err is not None:
                 return _respond(None, error=f"Failed to create company: {create_err}")
             new_company = (create_payload or {}).get("data", {}) or {}
-            company_id = int(new_company.get("id"))
+            company_id = new_company.get("id")
 
         # Create the job post
         job_data = JobPostCreate(
@@ -834,7 +836,7 @@ async def search_job_posts(
     query: Optional[str] = None,
     title: Optional[str] = None,
     company: Optional[str] = None,
-    company_id: Optional[int] = None,
+    company_id: Optional[str] = None,
     sort: Optional[str] = None,
     page_size: Optional[int] = None,
 ) -> str:
@@ -859,7 +861,7 @@ async def search_job_posts(
 
 async def get_job_posts(
     api: ApiClient,
-    id: Optional[int] = None,
+    id: Optional[str] = None,
     sort: Optional[str] = None,
     order: Optional[str] = None,
     page: Optional[int] = None,
@@ -887,7 +889,7 @@ async def get_job_posts(
 
 async def update_job_post(
     api: ApiClient,
-    job_post_id: int,
+    job_post_id: str,
     title: Optional[str] = None,
     description: Optional[str] = None,
     location: Optional[str] = None,
@@ -897,7 +899,7 @@ async def update_job_post(
     remote_ok: Optional[bool] = None,
     link: Optional[str] = None,
     posted_date: Optional[str] = None,
-    company_id: Optional[int] = None,
+    company_id: Optional[str] = None,
     source: Optional[str] = None,
 ) -> str:
     """Update an existing job post's attributes or company relationship."""
@@ -943,7 +945,7 @@ async def update_job_post(
     )
 
 
-async def publish_job_post(api: ApiClient, job_post_id: int) -> str:
+async def publish_job_post(api: ApiClient, job_post_id: str) -> str:
     """Publish a job post to the fediverse (ActivityPub) — owner-only.
 
     Thin wrapper over POST /api/v1/job-posts/<id>/publish/ (empty body). The
@@ -959,7 +961,7 @@ async def publish_job_post(api: ApiClient, job_post_id: int) -> str:
     )
 
 
-async def unpublish_job_post(api: ApiClient, job_post_id: int) -> str:
+async def unpublish_job_post(api: ApiClient, job_post_id: str) -> str:
     """Unpublish a job post from the fediverse (ActivityPub) — owner-only.
 
     Thin wrapper over POST /api/v1/job-posts/<id>/unpublish/ (empty body).
@@ -978,16 +980,18 @@ async def unpublish_job_post(api: ApiClient, job_post_id: int) -> str:
 
 async def create_job_application(
     api: ApiClient,
-    job_post_id: int,
+    job_post_id: str,
     status: str = "applied",
     notes: Optional[str] = None,
     applied_at: Optional[str] = None,
 ) -> str:
     """Create a new job application linked to an existing job post."""
-    if job_post_id <= 0:
+    # NanoID PKs (CC-77) are opaque strings; the old `<= 0` numeric guard
+    # raises TypeError on a str. Reject only empty/missing ids now.
+    if not job_post_id or not str(job_post_id).strip():
         return _respond(
             None,
-            error=f"Invalid job_post_id={job_post_id}. Look up the real ID first.",
+            error=f"Invalid job_post_id={job_post_id!r}. Look up the real ID first.",
         )
 
     attributes: dict = {"status": status}
@@ -1013,7 +1017,7 @@ async def create_job_application(
 
 async def get_job_applications(
     api: ApiClient,
-    id: Optional[int] = None,
+    id: Optional[str] = None,
     sort: Optional[_APPLICATION_SORT_FIELDS] = None,
     order: Optional[Literal["asc", "desc"]] = None,
     page: Optional[int] = None,
@@ -1039,7 +1043,7 @@ async def get_job_applications(
     )
 
 
-async def get_applications_for_job_post(api: ApiClient, job_post_id: int) -> str:
+async def get_applications_for_job_post(api: ApiClient, job_post_id: str) -> str:
     """Fetch all job applications linked to a specific job post."""
     return await _shaped_get(
         api,
@@ -1050,11 +1054,11 @@ async def get_applications_for_job_post(api: ApiClient, job_post_id: int) -> str
 
 async def update_job_application(
     api: ApiClient,
-    application_id: int,
+    application_id: str,
     status: Optional[str] = None,
     notes: Optional[str] = None,
     applied_at: Optional[str] = None,
-    company_id: Optional[int] = None,
+    company_id: Optional[str] = None,
 ) -> str:
     """Update a job application's status, notes, or company association."""
     attributes = {}
@@ -1117,7 +1121,7 @@ async def get_current_user(api: ApiClient) -> str:
 
 async def get_resumes(
     api: ApiClient,
-    id: Optional[int] = None,
+    id: Optional[str] = None,
     favorite: Optional[bool] = None,
     page: Optional[int] = None,
     per_page: Optional[int] = None,
@@ -1152,8 +1156,8 @@ async def get_resumes(
 async def create_scrape(
     api: ApiClient,
     url: str,
-    job_post_id: Optional[int] = None,
-    company_id: Optional[int] = None,
+    job_post_id: Optional[str] = None,
+    company_id: Optional[str] = None,
     status: Optional[str] = None,
 ) -> str:
     """Create a scrape record. Omit status (or pass 'pending') to start scraping immediately; pass 'hold' to queue for later."""
@@ -1181,7 +1185,7 @@ async def create_scrape(
 
 async def get_scrapes(
     api: ApiClient,
-    id: Optional[int] = None,
+    id: Optional[str] = None,
     sort: Optional[str] = None,
     page: Optional[int] = None,
     per_page: Optional[int] = None,
@@ -1255,7 +1259,7 @@ async def claim_next_scrape(
 
 async def update_scrape(
     api: ApiClient,
-    scrape_id: int,
+    scrape_id: str,
     status: Optional[str] = None,
     job_content: Optional[str] = None,
     url: Optional[str] = None,
@@ -1288,19 +1292,19 @@ async def update_scrape(
     )
 
 
-async def upload_screenshot(api: ApiClient, scrape_id: int, file_path: Path) -> str:
+async def upload_screenshot(api: ApiClient, scrape_id: str, file_path: Path) -> str:
     """Upload a screenshot PNG to the API for a scrape."""
     return await api.post_file(
         f"/api/v1/scrapes/{scrape_id}/screenshots/", file_path
     )
 
 
-async def list_screenshots(api: ApiClient, scrape_id: int) -> str:
+async def list_screenshots(api: ApiClient, scrape_id: str) -> str:
     """List screenshot filenames for a scrape. Staff-only endpoint."""
     return await api.get(f"/api/v1/scrapes/{scrape_id}/screenshots/")
 
 
-async def get_duplicate_candidates(api: ApiClient, job_post_id: int) -> str:
+async def get_duplicate_candidates(api: ApiClient, job_post_id: str) -> str:
     """Fetch likely-duplicate JobPosts for a given post.
 
     Returns a list of {id, title, company_name, match_signals,
@@ -1438,7 +1442,7 @@ async def find_duplicate_candidates(
     return _respond({"candidates": out_list, "count": len(out_list)})
 
 
-async def get_scrape_graph_trace(api: ApiClient, scrape_id: int) -> str:
+async def get_scrape_graph_trace(api: ApiClient, scrape_id: str) -> str:
     """Fetch the pydantic-graph node trace for a scrape. Owner-or-staff
     gated endpoint. Returns ordered transitions (graph_node + payload +
     note + timestamp) and meta.chain walking the source_scrape parents
@@ -1446,7 +1450,7 @@ async def get_scrape_graph_trace(api: ApiClient, scrape_id: int) -> str:
     return await api.get(f"/api/v1/scrapes/{scrape_id}/graph-trace/")
 
 
-async def get_scrape_statuses(api: ApiClient, scrape_id: int) -> str:
+async def get_scrape_statuses(api: ApiClient, scrape_id: str) -> str:
     """Fetch the full ScrapeStatus history for a scrape — every row, not
     just rows with a graph_node set. Owner-or-staff gated; the rows
     can carry exception text and internal-only diagnostic detail in
@@ -1454,7 +1458,7 @@ async def get_scrape_statuses(api: ApiClient, scrape_id: int) -> str:
     return await api.get(f"/api/v1/scrapes/{scrape_id}/scrape-statuses/")
 
 
-async def fetch_screenshot_bytes(api: ApiClient, scrape_id: int, filename: str) -> bytes:
+async def fetch_screenshot_bytes(api: ApiClient, scrape_id: str, filename: str) -> bytes:
     """Download a screenshot PNG's raw bytes. Staff-only endpoint.
 
     Returns raw PNG bytes on success; raises on HTTP error. Used by the MCP
@@ -1479,7 +1483,7 @@ async def get_scrape_profile(api: ApiClient, hostname: str) -> str:
     )
 
 
-async def update_scrape_profile(api: ApiClient, profile_id: int, **attrs) -> str:
+async def update_scrape_profile(api: ApiClient, profile_id: str, **attrs) -> str:
     """Update a scrape profile's editable fields (css_selectors, extraction_hints, etc.)."""
     json_attrs = {}
     for key, value in attrs.items():
@@ -1499,9 +1503,9 @@ async def update_scrape_profile(api: ApiClient, profile_id: int, **attrs) -> str
 
 async def get_questions(
     api: ApiClient,
-    id: Optional[int] = None,
-    company_id: Optional[int] = None,
-    job_post_id: Optional[int] = None,
+    id: Optional[str] = None,
+    company_id: Optional[str] = None,
+    job_post_id: Optional[str] = None,
     page: Optional[int] = None,
     per_page: Optional[int] = None,
 ) -> str:
@@ -1528,9 +1532,9 @@ async def get_questions(
 async def create_question(
     api: ApiClient,
     content: str,
-    company_id: Optional[int] = None,
-    job_post_id: Optional[int] = None,
-    job_application_id: Optional[int] = None,
+    company_id: Optional[str] = None,
+    job_post_id: Optional[str] = None,
+    job_application_id: Optional[str] = None,
 ) -> str:
     """Create an interview question. Supply at least one of company_id, job_post_id, or job_application_id so the question is scoped — unscoped questions are hard to find later. Always check get_questions first to avoid duplicates."""
     relationships: dict = {}
@@ -1559,8 +1563,8 @@ async def create_question(
 
 async def get_answers(
     api: ApiClient,
-    id: Optional[int] = None,
-    question_id: Optional[int] = None,
+    id: Optional[str] = None,
+    question_id: Optional[str] = None,
     favorite: Optional[bool] = None,
     page: Optional[int] = None,
     per_page: Optional[int] = None,
@@ -1587,7 +1591,7 @@ async def get_answers(
 
 async def create_answer(
     api: ApiClient,
-    question_id: int,
+    question_id: str,
     content: str,
     ai_assist: bool = False,
     prompt: Optional[str] = None,
@@ -1618,7 +1622,7 @@ async def create_answer(
 
 async def update_answer(
     api: ApiClient,
-    answer_id: int,
+    answer_id: str,
     content: Optional[str] = None,
     favorite: Optional[bool] = None,
 ) -> str:
@@ -1643,7 +1647,7 @@ async def update_answer(
     return await api.patch(f"/api/v1/answers/{answer_id}/", payload)
 
 
-async def score_job_post(api: ApiClient, job_post_id: int) -> str:
+async def score_job_post(api: ApiClient, job_post_id: str) -> str:
     """Score a job post against the user's career data."""
     payload = {
         "data": {
@@ -1659,8 +1663,8 @@ async def score_job_post(api: ApiClient, job_post_id: int) -> str:
 
 async def get_scores(
     api: ApiClient,
-    id: Optional[int] = None,
-    job_post_id: Optional[int] = None,
+    id: Optional[str] = None,
+    job_post_id: Optional[str] = None,
     page: Optional[int] = None,
     per_page: Optional[int] = None,
 ) -> str:
@@ -1690,7 +1694,7 @@ async def get_scores(
 _SCRAPE_TERMINAL = {"completed", "failed"}
 
 
-async def _raw_get_scrape(api: ApiClient, scrape_id: int) -> dict:
+async def _raw_get_scrape(api: ApiClient, scrape_id: str) -> dict:
     """GET a scrape and return the raw JSON:API body (relationships intact)."""
     async with httpx.AsyncClient(follow_redirects=True, timeout=api.timeout) as client:
         resp = await client.get(
@@ -1716,7 +1720,7 @@ def _composite_ok(message: str, **data) -> str:
 async def scrape_and_score(
     api: ApiClient,
     url: str,
-    resume_id: Optional[int] = None,
+    resume_id: Optional[str] = None,
     poll_interval: float = 3.0,
     timeout: float = 60.0,
 ) -> str:
@@ -1748,7 +1752,6 @@ async def scrape_and_score(
     scrape_id = scrape_data.get("id")
     if scrape_id is None:
         return _composite_err("Scrape created but no id returned", response=create_payload)
-    scrape_id = int(scrape_id)
 
     # 2. Poll for terminal status
     deadline = time.monotonic() + timeout
@@ -1782,11 +1785,11 @@ async def scrape_and_score(
         )
 
     # 3. Resolve job_post_id from relationships (may trail status flip briefly)
-    def _extract_job_post_id(body: dict) -> Optional[int]:
+    def _extract_job_post_id(body: dict) -> Optional[str]:
         rels = body.get("data", {}).get("relationships", {}) or {}
         jp = (rels.get("job-post") or {}).get("data")
         if jp and jp.get("id"):
-            return int(jp["id"])
+            return jp["id"]
         return None
 
     job_post_id = _extract_job_post_id(scrape_body)
@@ -1837,7 +1840,7 @@ async def scrape_and_score(
         )
 
     score_data = (score_payload or {}).get("data", {}) or {}
-    score_id = int(score_data["id"]) if score_data.get("id") else None
+    score_id = score_data["id"] if score_data.get("id") else None
     score_status = (score_data.get("attributes") or {}).get("status")
 
     # 5. Build frontend URL + return
@@ -1872,7 +1875,7 @@ async def scrape_and_score(
 # ---------------------------------------------------------------------------
 
 
-async def show_resume(api: ApiClient, resume_id: int) -> str:
+async def show_resume(api: ApiClient, resume_id: str) -> str:
     """Return a markdown-rendered view of a resume (token-efficient vs. JSON).
 
     Use this after an import to narrate the extracted contents back to the user
@@ -1883,7 +1886,7 @@ async def show_resume(api: ApiClient, resume_id: int) -> str:
 
 async def edit_resume(
     api: ApiClient,
-    resume_id: int,
+    resume_id: str,
     title: Optional[str] = None,
     name: Optional[str] = None,
     notes: Optional[str] = None,
@@ -1926,7 +1929,7 @@ async def edit_resume(
     return await api.patch(f"/api/v1/resumes/{resume_id}/", payload)
 
 
-async def show_cover_letter(api: ApiClient, cover_letter_id: int) -> str:
+async def show_cover_letter(api: ApiClient, cover_letter_id: str) -> str:
     """Return a markdown-rendered view of a cover letter."""
     return await api.get_text(
         f"/api/v1/cover-letters/{cover_letter_id}/markdown/"
@@ -1935,7 +1938,7 @@ async def show_cover_letter(api: ApiClient, cover_letter_id: int) -> str:
 
 async def edit_cover_letter(
     api: ApiClient,
-    cover_letter_id: int,
+    cover_letter_id: str,
     content: Optional[str] = None,
     favorite: Optional[bool] = None,
     status: Optional[str] = None,

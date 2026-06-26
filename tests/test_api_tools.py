@@ -114,16 +114,23 @@ class TestModels:
             CompanyData(name="")
 
     def test_job_post_create_salary_validation(self):
-        jp = JobPostCreate(title="Dev", company_id=1, salary_min=50000, salary_max=100000)
+        # company_id is a NanoID string PK since CC-77 (was int gt=0).
+        jp = JobPostCreate(
+            title="Dev", company_id="Wl308a2inM",
+            salary_min=50000, salary_max=100000,
+        )
         assert jp.salary_min == 50000
+        assert jp.company_id == "Wl308a2inM"
 
     def test_job_post_create_rejects_negative_salary(self):
         with pytest.raises(Exception):
-            JobPostCreate(title="Dev", company_id=1, salary_min=-1)
+            JobPostCreate(title="Dev", company_id="Wl308a2inM", salary_min=-1)
 
-    def test_job_post_create_rejects_zero_company(self):
+    def test_job_post_create_rejects_empty_company(self):
+        # NanoID company_id must be a non-empty string (min_length=1); the old
+        # gt=0 numeric guard no longer applies to opaque string PKs.
         with pytest.raises(Exception):
-            JobPostCreate(title="Dev", company_id=0)
+            JobPostCreate(title="Dev", company_id="")
 
 
 # ---------------------------------------------------------------------------

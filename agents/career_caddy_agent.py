@@ -26,11 +26,11 @@ class CareerCaddyResponse(BaseModel):
     action_taken: str = Field(
         description="Action performed: 'created', 'duplicate', 'found', 'queried', 'error'"
     )
-    job_id: Optional[int] = Field(
-        None, description="ID of the job post (if applicable)"
+    job_id: Optional[str] = Field(
+        None, description="ID of the job post (NanoID string, if applicable)"
     )
-    company_id: Optional[int] = Field(
-        None, description="ID of the company (if applicable)"
+    company_id: Optional[str] = Field(
+        None, description="ID of the company (NanoID string, if applicable)"
     )
     details: Optional[dict] = Field(None, description="Additional data from the API")
 
@@ -54,7 +54,7 @@ _CAREER_CADDY_SYSTEM_PROMPT = """
     ## Workflow for recording a job application
     1. Find the job post using `find_job_post_by_link` (preferred) or `get_job_posts` as a last resort.
        - The job post may already exist — that is fine. Use its `id` directly.
-    2. Call `create_job_application` with the `job_post_id` (integer) and `status` (default: "applied").
+    2. Call `create_job_application` with the `job_post_id` (string NanoID) and `status` (default: "applied").
     3. Done — do NOT retry or call any create_job_post tool after this step.
 
     ## Workflow for updating an existing job application (e.g. change status)
@@ -171,8 +171,8 @@ _CAREER_CADDY_SYSTEM_PROMPT = """
     You MUST call the `final_result` tool with these fields:
     - summary: plain-English description of what happened
     - action_taken: one of "created", "duplicate", "found", "queried", "error"
-    - job_id: integer ID of the job post, or null
-    - company_id: integer ID of the company, or null
+    - job_id: ID of the job post (string), or null
+    - company_id: ID of the company (string), or null
     - details: object with extra API data, or null
 
     NEVER output plain text or JSON as your final message. ALWAYS end by calling `final_result`.
@@ -188,7 +188,7 @@ career_caddy_agent = get_agent(
 )
 
 
-async def parse_and_add_job(job_content: str, url: Optional[str] = None, scrape_id: Optional[int] = None) -> dict:
+async def parse_and_add_job(job_content: str, url: Optional[str] = None, scrape_id: Optional[str] = None) -> dict:
     """Extract structured job data from raw content then add it to the system.
 
     Uses job_extractor_agent to produce a JobPostData, then delegates to

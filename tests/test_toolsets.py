@@ -170,7 +170,11 @@ class TestWrapperSignatures:
         from lib import api_tools
         wrapper = _make_tool_wrapper(api_tools.score_job_post)
         sig = inspect.signature(wrapper)
-        assert sig.parameters["job_post_id"].annotation is int
+        # job_post_id is a NanoID string PK since CC-77 (was int). The wrapper
+        # must propagate the str annotation so pydantic-ai advertises a
+        # JSON-schema string to the chat model — see CC-101. An int hint here
+        # makes the model client strip a NanoID before the call leaves it.
+        assert sig.parameters["job_post_id"].annotation is str
 
     def test_wrapper_preserves_defaults(self):
         from lib import api_tools
