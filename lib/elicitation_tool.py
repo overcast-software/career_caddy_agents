@@ -53,7 +53,12 @@ class ModelActionTarget(BaseModel):
     """
 
     type: str = Field(description="Ember model type, e.g. 'resume', 'cover-letter', 'answer', 'job-post', 'user'")
-    id: int = Field(description="Record id")
+    # Ember Data record ids are strings on the wire. Since CC-77 the
+    # NanoID-keyed models (resume/cover-letter/answer/job-post) carry opaque
+    # string ids; the user record stays numeric but serializes fine as a
+    # string. A plain `int` here let the MCP client strip a NanoID before the
+    # action reached the frontend.
+    id: str = Field(description="Record id")
     patch: dict[str, Any] = Field(
         description="Fields to set on the record. See ALLOWED_MODEL_PATCH_KEYS in the tool description."
     )

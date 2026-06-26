@@ -166,7 +166,7 @@ async def process_scrape(api: ApiClient, scrape: dict) -> bool:
 
 async def _run_graph(
     api: ApiClient,
-    scrape_id: int,
+    scrape_id: str,
     url: str,
     hostname: str,
     profile: dict | None,

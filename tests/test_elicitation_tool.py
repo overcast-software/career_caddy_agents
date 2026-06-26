@@ -31,13 +31,14 @@ class TestElicitationActionSchema:
         assert a.message is None
 
     def test_model_shape_valid(self):
+        # Record ids are NanoID strings since CC-77 (was int) — see CC-101.
         a = ElicitationAction(
             label="Favorite",
-            model={"type": "resume", "id": 7, "patch": {"favorite": True}},
+            model={"type": "resume", "id": "Rs7mAaaaaa", "patch": {"favorite": True}},
         )
         assert a.model is not None
         assert a.model.type == "resume"
-        assert a.model.id == 7
+        assert a.model.id == "Rs7mAaaaaa"
         assert a.model.patch == {"favorite": True}
 
     def test_message_shape_valid(self):
@@ -62,7 +63,7 @@ class TestElicitationActionSchema:
                 label="Very bad",
                 navigate="/x",
                 message="y",
-                model={"type": "resume", "id": 1, "patch": {"favorite": True}},
+                model={"type": "resume", "id": "1", "patch": {"favorite": True}},
             )
 
     def test_label_required(self):
@@ -73,18 +74,18 @@ class TestElicitationActionSchema:
 class TestModelActionTarget:
     def test_all_fields_required(self):
         with pytest.raises(ValidationError):
-            ModelActionTarget(type="resume", id=1)  # missing patch
+            ModelActionTarget(type="resume", id="1")  # missing patch
         with pytest.raises(ValidationError):
             ModelActionTarget(type="resume", patch={})  # missing id
         with pytest.raises(ValidationError):
-            ModelActionTarget(id=1, patch={})  # missing type
+            ModelActionTarget(id="1", patch={})  # missing type
 
     def test_patch_accepts_arbitrary_keys(self):
         """The tool side does NOT enforce the allow-list — the frontend does.
         The agent picks valid keys because the tool's docstring lists them."""
         target = ModelActionTarget(
             type="user",
-            id=1,
+            id="1",
             patch={"onboarding": {"wizard_enabled": False}},
         )
         assert target.patch == {"onboarding": {"wizard_enabled": False}}

@@ -29,7 +29,7 @@ class _FakeResponse:
         return self._body
 
 
-def _scrape_body(scrape_id: int, status: str, job_post_id=None):
+def _scrape_body(scrape_id, status: str, job_post_id=None):
     rels = {}
     if job_post_id is not None:
         rels["job-post"] = {"data": {"type": "job-post", "id": str(job_post_id)}}
@@ -59,23 +59,26 @@ def _no_sleep():
 
 @pytest.mark.asyncio
 async def test_happy_path(api):
-    create_resp = _post_data_ok({"data": {"type": "scrape", "id": "42"}}, 202)
+    # NanoID string PKs (CC-77): ids must round-trip uncoerced. The old
+    # int(scrape_id) / int(jp["id"]) / int(score["id"]) casts would have
+    # raised ValueError on these non-numeric ids — see CC-101.
+    create_resp = _post_data_ok({"data": {"type": "scrape", "id": "Sc42aaaaaa"}}, 202)
     score_resp = _post_data_ok(
-        {"data": {"type": "score", "id": "7", "attributes": {"status": "pending"}}},
+        {"data": {"type": "score", "id": "So7ccccccc", "attributes": {"status": "pending"}}},
         202,
     )
 
     with patch.object(ApiClient, "post_data", new=AsyncMock(side_effect=[create_resp, score_resp])), \
          patch("lib.api_tools._raw_get_scrape", new=AsyncMock(side_effect=[
-             _scrape_body(42, "pending"),
-             _scrape_body(42, "completed", job_post_id=9),
+             _scrape_body("Sc42aaaaaa", "pending"),
+             _scrape_body("Sc42aaaaaa", "completed", job_post_id="Jp9bbbbbbb"),
          ])):
         result = yaml.safe_load(await scrape_and_score(api, "https://x"))
 
-    assert result["scrape_id"] == 42
-    assert result["job_post_id"] == 9
-    assert result["score_id"] == 7
-    assert result["scores_url"].endswith("/job-posts/9/scores")
+    assert result["scrape_id"] == "Sc42aaaaaa"
+    assert result["job_post_id"] == "Jp9bbbbbbb"
+    assert result["score_id"] == "So7ccccccc"
+    assert result["scores_url"].endswith("/job-posts/Jp9bbbbbbb/scores")
 
 
 @pytest.mark.asyncio
@@ -110,7 +113,7 @@ async def test_late_job_post_linkage(api):
              _scrape_body(11, "completed", job_post_id=22),
          ])):
         result = yaml.safe_load(await scrape_and_score(api, "https://x"))
-    assert result["job_post_id"] == 22
+    assert result["job_post_id"] == "22"
 
 
 @pytest.mark.asyncio

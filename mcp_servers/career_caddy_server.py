@@ -92,7 +92,7 @@ async def search_companies(
 
 
 @server.tool()
-async def get_companies(id: Optional[int] = None) -> str:
+async def get_companies(id: Optional[str] = None) -> str:
     """Fetch companies. Pass id to retrieve a single company; omit for the full list."""
     return await api_tools.get_companies(_api(), id)
 
@@ -144,7 +144,7 @@ async def search_job_posts(
     query: Optional[str] = None,
     title: Optional[str] = None,
     company: Optional[str] = None,
-    company_id: Optional[int] = None,
+    company_id: Optional[str] = None,
     sort: Optional[str] = None,
     page_size: Optional[int] = None,
 ) -> str:
@@ -156,7 +156,7 @@ async def search_job_posts(
 
 @server.tool()
 async def get_job_posts(
-    id: Optional[int] = None,
+    id: Optional[str] = None,
     sort: Optional[str] = None,
     order: Optional[str] = None,
     page: Optional[int] = None,
@@ -168,7 +168,7 @@ async def get_job_posts(
 
 @server.tool()
 async def update_job_post(
-    job_post_id: int,
+    job_post_id: str,
     title: Optional[str] = None,
     description: Optional[str] = None,
     location: Optional[str] = None,
@@ -178,7 +178,7 @@ async def update_job_post(
     remote_ok: Optional[bool] = None,
     link: Optional[str] = None,
     posted_date: Optional[str] = None,
-    company_id: Optional[int] = None,
+    company_id: Optional[str] = None,
     source: Optional[str] = None,
 ) -> str:
     """Update an existing job post's attributes or company relationship."""
@@ -196,14 +196,14 @@ async def update_job_post(
 
 @server.tool()
 async def create_job_application(
-    job_post_id: int,
+    job_post_id: str,
     status: str = "applied",
     notes: Optional[str] = None,
     applied_at: Optional[str] = None,
 ) -> str:
     """Create a new job application linked to an existing job post.
 
-    job_post_id is the integer ID of the job post.
+    job_post_id is the ID of the job post.
     status should be one of: applied, interviewing, offered, rejected, withdrawn.
     applied_at: ISO date string (e.g. '2026-03-23'). Do NOT use 'applied_date'.
     """
@@ -213,7 +213,7 @@ async def create_job_application(
 
 
 @server.tool()
-async def get_applications_for_job_post(job_post_id: int) -> str:
+async def get_applications_for_job_post(job_post_id: str) -> str:
     """Fetch all job applications linked to a specific job post.
 
     Use this to find the application ID when you need to update an existing application.
@@ -224,7 +224,7 @@ async def get_applications_for_job_post(job_post_id: int) -> str:
 
 @server.tool()
 async def get_job_applications(
-    id: Optional[int] = None,
+    id: Optional[str] = None,
     sort: Optional[_APPLICATION_SORT_FIELDS] = None,
     order: Optional[Literal["asc", "desc"]] = None,
     page: Optional[int] = None,
@@ -242,11 +242,11 @@ async def get_job_applications(
 
 @server.tool()
 async def update_job_application(
-    application_id: int,
+    application_id: str,
     status: Optional[str] = None,
     notes: Optional[str] = None,
     applied_at: Optional[str] = None,
-    company_id: Optional[int] = None,
+    company_id: Optional[str] = None,
 ) -> str:
     """Update a job application's status, notes, or company association.
 

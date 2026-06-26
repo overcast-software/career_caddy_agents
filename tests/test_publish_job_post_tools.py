@@ -98,3 +98,32 @@ class TestUnpublishJobPost:
         out = yaml.safe_load(await unpublish_job_post(api, 12345))
         assert "404" in out["error"]
         assert out["status_code"] == 404
+
+
+class TestPublishUnpublishNanoIdRoundTrip:
+    """CC-101: JobPost PK is a 10-char NanoID string since CC-77. The headline
+    BACK-101 bug was the stale int hint on job_post_id stripping the NanoID
+    before the publish/unpublish call left the MCP client. These assert the
+    opaque string reaches the api URL unchanged."""
+
+    NANOID = "xDQWnN7j76"
+
+    @pytest.mark.asyncio
+    async def test_publish_forwards_nanoid_in_url(self):
+        api = _api((_job_post(self.NANOID, [AS2_PUBLIC]), None, 200))
+        out = yaml.safe_load(await publish_job_post(api, self.NANOID))
+        assert api.post_data.await_args.args == (
+            f"/api/v1/job-posts/{self.NANOID}/publish/", {},
+        )
+        assert out["data"]["id"] == self.NANOID
+        assert "error" not in out
+
+    @pytest.mark.asyncio
+    async def test_unpublish_forwards_nanoid_in_url(self):
+        api = _api((_job_post(self.NANOID, []), None, 200))
+        out = yaml.safe_load(await unpublish_job_post(api, self.NANOID))
+        assert api.post_data.await_args.args == (
+            f"/api/v1/job-posts/{self.NANOID}/unpublish/", {},
+        )
+        assert out["data"]["id"] == self.NANOID
+        assert "error" not in out
