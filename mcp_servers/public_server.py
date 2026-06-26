@@ -261,7 +261,7 @@ async def search_companies(
 
 
 @server.tool()
-async def get_companies(id: Optional[int] = None) -> str:
+async def get_companies(id: Optional[str] = None) -> str:
     """Fetch companies. Pass id to retrieve a single company; omit for the full list."""
     return await api_tools.get_companies(_api(), id)
 
@@ -313,7 +313,7 @@ async def find_job_post_by_link(link: str) -> str:
 
 
 @server.tool()
-async def get_duplicate_candidates(job_post_id: int) -> str:
+async def get_duplicate_candidates(job_post_id: str) -> str:
     """List likely-duplicate JobPosts for a given post.
 
     Returns up to 10 peer posts the system suspects represent the
@@ -366,7 +366,7 @@ async def search_job_posts(
     query: Optional[str] = None,
     title: Optional[str] = None,
     company: Optional[str] = None,
-    company_id: Optional[int] = None,
+    company_id: Optional[str] = None,
     sort: Optional[str] = None,
     page_size: Optional[int] = None,
 ) -> str:
@@ -387,7 +387,7 @@ async def search_job_posts(
 
 @server.tool()
 async def get_job_posts(
-    id: Optional[int] = None,
+    id: Optional[str] = None,
     sort: Optional[str] = None,
     order: Optional[str] = None,
     page: Optional[int] = None,
@@ -399,7 +399,7 @@ async def get_job_posts(
 
 @server.tool()
 async def update_job_post(
-    job_post_id: int,
+    job_post_id: str,
     title: Optional[str] = None,
     description: Optional[str] = None,
     location: Optional[str] = None,
@@ -409,7 +409,7 @@ async def update_job_post(
     remote_ok: Optional[bool] = None,
     link: Optional[str] = None,
     posted_date: Optional[str] = None,
-    company_id: Optional[int] = None,
+    company_id: Optional[str] = None,
     source: Optional[str] = None,
 ) -> str:
     """Update an existing job post's attributes or company relationship.
@@ -426,7 +426,7 @@ async def update_job_post(
 
 
 @server.tool()
-async def publish_job_post(job_post_id: int) -> str:
+async def publish_job_post(job_post_id: str) -> str:
     """Publish a job post to the fediverse (ActivityPub). Owner-only.
 
     Marks the post public by adding the AS2 Public URI to its audience; the
@@ -439,7 +439,7 @@ async def publish_job_post(job_post_id: int) -> str:
 
 
 @server.tool()
-async def unpublish_job_post(job_post_id: int) -> str:
+async def unpublish_job_post(job_post_id: str) -> str:
     """Unpublish a job post from the fediverse (ActivityPub). Owner-only.
 
     Removes the AS2 Public URI from the post's audience, flipping it back to
@@ -457,14 +457,14 @@ async def unpublish_job_post(job_post_id: int) -> str:
 
 @server.tool()
 async def create_job_application(
-    job_post_id: int,
+    job_post_id: str,
     status: str = "applied",
     notes: Optional[str] = None,
     applied_at: Optional[str] = None,
 ) -> str:
     """Create a new job application linked to an existing job post.
 
-    job_post_id is the integer ID of the job post.
+    job_post_id is the ID of the job post.
     status should be one of: applied, interviewing, offered, rejected, withdrawn.
     applied_at: ISO date string (e.g. '2026-03-23').
     """
@@ -475,7 +475,7 @@ async def create_job_application(
 
 @server.tool()
 async def get_job_applications(
-    id: Optional[int] = None,
+    id: Optional[str] = None,
     sort: Optional[api_tools._APPLICATION_SORT_FIELDS] = None,
     order: Optional[Literal["asc", "desc"]] = None,
     page: Optional[int] = None,
@@ -492,7 +492,7 @@ async def get_job_applications(
 
 
 @server.tool()
-async def get_applications_for_job_post(job_post_id: int) -> str:
+async def get_applications_for_job_post(job_post_id: str) -> str:
     """Fetch all job applications linked to a specific job post.
 
     Use this to find the application ID when you need to update an existing application.
@@ -503,11 +503,11 @@ async def get_applications_for_job_post(job_post_id: int) -> str:
 
 @server.tool()
 async def update_job_application(
-    application_id: int,
+    application_id: str,
     status: Optional[str] = None,
     notes: Optional[str] = None,
     applied_at: Optional[str] = None,
-    company_id: Optional[int] = None,
+    company_id: Optional[str] = None,
 ) -> str:
     """Update a job application's status, notes, or company association.
 
@@ -540,8 +540,8 @@ async def get_career_data() -> str:
 @server.tool()
 async def create_scrape(
     url: str,
-    job_post_id: Optional[int] = None,
-    company_id: Optional[int] = None,
+    job_post_id: Optional[str] = None,
+    company_id: Optional[str] = None,
 ) -> str:
     """Create a scrape record with status='hold' for later processing.
 
@@ -553,7 +553,7 @@ async def create_scrape(
 
 @server.tool()
 async def get_scrapes(
-    id: Optional[int] = None,
+    id: Optional[str] = None,
     sort: Optional[str] = None,
     page: Optional[int] = None,
     per_page: Optional[int] = None,
@@ -568,7 +568,7 @@ async def get_scrapes(
 
 @server.tool()
 async def update_scrape(
-    scrape_id: int,
+    scrape_id: str,
     status: Optional[str] = None,
     job_content: Optional[str] = None,
     url: Optional[str] = None,
@@ -581,7 +581,7 @@ async def update_scrape(
 
 
 @server.tool()
-async def list_scrape_screenshots(scrape_id: int) -> str:
+async def list_scrape_screenshots(scrape_id: str) -> str:
     """List screenshot filenames captured for a scrape. Staff-only.
 
     Returns JSON with a list of filenames that can be passed to
@@ -591,7 +591,7 @@ async def list_scrape_screenshots(scrape_id: int) -> str:
 
 
 @server.tool()
-async def get_scrape_graph_trace(scrape_id: int) -> str:
+async def get_scrape_graph_trace(scrape_id: str) -> str:
     """Fetch the pydantic-graph node trace for a scrape. Owner-or-staff.
 
     Returns ordered transitions: scrape_id, graph_node, graph_payload,
@@ -605,7 +605,7 @@ async def get_scrape_graph_trace(scrape_id: int) -> str:
 
 
 @server.tool()
-async def get_scrape_statuses(scrape_id: int) -> str:
+async def get_scrape_statuses(scrape_id: str) -> str:
     """Fetch the full status history for a scrape. Owner-or-staff.
 
     Returns every ScrapeStatus row (not just rows with a graph_node),
@@ -618,7 +618,7 @@ async def get_scrape_statuses(scrape_id: int) -> str:
 
 
 @server.tool()
-async def fetch_scrape_screenshot(scrape_id: int, filename: str) -> str:
+async def fetch_scrape_screenshot(scrape_id: str, filename: str) -> str:
     """Download a scrape screenshot as a base64-encoded PNG. Staff-only.
 
     The caller should base64-decode the result to get raw PNG bytes, e.g. to
@@ -644,7 +644,7 @@ async def get_scrape_profile(hostname: str) -> str:
 
 @server.tool()
 async def update_scrape_profile(
-    profile_id: int,
+    profile_id: str,
     css_selectors: Optional[dict] = None,
     extraction_hints: Optional[str] = None,
     page_structure: Optional[str] = None,
@@ -696,7 +696,7 @@ async def update_scrape_profile(
 
 
 @server.tool()
-async def score_job_post(job_post_id: int) -> str:
+async def score_job_post(job_post_id: str) -> str:
     """Score a job post against the user's career data.
 
     Scores against the user's full career data (all favorite resumes,
@@ -710,8 +710,8 @@ async def score_job_post(job_post_id: int) -> str:
 
 @server.tool()
 async def get_scores(
-    id: Optional[int] = None,
-    job_post_id: Optional[int] = None,
+    id: Optional[str] = None,
+    job_post_id: Optional[str] = None,
     page: Optional[int] = None,
     per_page: Optional[int] = None,
 ) -> str:
@@ -734,7 +734,7 @@ async def get_scores(
 # without spinning up MCP.
 
 
-async def _fetch_scrape_html(scrape_id: int) -> tuple[Optional[str], Optional[str]]:
+async def _fetch_scrape_html(scrape_id: str) -> tuple[Optional[str], Optional[str]]:
     """Return (html, error). Caller decides how to surface the error."""
     payload, error, status = await _api().get_data(
         f"/api/v1/scrapes/{scrape_id}/"
@@ -755,7 +755,7 @@ async def _fetch_scrape_html(scrape_id: int) -> tuple[Optional[str], Optional[st
 
 @server.tool()
 async def inspect_scrape_html(
-    scrape_id: int,
+    scrape_id: str,
     selector: Optional[str] = None,
     mode: Optional[Literal["trim", "skeleton", "selector"]] = None,
     max_chars: Optional[int] = None,
@@ -915,7 +915,7 @@ async def test_url_rewrite(
 
 @server.tool()
 async def find_selectors_for_text(
-    scrape_id: int,
+    scrape_id: str,
     text: str,
     max_results: Optional[int] = None,
     case_insensitive: Optional[bool] = None,
