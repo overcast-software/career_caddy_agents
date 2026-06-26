@@ -5,7 +5,12 @@ requires-python = ">=3.13"
 dependencies = [
     "uvicorn[standard]>=0.24.0",
     "pydantic>=2.0.0",
-    "pydantic-ai>=0.0.14",
+    # Pinned <2: pydantic-ai 2.0 is a breaking major (removed
+    # `pydantic_ai.ag_ui` used by chat_server; pydantic-graph 2.0 reworked
+    # the Graph constructor, breaking scrape_graph). The 2.0 migration is
+    # its own dedicated piece of work — hold here so the dep refresh stays
+    # shippable to the prod MCP servers. See CC-94.
+    "pydantic-ai>=0.0.14,<2",
     "playwright>=1.40.0",
     "httpx>=0.25.0",
     "python-dotenv>=1.0.0",
