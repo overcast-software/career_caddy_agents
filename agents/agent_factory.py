@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import AsyncIterator, Any, Callable
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
+from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.messages import ModelResponseStreamEvent
 from pydantic_ai.profiles import ModelProfile
 from pydantic_ai.models import ModelRequestParameters
@@ -244,8 +245,9 @@ global_model = get_model("caddy")
 class AgentConfig:
     """Configuration blueprint for creating a pydantic-ai Agent.
 
-    Toolsets and deps that require fresh instances per agent (e.g. MCPServerStdio)
-    should be passed as factory callables that return the object.
+    Toolsets and deps that require fresh instances per agent (e.g. an
+    MCPToolset over a stdio transport) should be passed as factory callables
+    that return the object.
     """
 
     role: str
@@ -253,8 +255,9 @@ class AgentConfig:
     output_type: type | None = None
     deps_type: type | None = None
     # Callables that return toolset instances — called at agent creation time.
-    # Use callables for stateful resources (MCPServerStdio) that need fresh
-    # instances. Plain objects (CareerCaddyToolset) can be wrapped in a lambda.
+    # Use callables for stateful resources (an MCPToolset over a stdio
+    # transport) that need fresh instances. Plain objects (CareerCaddyToolset)
+    # can be wrapped in a lambda.
     toolset_factories: list[Callable] = field(default_factory=list)
     history_processors: list[Callable] | None = None
     name: str | None = None  # Agent name override; defaults to role
@@ -323,7 +326,9 @@ def get_agent(role: str, **overrides) -> Agent:
     if deps_type is not None:
         kwargs["deps_type"] = deps_type
     if history_processors:
-        kwargs["history_processors"] = history_processors
+        # pydantic-ai 2.0 replaced the `history_processors` kwarg with the
+        # capabilities API; ProcessHistory wraps each processor callable.
+        kwargs["capabilities"] = [ProcessHistory(p) for p in history_processors]
 
     return Agent(model, **kwargs)
 
@@ -447,8 +452,10 @@ def register_defaults() -> None:
     ))
 
     # -- browser_scraper --
-    from pydantic_ai.mcp import MCPServerStdio
-
+    # pydantic-ai 2.0 removed MCPServerStdio; an MCP server is now exposed as
+    # an MCPToolset built from a fastmcp client transport.
+    from fastmcp.client.transports import StdioTransport
+    from pydantic_ai.mcp import MCPToolset
 
     register_agent("browser_scraper", AgentConfig(
         role="browser_scraper",
@@ -457,8 +464,12 @@ def register_defaults() -> None:
             "given URL. Return the raw text."
         ),
         toolset_factories=[
-            lambda: MCPServerStdio(
-                "python", args=["mcp_servers/browser_server.py"], env=os.environ.copy()
+            lambda: MCPToolset(
+                StdioTransport(
+                    command="python",
+                    args=["mcp_servers/browser_server.py"],
+                    env=os.environ.copy(),
+                )
             ),
         ],
     ))

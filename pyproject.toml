@@ -5,12 +5,19 @@ requires-python = ">=3.13"
 dependencies = [
     "uvicorn[standard]>=0.24.0",
     "pydantic>=2.0.0",
-    # Pinned <2: pydantic-ai 2.0 is a breaking major (removed
-    # `pydantic_ai.ag_ui` used by chat_server; pydantic-graph 2.0 reworked
-    # the Graph constructor, breaking scrape_graph). The 2.0 migration is
-    # its own dedicated piece of work — hold here so the dep refresh stays
-    # shippable to the prod MCP servers. See CC-94.
-    "pydantic-ai>=0.0.14,<2",
+    # pydantic-ai 2.0 migration completed under CC-94 (2026-06-26):
+    #  - agent_factory: history_processors= -> capabilities=[ProcessHistory(p)];
+    #    MCPServerStdio(...) -> MCPToolset(StdioTransport(...)).
+    #  - scrape_graph/graph.py: Graph(nodes=...) -> GraphBuilder (node/add_edge
+    #    + build); export_graph_structure derives edges from run() return hints
+    #    (Graph.node_defs/next_node_edges removed). runner.py: Graph.run is now
+    #    keyword-only -> run(inputs=entry, state=...).
+    #  - chat_server: removed `pydantic_ai.ag_ui.run_ag_ui` -> relocated
+    #    `pydantic_ai.ui.ag_ui.AGUIAdapter` (run_stream + encode_stream).
+    # The `[ag-ui]` extra is REQUIRED: in 2.0 the AG-UI protocol package
+    # (`ag_ui.core`, `ag_ui.encoder`) that chat_server imports is no longer a
+    # default dep — it ships behind this extra.
+    "pydantic-ai[ag-ui]>=0.0.14",
     "playwright>=1.40.0",
     "httpx>=0.25.0",
     "python-dotenv>=1.0.0",

@@ -9,7 +9,10 @@ the committed snapshot doesn't match the live graph.
 """
 from __future__ import annotations
 
-from pydantic_graph import Graph
+import typing
+
+from pydantic_graph import BaseNode, Graph, GraphBuilder
+from pydantic_graph.step import NodeStep
 
 from .nodes_extract import (
     EvaluateExtraction,
@@ -66,9 +69,15 @@ __all_nodes__ = (
 
 
 # Build graphs at module scope so pydantic-graph's forward-ref resolver
-# (which reads the caller's f_locals) sees every node class via this
-# module's globals. Building inside a function would hide cross-module
-# names behind LOAD_GLOBAL and break the lookup.
+# sees every node class via this module's globals. pydantic-graph 2.0's
+# GraphBuilder.node() resolves each node's run() return-type annotation
+# with typing.get_type_hints, using the CALLER frame's namespace (its
+# f_locals) as the local namespace. At module scope that namespace is this
+# module's globals, which imports every node class — so cross-module
+# forward-refs (e.g. StartScrape.run -> ExtractFail, which nodes_scrape.py
+# does NOT import) resolve here. Wrapping the build in a function would
+# expose only that function's locals and break the lookup, so the
+# GraphBuilder node/edge loop below is deliberately inline.
 _SCRAPE_NODES = [
     StartScrape, LoadProfile, Navigate,
     DetectObstacle, ObstacleRememberMe, ObstacleWaitRetry, ObstacleAgent,
@@ -88,8 +97,26 @@ _EXTRACT_NODES = [
     ReviewCompleteness, UpdateProfile, ResolveApplyUrl, ExtractFail,
 ]
 
-_SCRAPE_GRAPH = Graph(nodes=_SCRAPE_NODES, state_type=ScrapeGraphState)
-_EXTRACT_GRAPH = Graph(nodes=_EXTRACT_NODES, state_type=ScrapeGraphState)
+# GraphBuilder.node(cls) registers a BaseNode subclass and infers its
+# outgoing edges from the run() return-type union; add_edge wires the
+# graph's start node to the entry so `graph.run(inputs=Entry(), state=...)`
+# dispatches there. validate_graph_structure=False preserves the pre-2.0
+# `Graph(nodes=...)` semantics (no reachability/dead-end validation):
+# runtime routing between BaseNode steps is by node-class id, independent
+# of the inferred edge topology, so structural validation isn't required
+# for correctness and an intentionally not-yet-wired node can't break the
+# module import.
+_scrape_builder = GraphBuilder(state_type=ScrapeGraphState)
+for _node_cls in _SCRAPE_NODES:
+    _scrape_builder.add(_scrape_builder.node(_node_cls))
+_scrape_builder.add_edge(_scrape_builder.start_node, NodeStep(StartScrape))
+_SCRAPE_GRAPH = _scrape_builder.build(validate_graph_structure=False)
+
+_extract_builder = GraphBuilder(state_type=ScrapeGraphState)
+for _node_cls in _EXTRACT_NODES:
+    _extract_builder.add(_extract_builder.node(_node_cls))
+_extract_builder.add_edge(_extract_builder.start_node, NodeStep(StartExtract))
+_EXTRACT_GRAPH = _extract_builder.build(validate_graph_structure=False)
 
 
 def build_scrape_graph() -> "Graph[ScrapeGraphState, None, dict]":
@@ -420,6 +447,28 @@ NODE_META: dict[str, dict[str, str]] = {
 }
 
 
+def _node_edge_targets(cls) -> list[str]:
+    """Return the sorted node-ids ``cls.run`` can transition to.
+
+    Derived from the run() return-type annotation exactly the way
+    pydantic-graph infers edges: every ``BaseNode`` subclass named in the
+    return union is an outgoing edge; ``End`` (the graph terminal) is not.
+    Forward-refs are resolved against this module's namespace because some
+    return hints reference node classes defined in sibling modules
+    (e.g. ``StartScrape.run -> ExtractFail``) that the defining module does
+    not import. This reproduces the pre-2.0 ``next_node_edges`` edge set
+    without depending on pydantic-graph's internal Graph representation.
+    """
+    hints = typing.get_type_hints(cls.run, localns=dict(globals()))
+    ret = hints.get("return")
+    targets: set[str] = set()
+    for arg in typing.get_args(ret) or (ret,):
+        origin = typing.get_origin(arg) or arg
+        if isinstance(origin, type) and issubclass(origin, BaseNode) and origin is not BaseNode:
+            targets.add(origin.get_node_id())
+    return sorted(targets)
+
+
 def export_graph_structure() -> dict:
     """Introspect the live scrape-graph and return its {nodes, edges}
     snapshot in the shape api/ ships on /api/v1/admin/graph-structure/.
@@ -427,7 +476,6 @@ def export_graph_structure() -> dict:
     Nodes are ordered to match the registration order in _SCRAPE_NODES
     so the export is stable across runs.
     """
-    graph = _SCRAPE_GRAPH
     live_ids = {cls.get_node_id() for cls in _SCRAPE_NODES}
     missing = live_ids - NODE_META.keys()
     extra = NODE_META.keys() - live_ids
@@ -445,10 +493,7 @@ def export_graph_structure() -> dict:
     edges: list[tuple[str, str]] = []
     for cls in _SCRAPE_NODES:
         src = cls.get_node_id()
-        node_def = graph.node_defs.get(src)
-        if node_def is None:
-            continue
-        for target in sorted(node_def.next_node_edges.keys()):
+        for target in _node_edge_targets(cls):
             edges.append((src, target))
 
     return {
