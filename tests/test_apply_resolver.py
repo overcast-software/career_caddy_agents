@@ -17,7 +17,11 @@ from scrape_graph.apply_resolver import (
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # asyncio.run (not get_event_loop().run_until_complete): under
+    # pytest-asyncio 1.x + py3.13 the latter blows up ("coroutine never
+    # awaited") when a prior asyncio.run()-based test in the same process
+    # already closed the default loop. Order-robust.
+    return asyncio.run(coro)
 
 
 def _make_page(

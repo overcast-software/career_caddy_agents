@@ -33,6 +33,16 @@ from unittest.mock import patch
 from scrape_graph.nodes_scrape import ResolveFinalUrl, CheckLinkDedup
 from scrape_graph.state import ScrapeGraphState
 
+# Real NanoID shapes (CC-77). Ids are 10-char strings, not ints — the swap
+# is `state.scrape_id = new_id` (passthrough). int(new_id) would raise on a
+# real NanoID and the swap would silently fail. The prior numeric-string
+# fixtures ("394"/"395"/"476") + `== 395` int assertions false-greened the
+# broken int() cast.
+PARENT_A = "Zc3p_QeR9k"   # parent scrape id (was 394)
+CHILD_A = "Mn4Lp2Qr_T"    # child scrape id from redirect (was "395")
+PARENT_B = "Wq8sR3tUvX"   # parent scrape id (was 475)
+CHILD_B = "Yh1Zk5LmNp"    # child scrape id from redirect (was "476")
+
 
 def _run(node, state: ScrapeGraphState):
     ctx = SimpleNamespace(state=state)
@@ -77,7 +87,7 @@ def _state_for_js_redirect(submitted: str, landed_after_idle: str) -> ScrapeGrap
     """Build a state where Navigate captured the tracker URL but a
     later networkidle wait will see the redirected canonical URL.
     """
-    state = ScrapeGraphState(scrape_id=394, submitted_url=submitted)
+    state = ScrapeGraphState(scrape_id=PARENT_A, submitted_url=submitted)
     state.final_url = submitted  # Navigate's capture, frozen pre-redirect
     page = _FakePage(
         url_at_domcontentloaded=submitted,
@@ -101,7 +111,7 @@ def test_networkidle_reread_picks_up_js_redirect():
     patches: list[dict] = []
 
     def fake_post(url, json=None, headers=None, timeout=None):
-        return _FakeResp(201, {"data": {"id": "395"}})
+        return _FakeResp(201, {"data": {"id": CHILD_A}})
 
     def fake_patch_status(scrape_id, status, note=None):
         patches.append({"scrape_id": scrape_id, "status": status, "note": note})
@@ -121,9 +131,10 @@ def test_networkidle_reread_picks_up_js_redirect():
     assert state.did_redirect is True, (
         "post-redirect URL differs from submitted — should detect the redirect"
     )
-    assert state.scrape_id == 395, "child scrape id should be swapped in"
+    assert state.scrape_id == CHILD_A, "child scrape id should be swapped in"
+    assert isinstance(state.scrape_id, str)
     assert len(patches) == 1, "parent scrape should be terminal-closed exactly once"
-    assert patches[0]["scrape_id"] == 394
+    assert patches[0]["scrape_id"] == PARENT_A
     assert patches[0]["status"] == "completed"
 
 
@@ -132,7 +143,7 @@ def test_no_browser_page_falls_back_to_navigate_capture():
     ResolveFinalUrl must not crash on the networkidle re-read — it
     falls through to whatever final_url Navigate captured."""
     same = "https://example.com/jobs/42"
-    state = ScrapeGraphState(scrape_id=394, submitted_url=same)
+    state = ScrapeGraphState(scrape_id=PARENT_A, submitted_url=same)
     state.final_url = same
     # No state._browser_page set.
 
@@ -155,7 +166,7 @@ def test_networkidle_timeout_does_not_break_node():
     Navigate captured. The 5s budget keeps this from eating the outer
     15s _RESOLVE_FINAL_URL_BUDGET_S."""
     submitted = "https://example.com/track/abc"
-    state = ScrapeGraphState(scrape_id=394, submitted_url=submitted)
+    state = ScrapeGraphState(scrape_id=PARENT_A, submitted_url=submitted)
     state.final_url = submitted
 
     class _HangingPage:
@@ -203,7 +214,7 @@ def test_networkidle_timeout_still_rereads_page_url_when_url_moved_on():
     """
     submitted = "https://tracker.example.test/wrap?dest=%2Fjobs%2F42"
     landed = "https://content.example.test/jobs/42"
-    state = ScrapeGraphState(scrape_id=475, submitted_url=submitted)
+    state = ScrapeGraphState(scrape_id=PARENT_B, submitted_url=submitted)
     state.final_url = submitted  # Navigate's pre-redirect capture
 
     class _PageUrlMovedNetworkNeverIdle:
@@ -226,7 +237,7 @@ def test_networkidle_timeout_still_rereads_page_url_when_url_moved_on():
     patches: list[dict] = []
 
     def fake_post(url, json=None, headers=None, timeout=None):
-        return _FakeResp(201, {"data": {"id": "476"}})
+        return _FakeResp(201, {"data": {"id": CHILD_B}})
 
     def fake_patch_status(scrape_id, status, note=None):
         patches.append({"scrape_id": scrape_id, "status": status, "note": note})
@@ -244,8 +255,9 @@ def test_networkidle_timeout_still_rereads_page_url_when_url_moved_on():
         "post-login URL differs from submitted login wrapper — should "
         "detect the redirect and hand off to a child scrape"
     )
-    assert state.scrape_id == 476, "child scrape id should be swapped in"
+    assert state.scrape_id == CHILD_B, "child scrape id should be swapped in"
+    assert isinstance(state.scrape_id, str)
     assert any(
-        p["status"] == "completed" and "redirected to scrape 476" in (p.get("note") or "")
+        p["status"] == "completed" and f"redirected to scrape {CHILD_B}" in (p.get("note") or "")
         for p in patches
     ), "parent must be terminal-closed with the redirect note"

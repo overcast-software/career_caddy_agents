@@ -61,7 +61,7 @@ def trace_node(
 
 
 def _post_transition(
-    scrape_id: int,
+    scrape_id: str,
     node: str,
     routed_to: str,
     entry: NodeTraceEntry,
