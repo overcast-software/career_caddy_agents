@@ -1,15 +1,22 @@
 """Tests for ResolveFinalUrl's parent-scrape terminal-close on redirect.
 
-Repro: scrape 302 (LinkedIn /uas/login redirect URL) ran twice, both
-producing JobPost 1647 successfully via DuplicateShortCircuit on the
-child scrape — but scrape 302 itself stayed at status='running'
-forever because once ResolveFinalUrl swapped state.scrape_id to the
-child, no terminal PATCH ever landed on the parent. The poller kept
-re-dispatching it.
+Repro: a LinkedIn /uas/login redirect-URL scrape ran twice, both producing
+a JobPost successfully via DuplicateShortCircuit on the child scrape — but
+the parent scrape itself stayed at status='running' forever because once
+ResolveFinalUrl swapped state.scrape_id to the child, no terminal PATCH ever
+landed on the parent. The poller kept re-dispatching it.
 
-The fix: when ResolveFinalUrl creates a child scrape and swaps to it,
-it must first PATCH the parent to a terminal status with a note
-pointing at the child.
+The fix: when ResolveFinalUrl creates a child scrape and swaps to it, it
+must first PATCH the parent to a terminal status with a note pointing at the
+child.
+
+CC-100/CC-101: ids here are 10-char NanoID strings (CC-77), NOT ints. The
+swap is `state.scrape_id = new_id` (a string); int(new_id) would raise
+ValueError on a real NanoID and get swallowed by the surrounding except, so
+the swap would silently fail. The prior version of this test used numeric
+strings ("302"/"303") and asserted `state.scrape_id == 303` (int), which
+passed against the broken int() cast — a false green. These fixtures use
+real NanoID shapes and assert the string flows through.
 """
 from __future__ import annotations
 
@@ -20,6 +27,15 @@ from unittest.mock import patch
 from scrape_graph.nodes_scrape import ResolveFinalUrl, CheckLinkDedup
 from scrape_graph.state import ScrapeGraphState
 
+# Real NanoID shapes (alphabet [A-Za-z0-9_-], 10 chars). Non-numeric on
+# purpose — int() would raise on these.
+PARENT = "V1StGXR8_Z"        # parent scrape id (the entry row)
+CHILD = "a1fFQQe1xV"         # child scrape id created on redirect
+CHILD_B = "Ksd7bRkHpL"       # alt child id
+CHILD_C = "Z9yWvUtSr0"       # alt child id
+JP_WRAPPED = "3q4Xc_Lb-Z"    # JobPost whose canonical_link is still a wrapper
+JP_RESOLVED = "Op9NmLkJh2"   # JobPost already at the resolved URL
+
 
 def _run(node, state: ScrapeGraphState):
     ctx = SimpleNamespace(state=state)
@@ -27,7 +43,7 @@ def _run(node, state: ScrapeGraphState):
 
 
 def _state_for_redirect(submitted: str, landed: str) -> ScrapeGraphState:
-    state = ScrapeGraphState(scrape_id=302, submitted_url=submitted)
+    state = ScrapeGraphState(scrape_id=PARENT, submitted_url=submitted)
     state.final_url = landed
     return state
 
@@ -54,24 +70,26 @@ def test_redirect_terminal_closes_parent_then_swaps_id():
     patches: list[dict] = []
 
     def fake_post(url, json=None, headers=None, timeout=None):
-        return _FakeResp(201, {"data": {"id": "303"}})
+        return _FakeResp(201, {"data": {"id": CHILD}})
 
     def fake_patch_status(scrape_id, status, note=None):
         patches.append({"scrape_id": scrape_id, "status": status, "note": note})
 
     with patch("scrape_graph.nodes_scrape.httpx.post", side_effect=fake_post), \
-         patch("scrape_graph.nodes_scrape._patch_scrape_status", side_effect=fake_patch_status):
+         patch("scrape_graph.nodes_scrape._patch_scrape_status", side_effect=fake_patch_status), \
+         patch("scrape_graph.nodes_scrape._propagate_canonical_to_parent_jp"):
         next_node = _run(ResolveFinalUrl(), state)
 
     assert isinstance(next_node, CheckLinkDedup)
-    # Parent (302) was terminal-closed exactly once before the id swap.
+    # Parent was terminal-closed exactly once before the id swap.
     assert len(patches) == 1
     closed = patches[0]
-    assert closed["scrape_id"] == 302, "parent scrape must be closed before swap"
+    assert closed["scrape_id"] == PARENT, "parent scrape must be closed before swap"
     assert closed["status"] == "completed"
-    assert "303" in (closed["note"] or ""), "note must reference the child scrape id"
-    # state.scrape_id was swapped to the child.
-    assert state.scrape_id == 303
+    assert CHILD in (closed["note"] or ""), "note must reference the child scrape id"
+    # state.scrape_id was swapped to the child NanoID string (not int()).
+    assert state.scrape_id == CHILD
+    assert isinstance(state.scrape_id, str)
     assert state.did_redirect is True
 
 
@@ -92,7 +110,7 @@ def test_no_redirect_no_parent_close():
 
     assert isinstance(next_node, CheckLinkDedup)
     assert patches == [], "no terminal PATCH when submitted URL == landed URL"
-    assert state.scrape_id == 302
+    assert state.scrape_id == PARENT
     assert state.did_redirect is False
 
 
@@ -118,7 +136,7 @@ def test_child_create_failure_does_not_close_parent():
         _run(ResolveFinalUrl(), state)
 
     assert patches == [], "no parent close when child POST failed"
-    assert state.scrape_id == 302
+    assert state.scrape_id == PARENT
 
 
 def test_redirect_propagates_canonical_link_to_parent_jp():
@@ -126,13 +144,13 @@ def test_redirect_propagates_canonical_link_to_parent_jp():
     must PATCH that JobPost's canonical_link to the resolved
     post-redirect URL.
 
-    Motivating incident: cc_auto created jp 3036 with link = SendGrid
+    Motivating incident: cc_auto created a JobPost with link = SendGrid
     tracker wrapper. canonicalize_link couldn't decode the opaque
-    `upn=` token, so jp 3036.canonical_link stayed pinned to the
-    wrapper. A later scrape of the resolved destination
-    `hiring.cafe/job/<id>` directly created a fresh jp 3040 — same
-    opening, unmerged duplicate, because canonical_link comparison
-    couldn't match wrapper vs destination.
+    `upn=` token, so its canonical_link stayed pinned to the wrapper. A
+    later scrape of the resolved destination `hiring.cafe/job/<id>`
+    directly created a fresh duplicate JobPost — same opening, unmerged,
+    because canonical_link comparison couldn't match wrapper vs
+    destination.
 
     The fix propagates the resolved URL back to the parent JP. Future
     canonical_link lookups against the destination URL find the
@@ -149,7 +167,7 @@ def test_redirect_propagates_canonical_link_to_parent_jp():
 
     def fake_post(url, json=None, headers=None, timeout=None):
         posts.append({"url": url, "json": json})
-        return _FakeResp(201, {"data": {"id": "478"}})
+        return _FakeResp(201, {"data": {"id": CHILD_B}})
 
     def fake_patch_status(scrape_id, status, note=None):
         patches_status.append(
@@ -158,23 +176,23 @@ def test_redirect_propagates_canonical_link_to_parent_jp():
 
     def fake_get(url, headers=None, timeout=None):
         gets.append(url)
-        if "scrapes/302" in url:
-            # Parent scrape is attached to jp 3036.
+        if f"scrapes/{PARENT}" in url:
+            # Parent scrape is attached to JP_WRAPPED.
             return _FakeResp(200, {
                 "data": {
-                    "id": "302",
+                    "id": PARENT,
                     "type": "scrape",
                     "attributes": {},
                     "relationships": {
-                        "job-post": {"data": {"type": "job-post", "id": "3036"}}
+                        "job-post": {"data": {"type": "job-post", "id": JP_WRAPPED}}
                     },
                 }
             })
-        if "job-posts/3036" in url:
-            # JP 3036's current canonical_link is the SendGrid wrapper.
+        if f"job-posts/{JP_WRAPPED}" in url:
+            # JP_WRAPPED's current canonical_link is the SendGrid wrapper.
             return _FakeResp(200, {
                 "data": {
-                    "id": "3036",
+                    "id": JP_WRAPPED,
                     "type": "job-post",
                     "attributes": {"canonical_link": submitted},
                 }
@@ -198,20 +216,21 @@ def test_redirect_propagates_canonical_link_to_parent_jp():
     # the other tests; just confirm the state.scrape_id swap landed.
     # (httpx.post is also invoked by trace_node for graph-transition
     # logging, so a raw `len(posts) == 1` here would be racy.)
-    assert state.scrape_id == 478
+    assert state.scrape_id == CHILD_B
+    assert isinstance(state.scrape_id, str)
     assert any(
         p["url"].endswith("/api/v1/scrapes/")
         and (p.get("json") or {}).get("data", {}).get("attributes", {}).get("source") == "redirect"
         for p in posts
     ), "child scrape create POST must fire exactly once"
 
-    # The JobPost PATCH lands exactly once, on jp 3036, with the
+    # The JobPost PATCH lands exactly once, on JP_WRAPPED, with the
     # resolved canonical URL — NOT the wrapper that submitted was.
     assert len(patches_jp) == 1, (
         "JobPost canonical_link PATCH must fire exactly once"
     )
     patched = patches_jp[0]
-    assert "job-posts/3036" in patched["url"]
+    assert f"job-posts/{JP_WRAPPED}" in patched["url"]
     assert patched["json"]["data"]["attributes"]["canonical_link"] == landed
 
 
@@ -228,23 +247,23 @@ def test_redirect_skips_jp_patch_when_canonical_already_resolved():
     patches_jp: list[dict] = []
 
     def fake_post(url, json=None, headers=None, timeout=None):
-        return _FakeResp(201, {"data": {"id": "999"}})
+        return _FakeResp(201, {"data": {"id": CHILD_C}})
 
     def fake_get(url, headers=None, timeout=None):
-        if "scrapes/302" in url:
+        if f"scrapes/{PARENT}" in url:
             return _FakeResp(200, {
                 "data": {
-                    "id": "302", "type": "scrape", "attributes": {},
+                    "id": PARENT, "type": "scrape", "attributes": {},
                     "relationships": {
-                        "job-post": {"data": {"type": "job-post", "id": "42"}}
+                        "job-post": {"data": {"type": "job-post", "id": JP_RESOLVED}}
                     },
                 }
             })
-        if "job-posts/42" in url:
+        if f"job-posts/{JP_RESOLVED}" in url:
             # Already at the resolved URL — no PATCH needed.
             return _FakeResp(200, {
                 "data": {
-                    "id": "42", "type": "job-post",
+                    "id": JP_RESOLVED, "type": "job-post",
                     "attributes": {"canonical_link": landed},
                 }
             })
@@ -276,13 +295,13 @@ def test_redirect_no_jp_attached_skips_propagation():
     patches_jp: list[dict] = []
 
     def fake_post(url, json=None, headers=None, timeout=None):
-        return _FakeResp(201, {"data": {"id": "999"}})
+        return _FakeResp(201, {"data": {"id": CHILD_C}})
 
     def fake_get(url, headers=None, timeout=None):
-        if "scrapes/302" in url:
+        if f"scrapes/{PARENT}" in url:
             return _FakeResp(200, {
                 "data": {
-                    "id": "302", "type": "scrape", "attributes": {},
+                    "id": PARENT, "type": "scrape", "attributes": {},
                     "relationships": {"job-post": {"data": None}},
                 }
             })

@@ -107,7 +107,7 @@ async def _fetch_profile(api: ApiClient, hostname: str) -> dict | None:
         return None
     p = profiles[0] if isinstance(profiles, list) else profiles
     return {
-        "id": int(p["id"]),
+        "id": p["id"],
         "css_selectors": (p.get("attributes") or {}).get("css-selectors") or {},
     }
 
@@ -120,7 +120,7 @@ async def process_scrape(api: ApiClient, scrape: dict) -> bool:
     graph node writes its own trace + owns its side effects (PATCH
     scrape, upload screenshot, push profile selectors, create JobPost).
     """
-    scrape_id = int(scrape["id"])
+    scrape_id = scrape["id"]
     attrs = scrape.get("attributes", {})
     url = attrs.get("url")
     skip_extract = bool(attrs.get("skip_extract"))
@@ -355,7 +355,7 @@ async def _preflight_auth(api: ApiClient) -> bool:
     idempotent.
     """
     try:
-        raw = await get_scrapes(api, status="hold", sort="id", per_page=1)
+        raw = await get_scrapes(api, status="hold", sort="-scraped_at", per_page=1)
     except Exception as exc:
         logger.error("Pre-flight request raised: %s", exc)
         return False

@@ -336,7 +336,7 @@ class Navigate(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef
 
 
 def _propagate_canonical_to_parent_jp(
-    parent_scrape_id: int, resolved_canonical_url: str
+    parent_scrape_id: str, resolved_canonical_url: str
 ) -> None:
     """Best-effort: when a parent scrape's URL resolves through a
     redirect chain, propagate the resolved canonical URL back to the
@@ -486,7 +486,11 @@ def _resolve_final_url_body(state: ScrapeGraphState) -> None:
                 _propagate_canonical_to_parent_jp(
                     state.scrape_id, state.canonical_url
                 )
-                state.scrape_id = int(new_id)
+                # Scrape ids are NanoID strings (CC-77) — int() would raise
+                # ValueError, get swallowed by the except below, and the
+                # child-scrape swap would silently fail (the child's outcome
+                # then misattributed to the parent row).
+                state.scrape_id = new_id
     except Exception:
         logger.warning("ResolveFinalUrl: child-scrape create failed", exc_info=True)
 
@@ -596,7 +600,7 @@ class CheckLinkDedup(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no
         started = time.time()
         state = ctx.state
         canonical = state.canonical_url or state.submitted_url
-        non_stub_id: int | None = None
+        non_stub_id: str | None = None
         try:
             resp = httpx.get(
                 f"{_api_base()}/api/v1/job-posts/",
@@ -608,7 +612,11 @@ class CheckLinkDedup(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no
             for row in rows:
                 desc = (row.get("attributes") or {}).get("description") or ""
                 if len(desc.split()) >= 60:
-                    non_stub_id = int(row["id"])
+                    # JobPost id is a NanoID string (CC-77); int() would
+                    # raise, get swallowed by the bare except below, and
+                    # DuplicateShortCircuit would never fire — re-creating a
+                    # duplicate JobPost and violating dedupe-first.
+                    non_stub_id = row["id"]
                     break
         except Exception:
             pass
@@ -1395,7 +1403,7 @@ class SkipBrowserTier(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[n
         return nodes_extract.ResolveApplyUrl()
 
 
-def _patch_scrape_status(scrape_id: int, status: str, note: str | None = None) -> None:
+def _patch_scrape_status(scrape_id: str, status: str, note: str | None = None) -> None:
     """Helper used by terminal nodes to close out the scrape row with
     the frontend-visible status the poller-polling UI watches for
     ({completed, failed})."""

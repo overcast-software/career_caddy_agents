@@ -67,9 +67,11 @@ class ScrapeGraphState:
     - node_trace: writer = BaseNode mixin (via tracing.record_transition).
     """
 
-    # Identity — set once
-    scrape_id: int = 0  # mutable: ResolveFinalUrl may flip to a new scrape id
-    original_scrape_id: int = 0  # set once
+    # Identity — set once. Scrape ids are 10-char NanoID strings (CC-77),
+    # not ints; default to "" (falsy, like the old 0) so trace/PATCH guards
+    # `if not scrape_id` still short-circuit when unset.
+    scrape_id: str = ""  # mutable: ResolveFinalUrl may flip to a new scrape id
+    original_scrape_id: str = ""  # set once
     submitted_url: str = ""
     source: str = "manual"  # poller/paste/email/chat/manual/extension
     feature_flag_variant: str = "off"
@@ -137,7 +139,7 @@ class ScrapeGraphState:
     # Outcome
     outcome: Optional[str] = None  # "success" / "duplicate" / "failure"
     failure_reason: Optional[str] = None
-    job_post_id: Optional[int] = None
+    job_post_id: Optional[str] = None  # NanoID string (CC-77)
     was_duplicate: bool = False
 
     # Trace — appended by BaseNode mixin

@@ -1192,7 +1192,7 @@ async def get_scrapes(
     status: Optional[str] = None,
     has_score: Optional[bool] = None,
 ) -> str:
-    """Fetch scrape records. Pass id for a single scrape; omit for a paginated list. Use sort='-id' for most recent first, per_page=1 for just the latest. Filter by status with status='hold'. Pass has_score=False to scope to scrapes whose linked JobPost has no Score yet (drives the auto-score daemon)."""
+    """Fetch scrape records. Pass id for a single scrape; omit for a paginated list. Use sort='-scraped_at' for most recent first, per_page=1 for just the latest (ids are NanoIDs and do NOT sort by recency). Filter by status with status='hold'. Pass has_score=False to scope to scrapes whose linked JobPost has no Score yet (drives the auto-score daemon)."""
     shape = TOOL_SHAPES["get_scrapes"]
     if id is not None:
         return await _shaped_get(
