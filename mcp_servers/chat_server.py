@@ -719,13 +719,18 @@ def _build_system_prompt(
         job_post_id = None
         question_id = None
         answer_id = None
-        jp_match = re.search(r"/job-posts/(\d+)", url)
+        # Ids are 10-char NanoIDs (CC-77), not integers — the old \d+
+        # patterns never matched a real id, so the page-context hints
+        # silently vanished. Anchor to the NanoID class with a trailing
+        # boundary so the collection segment / route verb can't be
+        # mistaken for an id (see the generic fallback below).
+        jp_match = re.search(r"/job-posts/([A-Za-z0-9_-]{10})(?:/|$)", url)
         if jp_match:
             job_post_id = jp_match.group(1)
-        q_match = re.search(r"/questions/(\d+)", url)
+        q_match = re.search(r"/questions/([A-Za-z0-9_-]{10})(?:/|$)", url)
         if q_match:
             question_id = q_match.group(1)
-        a_match = re.search(r"/answers/(\d+)", url)
+        a_match = re.search(r"/answers/([A-Za-z0-9_-]{10})(?:/|$)", url)
         if a_match:
             answer_id = a_match.group(1)
 
@@ -733,7 +738,12 @@ def _build_system_prompt(
         # "call the matching tool with id=…" suffix.
         resource_id = answer_id or question_id or job_post_id
         if resource_id is None:
-            id_match = re.search(r"/(\d+)(?:/|$)", url)
+            # Generic resource page (/resumes/<id>, /companies/<id>, …).
+            # Anchor to the 10-char NanoID class + boundary so a bare
+            # collection name (job-posts/questions/…) or a route verb
+            # (/job-posts/new, /resumes/import) is NOT captured as an id —
+            # none of those segments are exactly 10 chars + boundary.
+            id_match = re.search(r"/([A-Za-z0-9_-]{10})(?:/|$)", url)
             resource_id = id_match.group(1) if id_match else None
 
         prompt += (
