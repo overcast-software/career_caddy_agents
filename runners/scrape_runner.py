@@ -52,7 +52,7 @@ from browser.engine import (
 from browser.resident import ResidentBrowser
 from lib.url_unwrap import unwrap_url
 
-# Module-level resident browser; set by the attended main() before the poll loop.
+# Module-level resident browser; set by the headed main() before the poll loop.
 _RESIDENT: ResidentBrowser | None = None
 
 
@@ -286,7 +286,7 @@ def _is_headless() -> bool:
     return bool(get_headless())
 
 
-async def poll_once(api: ApiClient, *, attended: bool = False) -> int:
+async def poll_once(api: ApiClient) -> int:
     """Claim and process hold scrapes one at a time via the runner-safe
     POST /api/v1/scrapes/claim-next/ endpoint (Plans/Scrape runner
     Phase 1). Each call atomically picks the oldest hold row, flips it
@@ -294,11 +294,9 @@ async def poll_once(api: ApiClient, *, attended: bool = False) -> int:
     means N concurrent runners on different hosts (omarchy + pibu +
     future) split the queue without racing.
 
-    ``attended`` partitions the hold queue at the api: an attended runner
-    (launched with ``--attended``) claims only scrapes flagged for attended
-    handling, and a default runner claims only the rest. A normal runner
-    therefore never grabs an attended scrape out from under the human who
-    queued it to solve a captcha/login in the resident window.
+    The hold queue is a single FIFO — a scrape is a scrape. Headed vs
+    headless is a property of the runner (``--headed``), not a flag
+    stamped on each scrape, so there is no per-scrape claim partition.
 
     Loops until the api returns 204 (queue empty). Returns count
     processed.
@@ -306,7 +304,7 @@ async def poll_once(api: ApiClient, *, attended: bool = False) -> int:
     runner_name = os.environ.get("CC_RUNNER_NAME") or socket.gethostname()
     processed = 0
     while True:
-        raw = await claim_next_scrape(api, runner_name=runner_name, attended=attended)
+        raw = await claim_next_scrape(api, runner_name=runner_name)
         data = yaml.safe_load(raw)
 
         if not isinstance(data, dict) or data.get("error"):
@@ -333,13 +331,21 @@ def _parse_args() -> argparse.Namespace:
         "--engine", choices=["camoufox", "chrome"], default=None,
         help="Browser engine (default: BROWSER_ENGINE env or 'camoufox')",
     )
-    parser.add_argument("--headless", action="store_true", default=None, help="Run headless")
-    parser.add_argument("--headed", dest="headless", action="store_false", help="Run headed")
+    parser.add_argument("--headless", action="store_true", default=None, help="Run headless (default)")
     parser.add_argument(
-        "--attended", action="store_true",
-        help="Launch a single headed browser; spawn an ephemeral tab per scrape "
-             "in the same window and close it on completion. Cookies persist on "
-             "the shared context across scrapes. Implies --headed.",
+        "--headed", dest="headed", action="store_true",
+        help="Launch a single resident headed browser; spawn an ephemeral tab "
+             "per scrape in the same window and close it on completion. Cookies "
+             "persist on the shared context across scrapes, so a login/captcha "
+             "you solve once stays warm. Use it to watch the runner work and "
+             "screenshot to verify. Forces headless off.",
+    )
+    # Deprecated alias of --headed, retained so the live pibu systemd unit and
+    # tmuxinator invocations keep working through the rollout. It launches the
+    # same resident headed browser; it no longer partitions the scrape queue
+    # (a scrape is a scrape). main() logs a one-line deprecation warning.
+    parser.add_argument(
+        "--attended", dest="headed", action="store_true", help=argparse.SUPPRESS,
     )
     return parser.parse_args()
 
@@ -370,10 +376,10 @@ async def _preflight_auth(api: ApiClient) -> bool:
     return True
 
 
-async def _run_poll_loop(api: ApiClient, running_flag, *, attended: bool = False):
+async def _run_poll_loop(api: ApiClient, running_flag):
     while running_flag():
         try:
-            count = await poll_once(api, attended=attended)
+            count = await poll_once(api)
             if count:
                 logger.info("Processed %d scrape(s)", count)
         except Exception:
@@ -384,8 +390,14 @@ async def _run_poll_loop(api: ApiClient, running_flag, *, attended: bool = False
 async def main():
     global _RESIDENT
     args = _parse_args()
-    # Attended mode forces headed.
-    headless = False if args.attended else args.headless
+    if "--attended" in sys.argv:
+        logger.warning(
+            "--attended is deprecated; it is now just an alias for --headed "
+            "(launch the resident headed browser). It no longer partitions the "
+            "scrape queue — a scrape is a scrape. Switch the invocation to --headed."
+        )
+    # Headed mode forces headless off.
+    headless = False if args.headed else args.headless
     configure_engine(engine=args.engine, headless=headless)
 
     base_url = os.environ.get("CC_API_BASE_URL")
@@ -399,15 +411,15 @@ async def main():
     # single scrape runs. Warning level so it shows under default
     # logging without LOG_LEVEL tweaks.
     logger.warning(
-        "poller boot: base_url=%s engine=%s headless=%s attended=%s poll_interval=%ds",
-        base_url, args.engine, headless, bool(args.attended), POLL_INTERVAL,
+        "poller boot: base_url=%s engine=%s headless=%s headed=%s poll_interval=%ds",
+        base_url, args.engine, headless, bool(args.headed), POLL_INTERVAL,
     )
 
     api = ApiClient(base_url=base_url, token=token)
 
     # Pre-flight: verify the token is accepted before we spin up a browser.
     # A bad token means no scrape will ever succeed; don't burn a browser
-    # launch (and on attended mode, a real user's workflow) to find out.
+    # launch (and on headed mode, a real user's workflow) to find out.
     if not await _preflight_auth(api):
         logger.error(
             "Pre-flight auth check failed against %s — aborting before browser launch. "
@@ -428,14 +440,14 @@ async def main():
     signal.signal(signal.SIGTERM, stop)
 
     from browser.engine import get_headless
-    mode = "attended" if args.attended else "ephemeral"
+    mode = "headed" if args.headed else "ephemeral"
     logger.info(
         "Hold poller started (mode=%s, interval=%ds, api=%s, engine=%s, headless=%s)",
         mode, POLL_INTERVAL, base_url, get_engine(), get_headless(),
     )
 
-    if args.attended:
-        # Wrap the whole attended block so SIGINT reaching Camoufox's
+    if args.headed:
+        # Wrap the whole headed block so SIGINT reaching Camoufox's
         # subprocess (which breaks the Playwright pipe) doesn't produce
         # a crash on shutdown. We've already persisted sessions after
         # each scrape, so a broken close is cosmetic.
@@ -443,31 +455,31 @@ async def main():
             async with launch_browser(get_engine(), headless=False) as browser:
                 _RESIDENT = ResidentBrowser(browser)
                 logger.info(
-                    "Attended: ready. Each scrape opens a tab in the resident "
+                    "Headed: ready. Each scrape opens a tab in the resident "
                     "window and closes it on completion. Solve captchas in the "
                     "live tab as scrapes arrive."
                 )
                 try:
-                    await _run_poll_loop(api, lambda: running, attended=bool(args.attended))
+                    await _run_poll_loop(api, lambda: running)
                 finally:
                     try:
                         saved = await _RESIDENT.save_sessions()
-                        logger.info("Attended: saved sessions for %d domain(s)", saved)
+                        logger.info("Headed: saved sessions for %d domain(s)", saved)
                     except Exception:
-                        logger.warning("Attended: save_sessions failed", exc_info=True)
+                        logger.warning("Headed: save_sessions failed", exc_info=True)
                     try:
                         await _RESIDENT.close()
                     except Exception:
-                        logger.debug("Attended: resident close raised", exc_info=True)
+                        logger.debug("Headed: resident close raised", exc_info=True)
                     _RESIDENT = None
         except Exception as exc:
             # Camoufox / Playwright can raise here if the subprocess
             # received SIGINT ahead of us — the pipe is already closed
             # so browser.close() has nothing to reply. Session state is
             # already on disk; no user-visible loss.
-            logger.info("Attended: browser shutdown finished with: %s", exc)
+            logger.info("Headed: browser shutdown finished with: %s", exc)
     else:
-        await _run_poll_loop(api, lambda: running, attended=bool(args.attended))
+        await _run_poll_loop(api, lambda: running)
 
 
 def main_sync():
