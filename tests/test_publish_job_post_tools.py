@@ -5,8 +5,7 @@ the api's owner-scoped POST /api/v1/job-posts/<id>/publish/ + /unpublish/
 @actions. These tests assert the wrappers (1) forward to the right endpoint
 with an empty body, (2) return the updated job-post resource, and (3)
 surface a 403/404 from the api as a clean error result — all with the HTTP
-layer mocked, never hitting a live api (mirrors test_attended_scrape_routing
-+ test_api_tools _fake_api).
+layer mocked, never hitting a live api (mirrors test_api_tools _fake_api).
 """
 
 from unittest.mock import AsyncMock, MagicMock

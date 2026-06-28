@@ -276,8 +276,11 @@ Then re-run via the existing entry:
 ```bash
 make runner                              # camoufox, headless, against prod
 make runner ARGS="--engine chrome"       # chromium + stealth
-make runner ARGS="--attended"            # headed; one resident window, ephemeral tabs
+make runner ARGS="--headed"              # headed; one resident window, ephemeral tabs (watch + screenshot to verify)
 make runner-local                        # against http://localhost:8000
+# `--attended` is retained as a hidden deprecated alias of `--headed` (logs a
+# warning) so the live pibu unit + tmuxinator invocations keep working through
+# the rollout. It no longer partitions the scrape queue — a scrape is a scrape.
 ```
 
 ### Pibu (Raspberry Pi runner)
