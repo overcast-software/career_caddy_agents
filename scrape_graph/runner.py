@@ -58,7 +58,10 @@ async def run_scrape_graph(
         state.scrape_id,
         state.source,
     )
-    result = await graph.run(entry, state=state)
+    # pydantic-graph 2.0: run() is keyword-only. The entry node instance is
+    # passed as `inputs`; the graph's start node is wired to NodeStep(entry)
+    # in graph.py, so the instance is dispatched to the right first node.
+    result = await graph.run(inputs=entry, state=state)
     return result
 
 
@@ -69,4 +72,4 @@ async def run_extract_graph(state: ScrapeGraphState):
     state._has_browser = False  # type: ignore[attr-defined]
     graph = build_extract_graph()
     from .nodes_extract import StartExtract
-    return await graph.run(StartExtract(), state=state)
+    return await graph.run(inputs=StartExtract(), state=state)

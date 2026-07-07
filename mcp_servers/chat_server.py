@@ -40,7 +40,7 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
 from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart  # noqa: E402
-from pydantic_ai.ag_ui import run_ag_ui  # noqa: E402
+from pydantic_ai.ui.ag_ui import AGUIAdapter  # noqa: E402
 from ag_ui.core.events import CustomEvent, EventType, RunErrorEvent  # noqa: E402
 from ag_ui.core.types import RunAgentInput, UserMessage  # noqa: E402
 from ag_ui.encoder import EventEncoder  # noqa: E402
@@ -972,7 +972,7 @@ async def chat(request: Request):
         augmented_message = f"{' '.join(prefix_parts)}\n{message}" if prefix_parts else message
 
         # Convert request history (JSON dicts) to pydantic-ai ModelMessage
-        # list so run_ag_ui can pass it through to the agent as
+        # list so the AGUIAdapter run can pass it through to the agent as
         # `message_history` (AG-UI's own run_input.messages carries only
         # the current-turn prompt).
         messages = []
@@ -1028,17 +1028,28 @@ async def chat(request: Request):
                     else:
                         last_new_messages = last_all_messages
                     u = result.usage()
-                    usage_total["request_tokens"] += u.request_tokens or 0
-                    usage_total["response_tokens"] += u.response_tokens or 0
-                    usage_total["total_tokens"] += u.total_tokens or 0
-                    usage_total["requests"] += u.requests or 0
+                    # pydantic-ai 2.0 renamed RunUsage.request_tokens /
+                    # response_tokens to input_tokens / output_tokens. Keep
+                    # the usage_total dict keys (the report_usage + frontend
+                    # session_meta contract) but source from the 2.0 attrs.
+                    usage_total["request_tokens"] += getattr(u, "input_tokens", 0) or 0
+                    usage_total["response_tokens"] += getattr(u, "output_tokens", 0) or 0
+                    usage_total["total_tokens"] += getattr(u, "total_tokens", 0) or 0
+                    usage_total["requests"] += getattr(u, "requests", 0) or 0
 
-                stream = run_ag_ui(
-                    agent,
-                    run_input,
-                    deps=deps,
-                    message_history=history_messages,
-                    on_complete=_on_complete,
+                # pydantic-ai 2.0 replaced the module-level run_ag_ui() with
+                # the AGUIAdapter. run_stream() yields native ag_ui protocol
+                # events; encode_stream() serializes them to the same SSE
+                # strings run_ag_ui used to emit — so the _parse_sse_chunk
+                # teeing + reload-CustomEvent injection below are unchanged,
+                # and on_complete still receives the AgentRunResult.
+                adapter = AGUIAdapter(agent, run_input)
+                stream = adapter.encode_stream(
+                    adapter.run_stream(
+                        deps=deps,
+                        message_history=history_messages,
+                        on_complete=_on_complete,
+                    )
                 )
 
                 async for chunk in stream:
