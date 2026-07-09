@@ -26,6 +26,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from scrape_graph._artifacts import _DOM_TRUNCATION_TRAILER, _MAX_DOM_BYTES
 from scrape_graph.nodes_extract import StartExtract
 from scrape_graph.nodes_scrape import PersistScrape
 from scrape_graph.state import ScrapeGraphState
@@ -139,3 +140,38 @@ def test_regrab_failure_omits_html_and_does_not_raise():
     assert page.content_calls == 1
     assert "html" not in attrs
     assert isinstance(next_node, StartExtract)
+
+
+def test_oversized_html_capped_at_max_dom_bytes():
+    """A captured DOM larger than the cap is truncated before the PATCH —
+    a multi-MB LinkedIn DOM must not be sent uncapped on the success path.
+    The PATCHed html is at most the cap plus the truncation trailer, and
+    the trailer is present so consumers can tell it was cut."""
+    big = "<html><body>" + ("x" * (_MAX_DOM_BYTES * 2)) + "</body></html>"
+    assert len(big) > _MAX_DOM_BYTES  # guard: the input really is oversized
+    state = _state(html=big)
+
+    with patch("scrape_graph.nodes_scrape.httpx.patch") as mock_patch:
+        next_node = _run(PersistScrape(), state)
+
+    attrs = _patched_attributes(mock_patch)
+    sent = attrs["html"]
+    assert len(sent) == _MAX_DOM_BYTES + len(_DOM_TRUNCATION_TRAILER)
+    assert sent.endswith(_DOM_TRUNCATION_TRAILER)
+    assert sent[:_MAX_DOM_BYTES] == big[:_MAX_DOM_BYTES]
+    assert isinstance(next_node, StartExtract)
+
+
+def test_small_html_passes_through_uncapped():
+    """A DOM at or under the cap is sent verbatim — no trailer, no
+    truncation. The cap only touches oversized DOMs."""
+    small = "<html><body>greenhouse SSR</body></html>"
+    assert len(small) <= _MAX_DOM_BYTES
+    state = _state(html=small)
+
+    with patch("scrape_graph.nodes_scrape.httpx.patch") as mock_patch:
+        _run(PersistScrape(), state)
+
+    attrs = _patched_attributes(mock_patch)
+    assert attrs["html"] == small
+    assert _DOM_TRUNCATION_TRAILER not in attrs["html"]
