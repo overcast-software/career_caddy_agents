@@ -36,6 +36,22 @@ logger = logging.getLogger(__name__)
 
 
 _MAX_DOM_BYTES = 200_000
+_DOM_TRUNCATION_TRAILER = "\n<!-- [truncated] -->"
+
+
+def truncate_dom(dom: str) -> str:
+    """Cap a captured DOM at ``_MAX_DOM_BYTES`` with a truncation trailer.
+
+    Shared by every path that persists ``scrape.html`` — the Fail-path
+    debug-artifact backfill (``capture_debug_artifact`` below) and the
+    success-path persist (``nodes_scrape.PersistScrape``). A LinkedIn /
+    Cloudflare DOM can be multiple MB; without a cap the success path
+    would PATCH the whole thing on every scrape. Keeping the cap + the
+    trailer convention in one place means both paths stay in lockstep.
+    """
+    if len(dom) > _MAX_DOM_BYTES:
+        return dom[:_MAX_DOM_BYTES] + _DOM_TRUNCATION_TRAILER
+    return dom
 
 
 def _api_base() -> str:
@@ -161,8 +177,7 @@ async def capture_debug_artifact(
         dom = None
 
     if dom:
-        if len(dom) > _MAX_DOM_BYTES:
-            dom = dom[:_MAX_DOM_BYTES] + "\n<!-- [truncated for debug artifact] -->"
+        dom = truncate_dom(dom)
         # Use the api to check if scrape.html is already set. Read-first-
         # then-maybe-write costs a round trip but keeps us from silently
         # overwriting a successful captured DOM. On any read/write

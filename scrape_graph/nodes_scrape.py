@@ -1263,9 +1263,14 @@ class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
         # Sending an empty html would clobber a DOM persisted on an earlier
         # run (lease-sweep re-dispatch) or by the debug-artifact backfill.
         # Composes with the api anti-clobber guard (which drops a falsy
-        # `html` from PATCHes) without relying on it.
+        # `html` from PATCHes) without relying on it. Cap at _MAX_DOM_BYTES
+        # via the same shared helper the Fail path uses — a LinkedIn DOM is
+        # multi-MB and the success path would otherwise PATCH it uncapped.
+        # Covers both the Capture-set html and the re-grab above, since both
+        # land in state.html before this gate.
         if state.html:
-            attributes["html"] = state.html
+            from ._artifacts import truncate_dom
+            attributes["html"] = truncate_dom(state.html)
 
         try:
             httpx.patch(
