@@ -67,4 +67,11 @@ RUN if [ "$INSTALL_CHROMIUM" = "true" ]; then uv run playwright install chromium
 COPY . /app
 RUN uv sync --frozen --no-dev
 
+# CC-161: guard Playwright 1.60's Firefox pageError dispatcher against an
+# undefined `location` (Camoufox/LinkedIn) so a location-less page error no
+# longer crashes the Node driver ("Connection closed while reading from the
+# driver"). Idempotent + shape-matched; must run after the final `uv sync`
+# (needs both the installed playwright bundle and scripts/ in the image).
+RUN uv run python scripts/patch_playwright_pageerror.py
+
 # No default CMD — overridden per-service in docker-compose
