@@ -235,11 +235,12 @@ async def _run_graph(
             await run_scrape_graph(state, browser_page=None, has_browser=True)
             return
         if _RESIDENT is not None:
+            # The resident hands back its ONE persistent work-page; the graph
+            # navigates it to the job URL. We deliberately do NOT close it
+            # afterward — it stays on the last job page while idle (reused
+            # tab, bounded memory), rebuilt only on driver death.
             page = await _RESIDENT.open_tab(domain=hostname, seed_cookies=cookies)
-            try:
-                await run_scrape_graph(state, browser_page=page, has_browser=True)
-            finally:
-                await _RESIDENT.close_tab(page)
+            await run_scrape_graph(state, browser_page=page, has_browser=True)
         else:
             async with launch_browser(get_engine(), _is_headless()) as browser:
                 ctx = await browser.new_context()
@@ -384,11 +385,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--headless", action="store_true", default=None, help="Run headless (default)")
     parser.add_argument(
         "--headed", dest="headed", action="store_true",
-        help="Launch a single resident headed browser; spawn an ephemeral tab "
-             "per scrape in the same window and close it on completion. Cookies "
-             "persist on the shared context across scrapes, so a login/captcha "
-             "you solve once stays warm. Use it to watch the runner work and "
-             "screenshot to verify. Forces headless off.",
+        help="Launch a single resident headed browser with ONE persistent "
+             "work-tab; each scrape navigates that same tab to the job URL and "
+             "leaves it there (reused tab, bounded memory — never closed "
+             "between scrapes). Cookies persist on the shared context across "
+             "scrapes, so a login/captcha you solve once stays warm. Use it to "
+             "watch the runner work and screenshot to verify. Forces headless off.",
     )
     # Deprecated alias of --headed, retained so the live pibu systemd unit and
     # tmuxinator invocations keep working through the rollout. It launches the
@@ -515,7 +517,7 @@ async def main():
     signal.signal(signal.SIGTERM, stop)
 
     from browser.engine import get_headless
-    mode = "headed" if args.headed else "ephemeral"
+    mode = "headed" if args.headed else "headless"
     logger.info(
         "Hold poller started (mode=%s, interval=%ds, api=%s, engine=%s, headless=%s)",
         mode, POLL_INTERVAL, base_url, get_engine(), get_headless(),
@@ -529,9 +531,14 @@ async def main():
         try:
             async with launch_browser(get_engine(), headless=False) as browser:
                 _RESIDENT = ResidentBrowser(browser)
+                # Build the context + persistent work-page eagerly so the
+                # resident window is up before the first scrape (idle = one
+                # tab on about:blank), not conjured lazily on first claim.
+                await _RESIDENT.ensure_ready()
                 logger.info(
-                    "Headed: ready. Each scrape opens a tab in the resident "
-                    "window and closes it on completion. Solve captchas in the "
+                    "Headed: ready. One persistent tab stays open in the "
+                    "resident window; each scrape navigates that same tab to "
+                    "the job URL and leaves it there. Solve captchas in the "
                     "live tab as scrapes arrive."
                 )
                 try:
