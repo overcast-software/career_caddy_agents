@@ -1,17 +1,27 @@
-"""ResidentBrowser — long-lived headed browser with ephemeral per-scrape tabs.
+"""ResidentBrowser — long-lived headed browser with ONE persistent work-page.
 
-One browser, one BrowserContext, one anchor page that stays open for the
-process lifetime, plus one ephemeral tab spawned per scrape via
-window.open() and closed when the scrape finishes.
+One browser, one BrowserContext, one page that stays open for the whole
+process lifetime. It is created eagerly when the headed runner starts, so
+the resident window is always up (idle = the one tab sits on about:blank or
+the last job page). Each scrape NAVIGATES that same page to the job URL and
+hands it back — it is never closed between scrapes and no fresh tab is
+spawned per scrape.
 
-Why window.open() instead of ctx.new_page(): Playwright Firefox / Camoufox
-renders ctx.new_page() as a separate OS window. Pages spawned via
-anchor.evaluate("window.open(...)") and captured via expect_page() honor
-the user's browser.link.open_newwindow preference and land as tabs in the
-anchor's window — the attended ergonomics we want.
+Why one persistent page via ctx.new_page(): Playwright Firefox / Camoufox
+renders ctx.new_page() as a separate OS window. With a SINGLE persistent
+page that's exactly what we want — one window == one tab == the workbench.
+(The old model kept an idle "anchor" page and spawned an ephemeral tab per
+scrape via anchor.evaluate("window.open(...)"), which flashed a window open
+and closed it on completion; that per-scrape tab churn is gone.) A separate
+omarchy windowrule parks class ``camoufox-default`` into ``special:scratchpad``,
+so no agents-side window management is needed — we just guarantee exactly one
+top-level window exists.
 
-Cookies persist on the shared context, so login state survives across
-scrapes regardless of which tab solved the auth challenge.
+Doug's rationale for one reused tab: "prefer one so I don't hold the past in
+memory" — bounded memory, no tab pile-up, the last job page stays visible.
+
+Cookies persist on the shared context, so login state survives across scrapes
+regardless of which navigation solved the auth challenge.
 """
 
 from __future__ import annotations
@@ -55,7 +65,10 @@ class ResidentBrowser:
     def __init__(self, browser):
         self._browser = browser
         self._context = None
-        self._anchor = None
+        # The single persistent work-page. Created eagerly by ensure_ready()
+        # / _ensure_context() and reused for every scrape — never closed
+        # between scrapes, rebuilt only on driver death via relaunch().
+        self._page = None
         self._session_store = SessionStore()
         self._seeded_domains: set[str] = set()
 
@@ -63,34 +76,49 @@ class ResidentBrowser:
     def browser(self):
         return self._browser
 
+    @property
+    def page(self):
+        """The single persistent work-page (None until ensure_ready)."""
+        return self._page
+
     async def _ensure_context(self):
         if self._context is None:
             self._context = await self._browser.new_context()
-            self._anchor = await self._context.new_page()
+            self._page = await self._context.new_page()
             try:
-                await self._anchor.goto("about:blank")
+                await self._page.goto("about:blank")
             except Exception:
                 pass
         return self._context
 
+    async def ensure_ready(self) -> None:
+        """Eagerly build the context + persistent page so the resident window
+        is up before the first scrape.
+
+        Called once when the headed runner starts. Idle state is then the one
+        persistent tab sitting on about:blank; each scrape navigates it.
+        """
+        await self._ensure_context()
+
     async def relaunch(self) -> None:
-        """Tear down and rebuild the context + anchor on the existing browser.
+        """Tear down and rebuild the context + persistent page on the existing
+        browser.
 
         Called when a driver-closed error is seen mid-run. Rebuilds the
-        BrowserContext and anchor page so the next ``open_tab`` runs against
-        a live pipe. Cookies are re-seeded lazily per domain on the next
-        ``open_tab`` (``_seeded_domains`` is cleared), so warm login state is
-        reloaded from SessionStore rather than lost.
+        BrowserContext and the single work-page so the next ``open_tab`` runs
+        against a live pipe. Cookies are re-seeded lazily per domain on the
+        next ``open_tab`` (``_seeded_domains`` is cleared), so warm login state
+        is reloaded from SessionStore rather than lost.
 
         If the browser process itself is dead — not just the context — the
         ``new_context()`` below re-raises the driver-closed error; the caller
         (``open_tab``) converts that into ``ResidentDriverDead`` so the runner
         backs off and lets the process/systemd respawn the whole browser.
         """
-        logger.warning("Resident: relaunching context+anchor after driver death")
+        logger.warning("Resident: relaunching context+page after driver death")
         old_ctx = self._context
         self._context = None
-        self._anchor = None
+        self._page = None
         self._seeded_domains.clear()
         if old_ctx is not None:
             try:
@@ -102,21 +130,23 @@ class ResidentBrowser:
         await self._ensure_context()
 
     async def open_tab(self, domain: str = "", seed_cookies: list[dict] | None = None):
-        """Spawn a fresh blank tab in the resident window and return it.
+        """Return the single persistent work-page for this scrape.
 
-        On first encounter for a domain, seed cookies (from arg or
-        SessionStore) into the shared context so subsequent navigations
-        run already-authenticated. The caller is expected to drive the
-        page (typically via the graph's Navigate node).
+        This does NOT spawn a new tab — it hands back the same reused page
+        every time (bounded memory, no tab pile-up). On first encounter for a
+        domain, seed cookies (from arg or SessionStore) into the shared context
+        so subsequent navigations run already-authenticated. The caller is
+        expected to navigate the page (typically via the graph's Navigate node)
+        and must NOT close it between scrapes.
 
-        If the resident driver connection is dead (the browser subprocess
-        died on a previous scrape), the first Playwright call here raises a
-        driver-closed error. We relaunch the context+anchor ONCE and retry
-        rather than let the scrape fail: a dead driver is infrastructure
-        death, not a content failure, and the resident model exists to be
-        rebuilt. If the retry still hits a driver-closed error the browser
-        process itself is gone — raise ``ResidentDriverDead`` so the runner
-        re-queues the scrape and backs off.
+        If the resident driver connection is dead (the browser subprocess died
+        on a previous scrape), the first Playwright call here raises a
+        driver-closed error. We relaunch the context+page ONCE and retry rather
+        than let the scrape fail: a dead driver is infrastructure death, not a
+        content failure, and the resident model exists to be rebuilt. If the
+        retry still hits a driver-closed error the browser process itself is
+        gone — raise ``ResidentDriverDead`` so the runner re-queues the scrape
+        and backs off.
         """
         try:
             return await self._open_tab_once(domain, seed_cookies)
@@ -124,7 +154,7 @@ class ResidentBrowser:
             if not is_driver_closed(exc):
                 raise
             logger.warning(
-                "Resident: driver closed opening tab for %s; relaunching and retrying",
+                "Resident: driver closed preparing page for %s; relaunching and retrying",
                 domain or "?",
             )
         # One relaunch + retry. Any driver-closed error on this path means
@@ -141,7 +171,7 @@ class ResidentBrowser:
 
     async def _open_tab_once(self, domain: str, seed_cookies: list[dict] | None):
         ctx = await self._ensure_context()
-        assert self._anchor is not None  # _ensure_context() set it
+        assert self._page is not None  # _ensure_context() set it
 
         if domain and domain not in self._seeded_domains:
             cookies = seed_cookies or self._session_store.load(domain) or []
@@ -155,15 +185,18 @@ class ResidentBrowser:
                     logger.warning("Resident: cookie seed failed for %s: %s", domain, exc)
             self._seeded_domains.add(domain)
 
-        async with ctx.expect_page() as new_page_info:
-            await self._anchor.evaluate("window.open('about:blank', '_blank')")
-        return await new_page_info.value
+        # A no-op Playwright call so a dead driver surfaces HERE (and is
+        # relaunched by open_tab) rather than later inside the graph's
+        # Navigate node, where it would be misread as a content failure.
+        await self._page.evaluate("1")
+        return self._page
 
     async def close_tab(self, page: Any) -> None:
-        try:
-            await page.close()
-        except Exception:
-            logger.debug("Resident: tab close raised", exc_info=True)
+        """No-op — the persistent work-page is deliberately NOT closed between
+        scrapes. It stays on the last job page (or about:blank) while idle so
+        the resident window never flashes shut. Signature kept for callers.
+        """
+        return None
 
     async def save_sessions(self) -> int:
         """Write current cookies back to SessionStore, one file per seeded
@@ -196,7 +229,7 @@ class ResidentBrowser:
             except Exception:
                 pass
             self._context = None
-        self._anchor = None
+        self._page = None
         self._seeded_domains.clear()
 
 

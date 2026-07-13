@@ -56,12 +56,12 @@ class TestIsDriverClosed:
 class _FakeContext:
     """Minimal Playwright BrowserContext stand-in for open_tab."""
 
-    def __init__(self, anchor):
-        self._anchor = anchor
+    def __init__(self, page):
+        self._page = page
         self.closed = False
 
     async def new_page(self):
-        return self._anchor
+        return self._page
 
     async def add_cookies(self, cookies):
         return None
@@ -69,45 +69,23 @@ class _FakeContext:
     async def close(self):
         self.closed = True
 
-    def expect_page(self):
-        # Playwright's expect_page() is an async CM yielding an info object
-        # whose `.value` awaitable resolves to the spawned page. The anchor's
-        # evaluate() (called inside the `async with`) is what raises when the
-        # driver is dead, so this CM just wires up the page hand-back.
-        return _CtxProxy(MagicMock(name="spawned_page"))
 
+class _FakePage:
+    """Persistent work-page whose ``evaluate`` raises driver-closed for the
+    first N calls (except the eager about:blank goto), then succeeds — models
+    a dead driver that a relaunch revives (or doesn't, when deaths=999).
 
-class _CtxProxy:
-    def __init__(self, page):
-        self._page = page
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *a):
-        return False
-
-    @property
-    def value(self):
-        page = self._page
-
-        async def _get():
-            return page
-
-        return _get()
-
-
-class _FakeAnchor:
-    """Anchor page whose ``evaluate`` raises driver-closed for the first N
-    calls, then succeeds — models a dead driver that a relaunch revives (or
-    doesn't, when deaths=999).
+    ``goto`` is what open_tab / graph Navigate would call; the resident's
+    readiness probe is ``evaluate("1")``, which is where driver-death surfaces.
     """
 
     def __init__(self, deaths: int):
         self._deaths = deaths
         self.evaluate_calls = 0
+        self.goto_calls = 0
 
     async def goto(self, *a, **kw):
+        self.goto_calls += 1
         return None
 
     async def evaluate(self, *a, **kw):
@@ -120,32 +98,80 @@ class _FakeAnchor:
 class _FakeBrowser:
     """Browser stand-in that hands out a fresh context per new_context().
 
-    ``contexts_before_recovery`` contexts get a dead anchor; contexts after
-    that get a live anchor (models the relaunch rebuilding onto a browser
-    that is itself still alive).
+    Contexts up to ``recover_after`` get a dead page; contexts after that get
+    a live page (models the relaunch rebuilding onto a browser that is itself
+    still alive).
     """
 
-    def __init__(self, deaths_per_anchor: int, recover_after: int):
-        self._deaths_per_anchor = deaths_per_anchor
+    def __init__(self, deaths_per_page: int, recover_after: int):
+        self._deaths_per_page = deaths_per_page
         self._recover_after = recover_after
         self.new_context_calls = 0
-        self.anchors: list[_FakeAnchor] = []
+        self.pages: list[_FakePage] = []
 
     async def new_context(self):
         self.new_context_calls += 1
-        deaths = 0 if self.new_context_calls > self._recover_after else self._deaths_per_anchor
-        anchor = _FakeAnchor(deaths=deaths)
-        self.anchors.append(anchor)
-        ctx = _FakeContext(anchor)
+        deaths = 0 if self.new_context_calls > self._recover_after else self._deaths_per_page
+        page = _FakePage(deaths=deaths)
+        self.pages.append(page)
+        ctx = _FakeContext(page)
         return ctx
+
+
+class TestResidentPersistentPage:
+    @pytest.mark.asyncio
+    async def test_ensure_ready_creates_context_and_persistent_page(self):
+        # Eager startup: the window (context + one page) exists before any
+        # scrape, so idle == one tab on about:blank.
+        browser = _FakeBrowser(deaths_per_page=0, recover_after=0)
+        rb = ResidentBrowser(browser)
+
+        await rb.ensure_ready()
+
+        assert rb.page is not None
+        assert browser.new_context_calls == 1
+        assert len(browser.pages) == 1
+
+    @pytest.mark.asyncio
+    async def test_successive_scrapes_reuse_same_page(self):
+        # CC-159: no fresh tab per scrape. open_tab hands back the SAME page
+        # object every time — one reused work-tab, bounded memory.
+        browser = _FakeBrowser(deaths_per_page=0, recover_after=0)
+        rb = ResidentBrowser(browser)
+        await rb.ensure_ready()
+
+        p1 = await rb.open_tab(domain="a.com")
+        p2 = await rb.open_tab(domain="b.com")
+        p3 = await rb.open_tab(domain="a.com")
+
+        assert p1 is p2 is p3
+        # No relaunch, exactly one context/page ever built across 3 scrapes.
+        assert browser.new_context_calls == 1
+        assert len(browser.pages) == 1
+
+    @pytest.mark.asyncio
+    async def test_close_tab_does_not_close_the_page(self):
+        # The persistent page is NOT torn down between scrapes; close_tab is a
+        # no-op so the resident window never flashes shut.
+        browser = _FakeBrowser(deaths_per_page=0, recover_after=0)
+        rb = ResidentBrowser(browser)
+        await rb.ensure_ready()
+
+        page = await rb.open_tab(domain="example.com")
+        page.close = AsyncMock()  # would-be close hook
+        await rb.close_tab(page)
+
+        page.close.assert_not_called()
+        # Same page still available for the next scrape.
+        assert await rb.open_tab(domain="example.com") is page
 
 
 class TestResidentOpenTabRelaunch:
     @pytest.mark.asyncio
     async def test_relaunch_and_succeed_on_driver_death(self, monkeypatch):
-        # First context's anchor dies once (the initial evaluate); relaunch
-        # rebuilds onto a live anchor and the retry succeeds.
-        browser = _FakeBrowser(deaths_per_anchor=99, recover_after=1)
+        # First context's page dies once (the readiness probe); relaunch
+        # rebuilds onto a live page and the retry succeeds.
+        browser = _FakeBrowser(deaths_per_page=99, recover_after=1)
         rb = ResidentBrowser(browser)
 
         page = await rb.open_tab(domain="example.com")
@@ -155,9 +181,25 @@ class TestResidentOpenTabRelaunch:
         assert browser.new_context_calls == 2
 
     @pytest.mark.asyncio
+    async def test_relaunch_rebuilds_persistent_page(self):
+        # Driver death rebuilds the ONE persistent page; the resident keeps
+        # serving a single reused tab afterward (not a growing pile).
+        browser = _FakeBrowser(deaths_per_page=99, recover_after=1)
+        rb = ResidentBrowser(browser)
+
+        recovered = await rb.open_tab(domain="example.com")
+
+        # The rebuilt page is the one the resident now holds and reuses.
+        assert rb.page is recovered
+        again = await rb.open_tab(domain="example.com")
+        assert again is recovered
+        # Only the relaunch (2 contexts) built pages — the reuse did not.
+        assert browser.new_context_calls == 2
+
+    @pytest.mark.asyncio
     async def test_raises_resident_driver_dead_when_relaunch_also_dies(self):
-        # Every context's anchor is dead — the browser process itself is gone.
-        browser = _FakeBrowser(deaths_per_anchor=99, recover_after=999)
+        # Every context's page is dead — the browser process itself is gone.
+        browser = _FakeBrowser(deaths_per_page=99, recover_after=999)
         rb = ResidentBrowser(browser)
 
         with pytest.raises(ResidentDriverDead):
@@ -169,16 +211,16 @@ class TestResidentOpenTabRelaunch:
 
     @pytest.mark.asyncio
     async def test_non_driver_error_is_not_swallowed(self):
-        browser = _FakeBrowser(deaths_per_anchor=0, recover_after=0)
+        browser = _FakeBrowser(deaths_per_page=0, recover_after=0)
         rb = ResidentBrowser(browser)
 
         async def boom(*a, **kw):
             raise ValueError("not a driver problem")
 
-        # Corrupt the anchor after context build so evaluate raises a
+        # Corrupt the page after context build so the readiness probe raises a
         # non-driver error; it must propagate unchanged (no relaunch).
         await rb._ensure_context()
-        rb._anchor.evaluate = boom
+        rb._page.evaluate = boom
         with pytest.raises(ValueError):
             await rb.open_tab(domain="example.com")
 
