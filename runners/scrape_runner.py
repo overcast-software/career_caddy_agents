@@ -49,11 +49,29 @@ from browser.engine import (
     get_engine,
     launch_browser,
 )
-from browser.resident import ResidentBrowser
+from browser.resident import ResidentBrowser, ResidentDriverDead, is_driver_closed
 from lib.url_unwrap import unwrap_url
 
 # Module-level resident browser; set by the headed main() before the poll loop.
 _RESIDENT: ResidentBrowser | None = None
+
+# How many consecutive driver-death events (across claims) the runner
+# tolerates before it stops claiming and backs off hard. A dead resident
+# whose relaunch keeps failing would otherwise poll claim-next forever and
+# drain the hold queue into `failed` rows (CC-141). Small bound, loud error.
+_DRIVER_DEATH_BACKOFF_THRESHOLD = 3
+# Seconds to sleep after the threshold trips, on top of POLL_INTERVAL, to
+# give a supervisor (systemd Restart / operator) time to respawn the browser.
+_DRIVER_DEATH_BACKOFF_SECONDS = 120
+
+
+class DriverDeath(Exception):
+    """Signal raised up through the runner when a claimed scrape failed only
+    because the resident browser driver was dead (infra-death), NOT because
+    of page/content. The scrape is left re-queued as ``hold`` (never
+    ``failed``); the poll loop counts these and backs off rather than
+    draining the queue.
+    """
 
 
 def format_scrape_label(entry_id, final_id) -> str:
@@ -252,7 +270,34 @@ async def _run_graph(
             note=f"graph run exceeded {int(GRAPH_RUN_TIMEOUT_S)}s cap",
         )
         return False
-    except Exception as exc:
+    except (ResidentDriverDead, Exception) as exc:
+        # Infra-death guard (CC-141). A dead browser driver surfaces as
+        # ResidentDriverDead (resident path, already relaunched-and-failed)
+        # or a raw Playwright "Connection closed while reading from the
+        # driver" error anywhere in the graph run. Either way this is NOT a
+        # content failure: the page never got a fair scrape. Marking it
+        # `failed` here is what silently drains the hold queue into failed
+        # rows while the browser is dead. Instead re-queue it as `hold`
+        # (distinctly tagged) and raise DriverDeath so the poll loop backs
+        # off instead of claim-looping on a dead browser.
+        if isinstance(exc, ResidentDriverDead) or is_driver_closed(exc):
+            label = format_scrape_label(scrape_id, state.scrape_id)
+            logger.error(
+                "Scrape %s hit dead browser driver — re-queueing as hold, "
+                "NOT failing (CC-141 infra-death)",
+                label,
+            )
+            try:
+                await update_scrape(
+                    api, scrape_id, status="hold",
+                    note="[driver-death] browser driver connection closed; re-queued",
+                )
+            except Exception:
+                logger.warning(
+                    "Scrape %s: re-queue PATCH failed after driver death", label,
+                    exc_info=True,
+                )
+            raise DriverDeath(str(exc)[:200]) from exc
         logger.exception(
             "Scrape %s failed inside graph run",
             format_scrape_label(scrape_id, state.scrape_id),
@@ -321,6 +366,11 @@ async def poll_once(api: ApiClient) -> int:
             return processed
 
         logger.info("Claimed scrape %s (runner=%s)", scrape.get("id"), runner_name)
+        # DriverDeath propagates: the browser is dead, so stop claiming this
+        # cycle rather than pulling the next hold row and failing it too. The
+        # scrape we just claimed was re-queued as `hold` by _run_graph, so it
+        # stays available for a healthy runner / the next cycle. The poll loop
+        # counts these and backs off.
         if await process_scrape(api, scrape):
             processed += 1
 
@@ -377,14 +427,39 @@ async def _preflight_auth(api: ApiClient) -> bool:
 
 
 async def _run_poll_loop(api: ApiClient, running_flag):
+    consecutive_driver_deaths = 0
     while running_flag():
+        backoff = 0
         try:
             count = await poll_once(api)
             if count:
                 logger.info("Processed %d scrape(s)", count)
+            consecutive_driver_deaths = 0
+        except DriverDeath as exc:
+            # The resident browser is dead and could not be rebuilt. The
+            # claimed scrape was already re-queued as `hold` (not failed).
+            # Stop hammering claim-next: count the death and, once we cross
+            # the threshold, back off hard with a loud ERROR so the outage is
+            # visible in logfire instead of silently draining the queue.
+            consecutive_driver_deaths += 1
+            if consecutive_driver_deaths >= _DRIVER_DEATH_BACKOFF_THRESHOLD:
+                backoff = _DRIVER_DEATH_BACKOFF_SECONDS
+                logger.error(
+                    "Browser driver dead %d cycles running (%s) — backing off "
+                    "%ds and NOT claiming. Holds are left claimable; restart "
+                    "the runner/browser to recover (CC-141).",
+                    consecutive_driver_deaths, exc, backoff,
+                )
+            else:
+                logger.warning(
+                    "Browser driver death %d/%d — pausing this cycle (%s)",
+                    consecutive_driver_deaths,
+                    _DRIVER_DEATH_BACKOFF_THRESHOLD, exc,
+                )
         except Exception:
             logger.warning("Poll cycle failed, will retry", exc_info=True)
-        await asyncio.sleep(POLL_INTERVAL)
+            consecutive_driver_deaths = 0
+        await asyncio.sleep(POLL_INTERVAL + backoff)
 
 
 async def main():
