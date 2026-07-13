@@ -20,11 +20,41 @@ from typing import Union
 import httpx
 from pydantic_graph import BaseNode, End, GraphRunContext
 
+from browser.resident import is_driver_closed
 from .state import ScrapeGraphState
 from .tracing import trace_node
 from .url_canonicalize import apply_url_rewrites, canonicalize_url, urls_differ
 
 logger = logging.getLogger(__name__)
+
+
+def _reraise_if_driver_closed(exc: BaseException) -> None:
+    """Re-raise ``exc`` when it is a Playwright driver-connection-dead error.
+
+    CC-160: a Camoufox/Playwright driver death that happens MID-scrape (after
+    ``open_tab`` succeeded — the seam CC-141's open_tab guard can't cover)
+    surfaces as "Connection closed while reading from the driver" on the next
+    Playwright call, whichever node is running. The browser-tier nodes below
+    catch every per-selector / per-op exception best-effort (a page that just
+    hasn't hydrated a selector yet is normal), which means a dead-driver error
+    would otherwise be swallowed as one more "not matched": the graph marches
+    over a dead page, captures 0 bytes, and terminates at ``ExtractFail`` →
+    the row is wrongly marked ``failed`` (and the ExtractFail screenshot fires
+    against a corpse → no screenshot, no DOM).
+
+    Call this at the TOP of every ``except`` that wraps a Playwright call. A
+    driver-closed error propagates out of the node and out of
+    ``run_scrape_graph``; the runner's ``_run_graph`` already treats it as
+    infra-death — relaunch (CC-141 ``open_tab``) + re-queue the scrape as
+    ``hold`` (never ``failed``) — so the eventual real failure happens on a
+    live, re-navigated page where the screenshot invariant can actually fire.
+
+    A genuine "no selector matched after 30s" (or any non-driver error) does
+    NOT carry the marker phrase, so it is left to be swallowed as before and
+    routes onward to SettleWait/…/ExtractFail exactly like today.
+    """
+    if is_driver_closed(exc):
+        raise exc
 
 # Wall-clock budget for ResolveFinalUrl — bounds the redirect-handoff
 # work (canonicalize + child-scrape POST + parent terminal-close) so a
@@ -329,6 +359,10 @@ class Navigate(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=30_000)
                 state.final_url = page.url
             except Exception as exc:
+                # CC-160: a driver death at goto is infra-death, not a
+                # navigation content failure — propagate so the runner
+                # relaunches + re-queues hold instead of marching on.
+                _reraise_if_driver_closed(exc)
                 state.failure_reason = f"navigate_failed: {exc}"
         from . import nodes_obstacle
         trace_node(state, "Navigate", "DetectObstacle", started)
@@ -726,6 +760,13 @@ class WaitReadySelector(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore
                         )
                         ok = True
                     except Exception as exc:
+                        # CC-160: a mid-scrape driver death surfaces here as a
+                        # per-selector wait_for exception. Re-raise it BEFORE
+                        # recording it as "not matched" so the runner can
+                        # relaunch + re-queue hold instead of marching over a
+                        # dead page to a wrong `failed`. Non-driver errors
+                        # (timeout, parse) fall through and are recorded.
+                        _reraise_if_driver_closed(exc)
                         # Distinguish parser errors (selector is malformed)
                         # from timeouts so the trace tells us which is which.
                         msg = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
@@ -837,7 +878,11 @@ class ScrollToLoad(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-r
                         await page.evaluate(
                             f"window.scrollBy(0, {_SCROLL_STEP_PX})"
                         )
-                    except Exception:
+                    except Exception as exc:
+                        # CC-160: don't let a mid-scroll driver death look like
+                        # a benign scroll error — propagate so the runner
+                        # relaunches + re-queues hold.
+                        _reraise_if_driver_closed(exc)
                         break
                     await asyncio.sleep(_SCROLL_TICK_MS / 1000.0)
                     for sel in selectors:
@@ -846,15 +891,16 @@ class ScrollToLoad(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-r
                             if handle is not None:
                                 matched = sel
                                 break
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _reraise_if_driver_closed(exc)
                     if matched:
                         break
                     try:
                         height = await page.evaluate(
                             "document.body.scrollHeight"
                         )
-                    except Exception:
+                    except Exception as exc:
+                        _reraise_if_driver_closed(exc)
                         height = last_height
                     if height == last_height:
                         stalled += 1
@@ -865,10 +911,14 @@ class ScrollToLoad(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-r
                         last_height = height
                 try:
                     final_y = await page.evaluate("window.scrollY") or 0
-                except Exception:
+                except Exception as exc:
+                    _reraise_if_driver_closed(exc)
                     final_y = 0
                 await asyncio.sleep(_SCROLL_POST_SETTLE_MS / 1000.0)
-            except Exception:
+            except Exception as exc:
+                # Outer guard: a driver-closed error re-raised by any inner
+                # handler must not be re-swallowed here (CC-160).
+                _reraise_if_driver_closed(exc)
                 logger.debug("ScrollToLoad failed", exc_info=True)
         trace_node(
             state, "ScrollToLoad", "ExpandTruncations", started,
@@ -892,7 +942,8 @@ class ExpandTruncations(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore
             try:
                 from mcp_servers.browser_server import _try_expand_truncations
                 await _try_expand_truncations(page)
-            except Exception:
+            except Exception as exc:
+                _reraise_if_driver_closed(exc)  # CC-160
                 logger.debug("ExpandTruncations failed", exc_info=True)
         trace_node(ctx.state, "ExpandTruncations", "Capture", started)
         return Capture()
@@ -911,6 +962,12 @@ class Capture(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
                 state.job_content = await page.inner_text("body")
                 state.html = await page.content()
             except Exception as exc:
+                # CC-160: a driver death between ResolveFinalUrl and here
+                # makes both reads throw. Propagate rather than persist a
+                # 0-byte capture and march to ExtractFail — the runner
+                # relaunches + re-queues hold so the retry captures a live
+                # page (and the eventual real ExtractFail screenshots it).
+                _reraise_if_driver_closed(exc)
                 state.failure_reason = f"capture_failed: {exc}"
 
             await _screenshot_and_upload(page, state)
