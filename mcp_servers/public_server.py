@@ -1,11 +1,11 @@
 """
 Career Caddy Public MCP Server — authenticated proxy to the Career Caddy API.
 
-Deployed at mcp.careercaddy.online. Exposes career-data tools only (no email,
+Deployed at careercaddy.online (/mcp). Exposes career-data tools only (no email,
 no browser). Each client authenticates with their own jh_* API key, which is
 forwarded to the Django API on every request.
 
-    Connect at: https://mcp.careercaddy.online/mcp
+    Connect at: https://careercaddy.online/mcp
     Auth:       Authorization: Bearer jh_xxxxx
 
 Security invariants:

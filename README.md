@@ -8,7 +8,7 @@ The agent runtime for [Career Caddy](https://github.com/overcast-software/career
 agents/                         (this repo)
 ├── agents/                     # Pydantic-AI agent definitions (job_extractor, obstacle, onboarding, career_caddy CRUD)
 ├── mcp_servers/                # 4 MCP servers — see mcp_servers/README.md for the deploy table
-│   ├── public_server.py        #   prod :8030 — mcp.careercaddy.online (per-client jh_* keys, read-only)
+│   ├── public_server.py        #   prod :8030 — careercaddy.online/mcp (per-client jh_* keys, read-only)
 │   ├── chat_server.py          #   prod :8031 — frontend chat (proxied via api)
 │   ├── browser_server.py       #   local-only :3004 — Camoufox/Playwright
 │   └── career_caddy_server.py  #   local-only stdio — CRUD against the Career Caddy REST API
@@ -52,7 +52,7 @@ The Docker image runs as **two prod services** (`caddy-public` and `caddy-chat`)
 
 | Surface | Where it runs |
 |---|---|
-| `mcp_servers/public_server.py` | Prod VPS (`:8030`, `mcp.careercaddy.online`) |
+| `mcp_servers/public_server.py` | Prod VPS (`:8030`, `careercaddy.online/mcp`) |
 | `mcp_servers/chat_server.py` | Prod VPS (`:8031`, internal-only behind api proxy) |
 | `mcp_servers/browser_server.py` | Local dev / Pi (`:3004`) |
 | `runners/scrape_runner.py` | Local dev / Pi / omarchy / pibu (drives the production scrape path) |
