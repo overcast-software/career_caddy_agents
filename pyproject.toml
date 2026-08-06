@@ -18,7 +18,13 @@ dependencies = [
     # (`ag_ui.core`, `ag_ui.encoder`) that chat_server imports is no longer a
     # default dep — it ships behind this extra.
     "pydantic-ai[ag-ui]>=0.0.14",
-    "playwright>=1.40.0",
+    # Keep playwright in lockstep with camoufox's bundled Firefox. camoufox
+    # ships a patched Firefox tied to a specific playwright protocol; if
+    # playwright floats ahead of camoufox the driver crashes serializing
+    # Firefox pageerror events (`location.url: expected string, got object`,
+    # crashes the Node driver mid-scrape — BACK-117). camoufox 0.5.4 caps
+    # playwright<1.61, so keep this floor high and let camoufox pick the ceiling.
+    "playwright>=1.60.0,<1.61",
     "httpx>=0.25.0",
     "python-dotenv>=1.0.0",
     "fastmcp>=3.0.0,<4",
@@ -31,7 +37,11 @@ dependencies = [
     # spans.
     "logfire[httpx]",
     "pyyaml",
-    "camoufox>=0.4.11",
+    # 0.5.x is the first camoufox built against the playwright 1.60 protocol.
+    # 0.4.11's Firefox binary is Jan-2025 vintage and mismatches — see the
+    # playwright pin above. Bumping the pin is not enough: re-fetch the browser
+    # binary too (`python -m camoufox fetch`).
+    "camoufox>=0.5.4",
     "playwright-stealth>=1.0.6",
     "jinja2>=3.0.0",
     "starlette>=0.37.0",
