@@ -263,9 +263,11 @@ async def update_job_application(
 
 
 @server.tool(
-    description="Fetch the user's personal career profile: resume, skills, experience, "
-    "education, certifications, and cover letters. Use this to score jobs or "
-    "answer questions about the user's background. This is NOT job posts."
+    description="Fetch the user's personal career profile: their favorited resumes, "
+    "Q&A answers, and cover letters, as one AI-ready markdown blob. Skills, "
+    "experience, education and certifications appear as prose inside the resume "
+    "text, not as separate fields. Use this to score jobs or answer questions "
+    "about the user's background. This is NOT job posts."
 )
 async def get_career_data() -> str:
     return await api_tools.get_career_data(_api())
