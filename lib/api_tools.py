@@ -245,15 +245,18 @@ TOOL_SHAPES: dict[str, dict[str, Any]] = {
     # --- Read: aggregate ---
     "get_career_data": {
         "kind": "aggregate",
+        # Keyed by the `type` of each entry in the response's `sections`
+        # list — NOT by resource name. See get_career_data() for the real
+        # response shape.
         "section_attrs": {
-            "resume": ["name", "created_at"],
-            "skill": ["name", "category", "level"],
-            "experience": ["company", "title", "started_at", "ended_at"],
-            "education": ["institution", "degree", "field", "ended_at"],
-            "certification": ["name", "issuer", "issued_at"],
-            "cover_letter": ["title", "created_at"],
+            "resumes": ["title", "subtitle"],
+            "qas": ["question_id"],
+            "cover_letters": ["job", "company", "created_at"],
         },
-        "notes": "Trim every nested record; keep nesting structure.",
+        "notes": "Response is {data: markdown blob, sections: [{type, title, "
+                 "items}], meta: {...ids}}. `data` already inlines every "
+                 "resume / Q&A / cover-letter body, so trim those bodies out "
+                 "of `sections` and keep it as an id index only.",
     },
 
     # --- Write: create ---
@@ -1090,25 +1093,32 @@ async def update_job_application(
 
 
 async def get_career_data(api: ApiClient) -> str:
-    """Fetch the user's resumes, skills, experience, education, certifications, cover letters, and favorited answers. Large aggregated blob — call only when role-fit / experience-tailoring is needed and you don't already have it in this conversation. Does NOT contain the user's name, email, phone, address, LinkedIn, or GitHub — for those, call get_current_user."""
+    """Fetch the user's career profile — their favorited resumes, favorited Q&A answers, and favorited cover letters — as one AI-ready markdown blob under `data`, plus an id index under `sections` / `meta`. Skills, experience, education and certifications appear only as prose inside the resume text; there are no separate fields for them. Large — call only when role-fit / experience-tailoring is needed and you don't already have it in this conversation. Does NOT contain the user's name, email, phone, address, LinkedIn, or GitHub — for those, call get_current_user."""
     payload, error, status = await api.get_data("/api/v1/career-data/")
     if error is not None:
         return _respond(None, error=error, status_code=status)
-    # career-data is a flat dict of nested arrays per resource type
-    # ({"resume": [...], "skill": [...], ...}). Trim every nested record
-    # to the per-section attr list in TOOL_SHAPES.
+    # /api/v1/career-data/ returns
+    #   {"data": <markdown blob>, "sections": [{type, title, items}], "meta": {...ids}}
+    # `sections` is the frontend's per-card slice of the very same resume /
+    # Q&A / cover-letter bodies already inlined in `data` (CareerData.resumes
+    # et al are aliases of the favorite_* properties), so shipping both sends
+    # every body twice for no extra information. Keep `sections` as an index —
+    # `id` plus identifying fields — and drop the duplicated bodies.
     section_attrs = TOOL_SHAPES["get_career_data"]["section_attrs"]
     if isinstance(payload, dict):
-        for section, attrs in section_attrs.items():
-            rows = payload.get(section)
-            if isinstance(rows, list):
-                for row in rows:
-                    if isinstance(row, dict):
-                        # career-data records are flat (no JSON:API wrapper),
-                        # so filter the dict in place.
-                        for k in list(row.keys()):
-                            if k not in attrs and k != "id":
-                                row.pop(k, None)
+        for section in payload.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            attrs = section_attrs.get(section.get("type"))
+            if attrs is None:
+                continue
+            for item in section.get("items") or []:
+                if isinstance(item, dict):
+                    # Section items are flat (no JSON:API wrapper), so
+                    # filter the dict in place.
+                    for k in list(item.keys()):
+                        if k not in attrs and k != "id":
+                            item.pop(k, None)
     return _respond(payload)
 
 

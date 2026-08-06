@@ -17,6 +17,7 @@ from lib.api_tools import (
     _slim_payload,
     _slim_record,
     find_duplicate_candidates,
+    get_career_data,
 )
 
 
@@ -520,3 +521,122 @@ class TestFindDuplicateCandidates:
         cand = out["candidates"][0]
         assert cand["match_signals"] == ["link", "title_exact"]
         assert cand["confidence"] == "high"
+
+
+# ---------------------------------------------------------------------------
+# get_career_data — response-shape trimming
+# ---------------------------------------------------------------------------
+
+
+def _career_data_payload():
+    """The real /api/v1/career-data/ body shape.
+
+    Mirrors api career_data view: {"data": <prompt>, "sections": [...],
+    "meta": <to_refs>} where each section is {type, title, items} and the
+    item bodies duplicate what is already inlined in `data`.
+    """
+    return {
+        "data": "# Resumes\n<resume body>\n# Q&A\n<qa body>\n# Cover Letters\n<cl body>\n",
+        "sections": [
+            {
+                "type": "resumes",
+                "title": "Resumes",
+                "items": [{
+                    "id": "r1",
+                    "title": "Senior Platform Eng",
+                    "subtitle": "Ada Lovelace",
+                    "markdown": "<resume body>",
+                }],
+            },
+            {
+                "type": "qas",
+                "title": "Q&A",
+                "items": [{
+                    "id": "a1",
+                    "question_id": "q1",
+                    "question": "Why us?",
+                    "answer": "<qa body>",
+                }],
+            },
+            {
+                "type": "cover_letters",
+                "title": "Cover Letters",
+                "items": [{
+                    "id": "c1",
+                    "job": "SRE",
+                    "company": "Visa",
+                    "created_at": "2026-08-01T00:00:00",
+                    "content": "<cl body>",
+                }],
+            },
+        ],
+        "meta": {
+            "resume_ids": ["r1"],
+            "cover_letter_ids": ["c1"],
+            "answer_ids": ["a1"],
+        },
+    }
+
+
+def _career_api(result):
+    api = MagicMock()
+    api.get_data = AsyncMock(return_value=result)
+    return api
+
+
+class TestGetCareerData:
+    @pytest.mark.asyncio
+    async def test_prompt_blob_and_meta_survive(self):
+        api = _career_api((_career_data_payload(), None, 200))
+        out = yaml.safe_load(await get_career_data(api))
+        assert out["data"].startswith("# Resumes")
+        assert out["meta"]["resume_ids"] == ["r1"]
+
+    @pytest.mark.asyncio
+    async def test_duplicated_bodies_are_trimmed_from_sections(self):
+        api = _career_api((_career_data_payload(), None, 200))
+        out = yaml.safe_load(await get_career_data(api))
+        by_type = {s["type"]: s["items"][0] for s in out["sections"]}
+        # Bodies live in `data`; sections keep only the id index.
+        assert "markdown" not in by_type["resumes"]
+        assert "answer" not in by_type["qas"]
+        assert "question" not in by_type["qas"]
+        assert "content" not in by_type["cover_letters"]
+
+    @pytest.mark.asyncio
+    async def test_identifying_fields_are_kept(self):
+        api = _career_api((_career_data_payload(), None, 200))
+        out = yaml.safe_load(await get_career_data(api))
+        by_type = {s["type"]: s["items"][0] for s in out["sections"]}
+        assert by_type["resumes"] == {
+            "id": "r1", "title": "Senior Platform Eng", "subtitle": "Ada Lovelace",
+        }
+        assert by_type["qas"] == {"id": "a1", "question_id": "q1"}
+        assert by_type["cover_letters"] == {
+            "id": "c1", "job": "SRE", "company": "Visa",
+            "created_at": "2026-08-01T00:00:00",
+        }
+
+    @pytest.mark.asyncio
+    async def test_unknown_section_type_is_left_alone(self):
+        payload = _career_data_payload()
+        payload["sections"].append(
+            {"type": "future_thing", "title": "New", "items": [{"id": "x", "body": "keep"}]}
+        )
+        api = _career_api((payload, None, 200))
+        out = yaml.safe_load(await get_career_data(api))
+        extra = [s for s in out["sections"] if s["type"] == "future_thing"][0]
+        assert extra["items"][0]["body"] == "keep"
+
+    @pytest.mark.asyncio
+    async def test_error_passes_through(self):
+        api = _career_api((None, "403 - Forbidden", 403))
+        out = yaml.safe_load(await get_career_data(api))
+        assert out["status_code"] == 403
+        assert "403" in out["error"]
+
+    @pytest.mark.asyncio
+    async def test_missing_sections_key_does_not_crash(self):
+        api = _career_api(({"data": "# Resumes\n", "meta": {}}, None, 200))
+        out = yaml.safe_load(await get_career_data(api))
+        assert out["data"] == "# Resumes\n"
