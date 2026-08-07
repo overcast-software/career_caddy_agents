@@ -499,3 +499,92 @@ class TestNanoIdRoundTrip:
             ))
         path = fake.get_data.await_args.args[0]
         assert self.NANOID in path, path
+
+
+class TestUpstreamStartupProbe:
+    """`_probe_upstream_api` must survive a cold upstream but still die on a misroute.
+
+    Regression cover for the failed Cloud Run revision mcp-00005-mk8
+    (2026-08-06): one 5s shot at the apex healthcheck read-timed out while
+    the scale-to-zero frontend cold-started, the probe called sys.exit(1)
+    before the port was ever bound, and `tofu apply` failed with
+    HealthCheckContainerError. The same image booted `chat` fine — only
+    public_server carries this probe.
+    """
+
+    @pytest.fixture
+    def ps(self, monkeypatch):
+        import mcp_servers.public_server as ps
+        # Tiny real timings — no clock mocking, tests stay in the ~0.2s range.
+        monkeypatch.setattr(ps, "_PROBE_BACKOFF_S", 0.01)
+        monkeypatch.setattr(ps, "_PROBE_DEADLINE_S", 5.0)
+        return ps
+
+    @staticmethod
+    def _resp(status, body=""):
+        from unittest.mock import MagicMock
+        r = MagicMock()
+        r.status_code = status
+        r.text = body
+        return r
+
+    def _install(self, ps, monkeypatch, outcomes):
+        """Each outcome is either an Exception to raise or a response to return."""
+        calls = []
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            outcome = outcomes[min(len(calls) - 1, len(outcomes) - 1)]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(ps.httpx, "get", fake_get)
+        return calls
+
+    def test_recovers_after_cold_start_timeouts(self, ps, monkeypatch):
+        import httpx
+        calls = self._install(ps, monkeypatch, [
+            httpx.ReadTimeout("The read operation timed out"),
+            httpx.ReadTimeout("The read operation timed out"),
+            self._resp(200),
+        ])
+        ps._probe_upstream_api()          # must NOT raise SystemExit
+        assert len(calls) == 3, calls
+
+    def test_retries_5xx_then_succeeds(self, ps, monkeypatch):
+        calls = self._install(ps, monkeypatch, [
+            self._resp(503, "upstream not ready"),
+            self._resp(200),
+        ])
+        ps._probe_upstream_api()
+        assert len(calls) == 2, calls
+
+    def test_persistent_transport_failure_still_exits(self, ps, monkeypatch):
+        import httpx
+        monkeypatch.setattr(ps, "_PROBE_DEADLINE_S", 0.2)
+        monkeypatch.setattr(ps, "_PROBE_BACKOFF_S", 0.05)
+        calls = self._install(ps, monkeypatch, [httpx.ConnectError("no route")])
+        with pytest.raises(SystemExit) as exc:
+            ps._probe_upstream_api()
+        assert exc.value.code == 1
+        # It gave up, but only after retrying — not on the first failure.
+        assert len(calls) > 1, calls
+
+    def test_misroute_4xx_exits_immediately_without_retrying(self, ps, monkeypatch):
+        calls = self._install(ps, monkeypatch, [self._resp(404, "not found")])
+        with pytest.raises(SystemExit) as exc:
+            ps._probe_upstream_api()
+        assert exc.value.code == 1
+        # A deterministic misroute is what the probe exists to catch; waiting
+        # cannot fix it, so it must not burn the deadline.
+        assert len(calls) == 1, calls
+
+    def test_zero_deadline_restores_one_shot_failfast(self, ps, monkeypatch):
+        import httpx
+        monkeypatch.setattr(ps, "_PROBE_DEADLINE_S", 0.0)
+        calls = self._install(ps, monkeypatch, [httpx.ReadTimeout("timed out")])
+        with pytest.raises(SystemExit) as exc:
+            ps._probe_upstream_api()
+        assert exc.value.code == 1
+        assert len(calls) == 1, calls

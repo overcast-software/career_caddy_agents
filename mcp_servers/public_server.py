@@ -50,6 +50,15 @@ API_BASE_URL = os.environ.get("CC_API_BASE_URL", "http://localhost:8000")
 # /me/ non-200 surfaced to clients as a bogus "invalid_token" 401).
 _VERIFY_CACHE_TTL_S = 300
 
+# Startup upstream probe (see _probe_upstream_api). The deadline has to
+# clear a cold start of the apex path-route, and stay well inside Cloud
+# Run's own startup probe budget (240s) so a slow upstream still surfaces
+# as our explicit log line rather than an opaque HealthCheckContainerError.
+# Set CC_MCP_PROBE_DEADLINE_S=0 to restore the old one-shot fail-fast.
+_PROBE_TIMEOUT_S = float(os.environ.get("CC_MCP_PROBE_TIMEOUT_S", "5.0"))
+_PROBE_DEADLINE_S = float(os.environ.get("CC_MCP_PROBE_DEADLINE_S", "60.0"))
+_PROBE_BACKOFF_S = float(os.environ.get("CC_MCP_PROBE_BACKOFF_S", "3.0"))
+
 
 # ---------------------------------------------------------------------------
 # Auth: API key pass-through via TokenVerifier
@@ -969,20 +978,52 @@ def _probe_upstream_api() -> None:
     verify silently returns a non-200 (e.g. SSL redirect, DisallowedHost,
     wrong CC_API_BASE_URL). Crashlooping with a clear reason beats a
     running container that 401s every request.
+
+    A *persistent* fault still exits(1) — that invariant is the point. But
+    the probe must not mistake a slow cold start for a misroute: on GCP,
+    API_BASE_URL is the apex, whose /api path-routes through the frontend
+    service, and frontend runs minScale=0. One 5s shot against a cold
+    frontend read-timed out and killed revision mcp-00005-mk8 before it
+    ever bound the port, failing the whole `tofu apply`. So transport
+    errors and 5xx get retried to a deadline; only a non-5xx non-200
+    (a deterministic misroute, which no amount of waiting fixes) still
+    exits on the first response.
     """
     url = f"{API_BASE_URL}/api/v1/healthcheck/"
-    try:
-        resp = httpx.get(url, headers={"X-Forwarded-Proto": "https"}, timeout=5.0)
-    except httpx.HTTPError as exc:
-        logger.error("Upstream probe failed: %s (url=%s)", exc, url)
-        sys.exit(1)
-    if resp.status_code != 200:
-        logger.error(
-            "Upstream probe non-200: status=%s url=%s body=%s",
-            resp.status_code, url, resp.text[:200],
+    deadline = time.monotonic() + _PROBE_DEADLINE_S
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            resp = httpx.get(
+                url, headers={"X-Forwarded-Proto": "https"}, timeout=_PROBE_TIMEOUT_S
+            )
+        except httpx.HTTPError as exc:
+            failure = f"transport error: {exc}"
+        else:
+            if resp.status_code == 200:
+                logger.info("Upstream probe ok: %s (attempt %d)", url, attempt)
+                return
+            if resp.status_code < 500:
+                logger.error(
+                    "Upstream probe non-200: status=%s url=%s body=%s",
+                    resp.status_code, url, resp.text[:200],
+                )
+                sys.exit(1)
+            failure = f"status={resp.status_code} body={resp.text[:200]}"
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.error(
+                "Upstream probe failed after %d attempt(s) over %.0fs: %s (url=%s)",
+                attempt, _PROBE_DEADLINE_S, failure, url,
+            )
+            sys.exit(1)
+        logger.warning(
+            "Upstream probe attempt %d failed (%s); retrying in %.0fs (url=%s)",
+            attempt, failure, min(_PROBE_BACKOFF_S, remaining), url,
         )
-        sys.exit(1)
-    logger.info("Upstream probe ok: %s", url)
+        time.sleep(min(_PROBE_BACKOFF_S, remaining))
 
 
 def main():
