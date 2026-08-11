@@ -1,31 +1,40 @@
 # agents/CLAUDE.md
 
 Guidance for Claude Code when working in `agents/`. This file is a
-pointer; the canonical state lives in `agents/notes.org`.
+quickstart; durable canon lives in claudex.
 
 ## Source of truth — read FIRST
 
-- **`agents/notes.org`** (drill via `claude/cag-*`) — scrape-graph
-  state machine, MCP server boundary (prod vs local), agent-memory-
-  does-not-flow-to-production rule, ScrapeProfile as source of truth,
-  selector-engine boundary, runner safety invariants.
-- **Parent `todo.org`** (drill via `claude/cc-*`) — agents
-  work-items are filed under the parent `Inbox`; there is no
-  `agents/todo.org`.
-
-Boot sequence (every cc-agents / scrape-profile-enhancer session):
+**claudex is the source of truth for priming.** Boot every cc-agents
+/ scrape-profile-enhancer session from it, with an explicit
+`projectId` (the dockerized MCP CWD-detects to a bogus `-app`).
+`agents/` has **no** projectId of its own — its durable memory lives
+under the **parent** project, namespace `agents`:
 
 ```
-emacsclient --eval '(claude/cag-help)'
-emacsclient --eval '(claude/cag-notes-toc)'
-emacsclient --eval '(claude/cag-notes-read "Architecture/Scrape-graph state machine")'
-emacsclient --eval '(claude/cag-notes-read "Architecture/MCP server boundary")'
-emacsclient --eval '(claude/cag-notes-read "Architecture/Agent memory does not flow to production")'
+mcp__claudex__get_project_context  projectId=-home-oldbones-Network-syncthing-Projects-career-caddy
+mcp__claudex__recall_memory        projectId=-home-oldbones-Network-syncthing-Projects-career-caddy  key=bootstrap
+mcp__claudex__recall_memory        projectId=-home-oldbones-Network-syncthing-Projects-career-caddy  namespace=agents
 ```
 
-For ScrapeProfile / selector / hint work, also read
-`Architecture/ScrapeProfile as source of truth` and
-`Architecture/Selector-engine boundary`.
+The canon that used to live in `agents/notes.org Architecture/*` is
+now claudex memories — the scrape-graph state machine, the MCP server
+boundary (prod vs local), agent-memory-does-not-flow-to-production,
+ScrapeProfile as source of truth, the selector-engine boundary, and
+runner safety invariants. For scrape failures by domain, also recall
+the `ops-scrapelog-*` entries.
+
+Work state lives on the **PACA** board (Platform
+`438e9c51-1c71-4cad-b597-8356b0b600ec` prefix `CC`; Backend `BACK`),
+not in an org file.
+
+### RETIRED for agents — do not use
+
+`agents/notes.org` and the parent `todo.org` are Doug's personal
+emacs surface: no `Read`, no writes, no commits. The `claude/cag-*` /
+`cc-todo-*` emacsclient helpers no longer exist — `~/.config/doom/elisp/`
+was deleted 2026-08-04, so calling one returns a void-function error.
+Do not reintroduce them into a boot sequence.
 
 ## What This Is
 
@@ -45,7 +54,7 @@ The parent repo (`career_caddy`) has four submodules:
 - *Is it a service for everyone?* → `agents/`. Browser/Camoufox, scrape pipeline, prod MCP servers, pollers/workers, anything Docker-shipped to all users.
 - *Is it an operator for one user?* → `automation/`. Email-driven flows, user-side copilot, anything that runs on one human's machine.
 
-Cross-link: parent's `CLAUDE.md` has the same role-split text and is the canonical home for the framing. The full reconstruction plan lives at `career_caddy/notes.org/Plans/Promoting cc_auto → automation/ — first-class submodule`.
+Cross-link: parent's `CLAUDE.md` has the same role-split text and is the canonical home for the framing. The cc_auto → `automation/` promotion is complete; its history lives in claudex under the parent project.
 
 ## Environment Setup
 
