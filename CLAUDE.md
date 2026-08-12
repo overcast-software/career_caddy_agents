@@ -1,32 +1,33 @@
 # agents/CLAUDE.md
 
-Guidance for Claude Code when working in `agents/`. This file is a
-quickstart; durable canon lives in claudex.
+Guidance for working in `agents/` — the service-side AI layer. New to the
+project? Start with the repo-root [CONTRIBUTING.md](../CONTRIBUTING.md).
 
-## Source of truth — read FIRST
+## The rules that bite
 
-**claudex is the source of truth for priming.** Boot every cc-agents
-/ scrape-profile-enhancer session from it, with an explicit
-`projectId` (the dockerized MCP CWD-detects to a bogus `-app`).
-`agents/` has **no** projectId of its own — its durable memory lives
-under the **parent** project, namespace `agents`:
+- **ScrapeProfile is data, not code.** Per-domain selectors and tiering live
+  in JSONB on the profile and are edited at runtime — **no PR, no deploy**.
+  Changing extraction for one site should never mean shipping code. Back up
+  the prior selectors before overwriting.
+- **Agent memory does not flow to production.** Anything an agent learns in a
+  local session stays local unless it's written into a ScrapeProfile or the
+  api. Don't build features that assume a warm local cache exists in prod.
+- **The MCP server boundary is real.** `chat_server.py` and
+  `public_server.py` ship to production; `browser_server.py` and
+  `career_caddy_server.py` are local-only. Adding a tool to the wrong one
+  either exposes it publicly or makes it unavailable where it's needed.
+- **Runner safety.** Multiple scrape runners coexist by claiming work with
+  `SELECT FOR UPDATE SKIP LOCKED` via `POST /api/v1/scrapes/claim-next/`.
+  Anything that weakens that claim lets two runners double-process a scrape.
+  A runner whose browser has died must **relaunch or stop claiming** — never
+  keep claiming and failing, which silently drains the queue into failures.
+- **Escalate through the tier ladder, don't skip it.** Tier 0 (CSS
+  selectors, free) → Tier 1 → Tier 2 → Tier 3. Each rung costs more; jumping
+  straight to an LLM tier hides the fact that the cheap path is broken.
 
-```
-mcp__claudex__get_project_context  projectId=-home-oldbones-Network-syncthing-Projects-career-caddy
-mcp__claudex__recall_memory        projectId=-home-oldbones-Network-syncthing-Projects-career-caddy  key=bootstrap
-mcp__claudex__recall_memory        projectId=-home-oldbones-Network-syncthing-Projects-career-caddy  namespace=agents
-```
-
-The canon that used to live in `agents/notes.org Architecture/*` is
-now claudex memories — the scrape-graph state machine, the MCP server
-boundary (prod vs local), agent-memory-does-not-flow-to-production,
-ScrapeProfile as source of truth, the selector-engine boundary, and
-runner safety invariants. For scrape failures by domain, also recall
-the `ops-scrapelog-*` entries.
-
-Work state lives on the **PACA** board (Platform
-`438e9c51-1c71-4cad-b597-8356b0b600ec` prefix `CC`; Backend `BACK`),
-not in an org file.
+Maintainers: claudex holds the per-domain scrape log and incident history
+behind these (parent projectId, namespace `agents` — this submodule has no
+projectId of its own).
 
 ### RETIRED for agents — do not use
 
