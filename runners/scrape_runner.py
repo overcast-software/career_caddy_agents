@@ -26,6 +26,7 @@ Usage:
 import argparse
 import asyncio
 import logging
+from datetime import datetime, time as dtime, timedelta
 
 import yaml
 import os
@@ -109,6 +110,27 @@ POLL_INTERVAL = int(os.environ.get("HOLD_POLL_INTERVAL", "30"))
 # that costs a minute of idling before exit — cheap against the alternative
 # of a scheduled run stopping with work still queued.
 _DRAIN_IDLE_POLLS = int(os.environ.get("HOLD_DRAIN_IDLE_POLLS", "2"))
+
+# THE DEFAULT MODE: wake at these local times, drain the queue, sleep again.
+#
+# The runner used to poll claim-next every 30s forever. Measured over three
+# days that was 8,568 calls, every one a 204 No Content — it kept the Cloud
+# Run api instance from scaling to zero, held a Camoufox process open around
+# the clock, and pushed ~5,700 records/day into Logfire for no work done.
+# Email arrives in digests, so there is nothing to scrape between batches.
+#
+# Scheduling lives HERE rather than in systemd/cron on purpose: the runner is
+# started from tmuxinator and left running, so the thing that knows when to
+# work should be the long-lived process itself. One less moving part, and no
+# machine-level config to install.
+_DEFAULT_RUN_AT = os.environ.get("HOLD_RUN_AT", "06:00,18:00")
+
+# How often the scheduler re-checks the clock instead of sleeping straight
+# through to the target. A desktop suspends; a single 12-hour asyncio.sleep
+# would overshoot the window by however long the machine was down. Waking
+# every 5 minutes to recompute costs nothing and means a resumed machine
+# fires promptly on a window it slept through.
+_SCHEDULE_TICK_S = int(os.environ.get("HOLD_SCHEDULE_TICK", "300"))
 
 
 def _parse_hostname(url: str) -> str:
@@ -408,11 +430,21 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--drain", action="store_true",
-        help="Batch mode: work the hold queue down and EXIT once it is empty, "
-             "instead of polling forever. Use this from a timer/cron — a "
-             "scheduled unit has to terminate or the next fire finds it still "
-             "active. Exits non-zero if the browser dies, so a failed batch is "
-             "visible in `systemctl --user status` rather than silent.",
+        help="Run ONE batch right now — drain the hold queue, then exit. "
+             "Use it to process a backlog on demand without waiting for the "
+             "next window. Exits non-zero if the browser died mid-batch.",
+    )
+    parser.add_argument(
+        "--at", default=_DEFAULT_RUN_AT, metavar="HH:MM,HH:MM",
+        help=f"Local times to wake, drain and sleep again "
+             f"(default: {_DEFAULT_RUN_AT}, env HOLD_RUN_AT). Between windows "
+             f"nothing runs — no browser, no polling.",
+    )
+    parser.add_argument(
+        "--continuous", action="store_true",
+        help="Old behaviour: poll claim-next every HOLD_POLL_INTERVAL seconds "
+             "forever, with a resident browser. Only worth it when scrapes "
+             "arrive at unpredictable times; for digest email they do not.",
     )
     return parser.parse_args()
 
@@ -441,6 +473,196 @@ async def _preflight_auth(api: ApiClient) -> bool:
         logger.error("Pre-flight failed: %s", body.get("error"))
         return False
     return True
+
+
+def parse_run_at(spec: str) -> list[dtime]:
+    """Parse "06:00,18:00" into sorted, de-duplicated local times.
+
+    Raises ValueError on anything unparseable — a typo'd schedule must fail
+    at startup with a clear message, not silently collapse to "never run".
+    """
+    times: list[dtime] = []
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            hh, _, mm = chunk.partition(":")
+            times.append(dtime(hour=int(hh), minute=int(mm or 0)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"bad --at entry {chunk!r} (want HH:MM, e.g. 06:00)"
+            ) from exc
+    if not times:
+        raise ValueError(f"--at {spec!r} parsed to no run times")
+    return sorted(set(times))
+
+
+def next_window(times: list[dtime], now: datetime) -> datetime:
+    """The next occurrence of any scheduled time, strictly after ``now``.
+
+    Local wall-clock on purpose: "6am" means 6am where the operator is, and
+    should keep meaning that across a DST shift.
+    """
+    today = [now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+             for t in times]
+    upcoming = [c for c in today if c > now]
+    if upcoming:
+        return min(upcoming)
+    # All of today's windows are behind us — first one tomorrow.
+    return min(today) + timedelta(days=1)
+
+
+async def _sleep_until(target: datetime, running_flag, stop_event=None) -> bool:
+    """Sleep until ``target``, waking every _SCHEDULE_TICK_S to re-check.
+
+    Chunked rather than one long sleep so a suspend/resume cycle cannot
+    overshoot: on resume the clock is re-read and, if the window has already
+    passed, this returns immediately instead of sleeping out the remainder of
+    a stale duration.
+
+    ``stop_event`` makes Ctrl-C immediate. Without it the wait only notices a
+    shutdown when the current chunk elapses — up to _SCHEDULE_TICK_S, five
+    minutes by default. That is unacceptable for a process run in a tmux pane
+    and killed by hand: it looks hung. Caught in a smoke test where the runner
+    outlived its `timeout 30`.
+
+    Returns False if we were asked to stop while waiting.
+    """
+    while running_flag():
+        remaining = (target - datetime.now().astimezone()).total_seconds()
+        if remaining <= 0:
+            return True
+        chunk = min(remaining, _SCHEDULE_TICK_S)
+        if stop_event is None:
+            await asyncio.sleep(chunk)
+            continue
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=chunk)
+        except (asyncio.TimeoutError, TimeoutError):
+            continue  # chunk elapsed; re-read the clock
+        return False  # event fired — shutting down
+    return False
+
+
+async def _run_batch(api: ApiClient, running_flag, headed: bool) -> bool:
+    """One drain, with the browser alive only for its duration.
+
+    The daemon keeps a resident browser for its whole life, which is right
+    when it might claim work at any moment. A scheduled runner would instead
+    be holding Camoufox open for the ~12 hours between windows — the exact
+    idle cost this mode exists to remove. So the browser is launched per
+    batch and torn down after.
+    """
+    global _RESIDENT
+    if not headed:
+        return await _run_poll_loop(api, running_flag, drain=True)
+
+    clean = True
+    try:
+        async with launch_browser(get_engine(), headless=False) as browser:
+            _RESIDENT = ResidentBrowser(browser)
+            await _RESIDENT.ensure_ready()
+            logger.info(
+                "Headed batch: window open. Solve any login/captcha in the "
+                "live tab; the window closes when the queue is drained."
+            )
+            try:
+                clean = await _run_poll_loop(api, running_flag, drain=True)
+            finally:
+                try:
+                    saved = await _RESIDENT.save_sessions()
+                    logger.info("Headed: saved sessions for %d domain(s)", saved)
+                except Exception:
+                    logger.warning("Headed: save_sessions failed", exc_info=True)
+                try:
+                    await _RESIDENT.close()
+                except Exception:
+                    logger.debug("Headed: resident close raised", exc_info=True)
+                _RESIDENT = None
+    except Exception as exc:
+        # Camoufox/Playwright can raise on teardown if the subprocess already
+        # took a signal. Sessions are persisted per-scrape, so a noisy close
+        # is cosmetic and must not mark the batch failed.
+        logger.info("Headed: browser shutdown finished with: %s", exc)
+    return clean
+
+
+async def _run_daemon(api: ApiClient, running_flag, headed: bool) -> bool:
+    """--continuous: the original forever-poll, resident browser for its life.
+
+    Unchanged behaviour, kept for the case the schedule does not fit — a host
+    where scrapes genuinely arrive at unpredictable times. Not the default any
+    more, because for digest email they do not.
+    """
+    global _RESIDENT
+    if not headed:
+        return await _run_poll_loop(api, running_flag)
+
+    clean = True
+    try:
+        async with launch_browser(get_engine(), headless=False) as browser:
+            _RESIDENT = ResidentBrowser(browser)
+            # Build the context + persistent work-page eagerly so the resident
+            # window is up before the first scrape (idle = one tab on
+            # about:blank), not conjured lazily on first claim.
+            await _RESIDENT.ensure_ready()
+            logger.info(
+                "Headed: ready. One persistent tab stays open in the resident "
+                "window; each scrape navigates that same tab to the job URL "
+                "and leaves it there. Solve captchas in the live tab as "
+                "scrapes arrive."
+            )
+            try:
+                clean = await _run_poll_loop(api, running_flag)
+            finally:
+                try:
+                    saved = await _RESIDENT.save_sessions()
+                    logger.info("Headed: saved sessions for %d domain(s)", saved)
+                except Exception:
+                    logger.warning("Headed: save_sessions failed", exc_info=True)
+                try:
+                    await _RESIDENT.close()
+                except Exception:
+                    logger.debug("Headed: resident close raised", exc_info=True)
+                _RESIDENT = None
+    except Exception as exc:
+        # Camoufox / Playwright can raise here if the subprocess received
+        # SIGINT ahead of us — the pipe is already closed so browser.close()
+        # has nothing to reply. Session state is already on disk.
+        logger.info("Headed: browser shutdown finished with: %s", exc)
+    return clean
+
+
+async def run_scheduled(
+    api: ApiClient, running_flag, headed: bool, times: list[dtime],
+    stop_event=None,
+) -> bool:
+    """Sleep until each window, drain, repeat. The default mode.
+
+    Between windows NOTHING runs — no browser process, no claim-next polling.
+    That is the whole point: email arrives in digests, so there is no work to
+    find at 03:00 and no reason to be awake looking for it.
+    """
+    all_clean = True
+    while running_flag():
+        target = next_window(times, datetime.now().astimezone())
+        logger.info(
+            "Idle until %s (next of %s). Nothing polls or runs until then.",
+            target.strftime("%Y-%m-%d %H:%M %Z"),
+            ",".join(t.strftime("%H:%M") for t in times),
+        )
+        if not await _sleep_until(target, running_flag, stop_event):
+            break
+        if not running_flag():
+            break
+        logger.info("Window %s — draining the queue.", target.strftime("%H:%M"))
+        if not await _run_batch(api, running_flag, headed):
+            # A failed batch is not fatal to the schedule: the holds stay
+            # claimable and the next window retries. Remember it for the exit
+            # code so a supervisor still sees that something went wrong.
+            all_clean = False
+    return all_clean
 
 
 async def _run_poll_loop(api: ApiClient, running_flag, drain: bool = False) -> bool:
@@ -540,6 +762,15 @@ async def main():
             "(launch the resident headed browser). It no longer partitions the "
             "scrape queue — a scrape is a scrape. Switch the invocation to --headed."
         )
+
+    # Validate the schedule before anything expensive: a typo'd --at should
+    # fail in the first second, not after a browser launch or a network call.
+    try:
+        run_at = parse_run_at(args.at)
+    except ValueError as exc:
+        logger.error("Bad --at value: %s", exc)
+        sys.exit(1)
+
     # Headed mode forces headless off.
     headless = False if args.headed else args.headless
     configure_engine(engine=args.engine, headless=headless)
@@ -574,63 +805,59 @@ async def main():
         sys.exit(2)
 
     running = True
+    # Set alongside `running` so a long scheduler wait can be interrupted the
+    # instant a signal lands. Polling `running` alone means Ctrl-C is only
+    # noticed when the current sleep chunk elapses, which in scheduled mode is
+    # up to _SCHEDULE_TICK_S — the process looks hung in the tmux pane.
+    stop_event = asyncio.Event()
 
     def stop(*_):
         nonlocal running
+        if not running:
+            return
         running = False
+        stop_event.set()
         logger.info("Shutting down...")
 
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
+    # add_signal_handler runs the callback ON the event loop, which is what
+    # makes stop_event.set() wake the waiter immediately. signal.signal would
+    # set it from the C-level handler and the loop might not notice until its
+    # current sleep finished. Fall back to signal.signal where the loop does
+    # not support it (non-Unix).
+    loop = asyncio.get_running_loop()
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(_sig, stop)
+        except (NotImplementedError, RuntimeError):
+            signal.signal(_sig, stop)
 
     from browser.engine import get_headless
-    mode = "headed" if args.headed else "headless"
+    browser_mode = "headed" if args.headed else "headless"
+
+    # Precedence: --drain (one batch, now) beats --continuous (the old
+    # forever-poll daemon), and the default when neither is given is the
+    # scheduled windows.
+    if args.drain:
+        run_mode = "drain-once"
+    elif args.continuous:
+        run_mode = "continuous"
+    else:
+        run_mode = "scheduled"
+
     logger.info(
-        "Hold poller started (mode=%s, drain=%s, interval=%ds, api=%s, engine=%s, headless=%s)",
-        mode, bool(args.drain), POLL_INTERVAL, base_url, get_engine(), get_headless(),
+        "Scrape runner started (mode=%s, browser=%s, api=%s, engine=%s, headless=%s%s)",
+        run_mode, browser_mode, base_url, get_engine(), get_headless(),
+        f", windows={args.at}" if run_mode == "scheduled" else "",
     )
 
-    clean = True
-
-    if args.headed:
-        # Wrap the whole headed block so SIGINT reaching Camoufox's
-        # subprocess (which breaks the Playwright pipe) doesn't produce
-        # a crash on shutdown. We've already persisted sessions after
-        # each scrape, so a broken close is cosmetic.
-        try:
-            async with launch_browser(get_engine(), headless=False) as browser:
-                _RESIDENT = ResidentBrowser(browser)
-                # Build the context + persistent work-page eagerly so the
-                # resident window is up before the first scrape (idle = one
-                # tab on about:blank), not conjured lazily on first claim.
-                await _RESIDENT.ensure_ready()
-                logger.info(
-                    "Headed: ready. One persistent tab stays open in the "
-                    "resident window; each scrape navigates that same tab to "
-                    "the job URL and leaves it there. Solve captchas in the "
-                    "live tab as scrapes arrive."
-                )
-                try:
-                    clean = await _run_poll_loop(api, lambda: running, drain=args.drain)
-                finally:
-                    try:
-                        saved = await _RESIDENT.save_sessions()
-                        logger.info("Headed: saved sessions for %d domain(s)", saved)
-                    except Exception:
-                        logger.warning("Headed: save_sessions failed", exc_info=True)
-                    try:
-                        await _RESIDENT.close()
-                    except Exception:
-                        logger.debug("Headed: resident close raised", exc_info=True)
-                    _RESIDENT = None
-        except Exception as exc:
-            # Camoufox / Playwright can raise here if the subprocess
-            # received SIGINT ahead of us — the pipe is already closed
-            # so browser.close() has nothing to reply. Session state is
-            # already on disk; no user-visible loss.
-            logger.info("Headed: browser shutdown finished with: %s", exc)
+    if run_mode == "scheduled":
+        clean = await run_scheduled(
+            api, lambda: running, bool(args.headed), run_at, stop_event
+        )
+    elif run_mode == "drain-once":
+        clean = await _run_batch(api, lambda: running, bool(args.headed))
     else:
-        clean = await _run_poll_loop(api, lambda: running, drain=args.drain)
+        clean = await _run_daemon(api, lambda: running, bool(args.headed))
 
     # Only meaningful for --drain; the daemon exits via signal, which is a
     # clean stop. A non-zero code here is what makes a failed scheduled batch
@@ -640,7 +867,16 @@ async def main():
 
 
 def main_sync():
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # main() installs SIGINT on the event loop, which only covers the
+        # loop's own lifetime. A Ctrl-C that lands during interpreter teardown
+        # — logfire/OTel flushing its batch processor is the usual window —
+        # falls through to Python's default handler and prints a traceback
+        # over a shutdown that actually succeeded. Swallow it; the runner has
+        # already logged "Shutting down...". Mirrors caddy-inbox's run().
+        logger.info("caddy-runner interrupted — exiting.")
 
 
 if __name__ == "__main__":
