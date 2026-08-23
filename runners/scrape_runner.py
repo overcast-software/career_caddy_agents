@@ -103,6 +103,13 @@ logger = logging.getLogger("scrape_runner")
 
 POLL_INTERVAL = int(os.environ.get("HOLD_POLL_INTERVAL", "30"))
 
+# --drain: how many consecutive empty claim-next polls mean "the queue is
+# empty" rather than "we raced a writer". Two, so one unlucky 204 between
+# two queued scrapes doesn't end a batch early. At the default 30s interval
+# that costs a minute of idling before exit — cheap against the alternative
+# of a scheduled run stopping with work still queued.
+_DRAIN_IDLE_POLLS = int(os.environ.get("HOLD_DRAIN_IDLE_POLLS", "2"))
+
 
 def _parse_hostname(url: str) -> str:
     """Extract and normalize hostname from a URL."""
@@ -399,6 +406,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--attended", dest="headed", action="store_true", help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--drain", action="store_true",
+        help="Batch mode: work the hold queue down and EXIT once it is empty, "
+             "instead of polling forever. Use this from a timer/cron — a "
+             "scheduled unit has to terminate or the next fire finds it still "
+             "active. Exits non-zero if the browser dies, so a failed batch is "
+             "visible in `systemctl --user status` rather than silent.",
+    )
     return parser.parse_args()
 
 
@@ -428,14 +443,38 @@ async def _preflight_auth(api: ApiClient) -> bool:
     return True
 
 
-async def _run_poll_loop(api: ApiClient, running_flag):
+async def _run_poll_loop(api: ApiClient, running_flag, drain: bool = False) -> bool:
+    """Claim and process hold scrapes.
+
+    Default (drain=False) is the long-lived daemon: poll forever at
+    POLL_INTERVAL until signalled.
+
+    With drain=True the runner is a BATCH job — it works the queue down and
+    exits once it is empty. That is the shape a scheduled run needs: a timer
+    that fires at 06:00 has to terminate, or the next fire finds the unit
+    already active and does nothing. Draining also skips the inter-poll sleep
+    while work is arriving, so a backlog clears at browser speed instead of
+    one scrape per POLL_INTERVAL.
+
+    Returns True if the loop ended cleanly, False if it gave up on a dead
+    browser — main() turns that into a non-zero exit so a scheduled run is
+    recorded as failed rather than silently doing nothing.
+    """
     consecutive_driver_deaths = 0
+    idle_polls = 0
+    processed = 0
     while running_flag():
         backoff = 0
+        did_work = False
         try:
             count = await poll_once(api)
             if count:
                 logger.info("Processed %d scrape(s)", count)
+                processed += count
+                did_work = True
+                idle_polls = 0
+            else:
+                idle_polls += 1
             consecutive_driver_deaths = 0
         except DriverDeath as exc:
             # The resident browser is dead and could not be rebuilt. The
@@ -445,6 +484,17 @@ async def _run_poll_loop(api: ApiClient, running_flag):
             # visible in logfire instead of silently draining the queue.
             consecutive_driver_deaths += 1
             if consecutive_driver_deaths >= _DRIVER_DEATH_BACKOFF_THRESHOLD:
+                if drain:
+                    # A batch run has nobody watching and no reason to sit in
+                    # a backoff cycle until the next timer fires. Give up
+                    # loudly and let the exit code carry the failure.
+                    logger.error(
+                        "Browser driver dead %d cycles running (%s) — abandoning "
+                        "this drain. Holds are left claimable and will be retried "
+                        "on the next scheduled run (CC-141).",
+                        consecutive_driver_deaths, exc,
+                    )
+                    return False
                 backoff = _DRIVER_DEATH_BACKOFF_SECONDS
                 logger.error(
                     "Browser driver dead %d cycles running (%s) — backing off "
@@ -461,7 +511,24 @@ async def _run_poll_loop(api: ApiClient, running_flag):
         except Exception:
             logger.warning("Poll cycle failed, will retry", exc_info=True)
             consecutive_driver_deaths = 0
+
+        if drain and idle_polls >= _DRAIN_IDLE_POLLS:
+            logger.info(
+                "Drain complete: queue empty after %d consecutive empty poll(s); "
+                "processed %d scrape(s) this run.",
+                idle_polls, processed,
+            )
+            return True
+
+        # Work is arriving — go straight back for the next claim rather than
+        # idling POLL_INTERVAL between scrapes. Only meaningful while draining;
+        # the daemon deliberately paces itself.
+        if drain and did_work and not backoff:
+            continue
+
         await asyncio.sleep(POLL_INTERVAL + backoff)
+
+    return True
 
 
 async def main():
@@ -519,9 +586,11 @@ async def main():
     from browser.engine import get_headless
     mode = "headed" if args.headed else "headless"
     logger.info(
-        "Hold poller started (mode=%s, interval=%ds, api=%s, engine=%s, headless=%s)",
-        mode, POLL_INTERVAL, base_url, get_engine(), get_headless(),
+        "Hold poller started (mode=%s, drain=%s, interval=%ds, api=%s, engine=%s, headless=%s)",
+        mode, bool(args.drain), POLL_INTERVAL, base_url, get_engine(), get_headless(),
     )
+
+    clean = True
 
     if args.headed:
         # Wrap the whole headed block so SIGINT reaching Camoufox's
@@ -542,7 +611,7 @@ async def main():
                     "live tab as scrapes arrive."
                 )
                 try:
-                    await _run_poll_loop(api, lambda: running)
+                    clean = await _run_poll_loop(api, lambda: running, drain=args.drain)
                 finally:
                     try:
                         saved = await _RESIDENT.save_sessions()
@@ -561,7 +630,13 @@ async def main():
             # already on disk; no user-visible loss.
             logger.info("Headed: browser shutdown finished with: %s", exc)
     else:
-        await _run_poll_loop(api, lambda: running)
+        clean = await _run_poll_loop(api, lambda: running, drain=args.drain)
+
+    # Only meaningful for --drain; the daemon exits via signal, which is a
+    # clean stop. A non-zero code here is what makes a failed scheduled batch
+    # show up in `systemctl --user status` instead of passing silently.
+    if not clean:
+        sys.exit(3)
 
 
 def main_sync():
