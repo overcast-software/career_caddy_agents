@@ -124,6 +124,23 @@ class ScrapeGraphState:
     tier_attempts: list[TierAttempt] = field(default_factory=list)
     parsed: Optional[dict] = None  # ParsedJobData as dict (serializable)
     evaluation: Optional[dict] = None  # {passed: bool, reasons: [str]}
+    # Why this extraction is an honest stub rather than real content —
+    # writer = EvaluateExtraction (single). None means "the description
+    # is real". Non-None values are short machine-readable codes:
+    #   "partial_render"   — the profile's extraction_hints told the LLM
+    #                        to emit the documented placeholder because
+    #                        the page only rendered its top card.
+    #   "ungrounded"       — the description the model returned is not
+    #                        present in the captured source; it was
+    #                        invented. The ladder escalated and every
+    #                        tier came back ungrounded.
+    #   "no_description"   — every tier came back with an empty or thin
+    #                        description and escalation is exhausted.
+    # ReviewCompleteness reads it and marks the persisted JobPost
+    # complete=False so the failure stays visible and the repair paths
+    # (re-scrape, extension re-send, manual edit) stay open. A stub that
+    # reads as complete is worse than no post at all — it hides itself.
+    stub_reason: Optional[str] = None
 
     # Closed-state detection — writer = DetectClosedState (single).
     # Verdict is "closed" or None; None means either "open" (the curated
@@ -156,5 +173,6 @@ class ScrapeGraphState:
             "obstacle_history": [oa.__dict__ for oa in self.obstacle_history],
             "outcome": self.outcome,
             "failure_reason": self.failure_reason,
+            "stub_reason": self.stub_reason,
             "job_post_id": self.job_post_id,
         }

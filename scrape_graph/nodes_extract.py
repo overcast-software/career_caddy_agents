@@ -46,6 +46,91 @@ def _is_partial_render_placeholder(description: str) -> bool:
     return description.lstrip().startswith(_PARTIAL_RENDER_DESCRIPTION_PREFIX)
 
 
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+# Grounding check — the anti-fabrication invariant.
+#
+# The api-side extractor prompt gives the model no way to say "there was
+# no job description on this page", and ParsedJobData requires a
+# non-empty title + company_name, so a model handed a content-free
+# capture has exactly one way to produce a schema-valid answer: invent
+# one. Worse, EvaluateExtraction used to escalate only on *empty* /
+# *thin* output — so a confident 60-word fabrication PASSED and stopped
+# the ladder, while an honest short answer escalated. Fabrication was
+# the cheaper strategy.
+#
+# This closes that hole deterministically, with no extra LLM call: a
+# real extraction copies phrases out of the page, so most of its
+# n-grams appear verbatim in the captured source. An invented one has
+# almost no overlap. Same technique as the api's `closed_evidence`
+# validator (verbatim-substring-or-drop), applied to the description.
+#
+# Tokenising on `[a-z0-9]+` makes the comparison immune to the
+# reformatting a real extraction legitimately does — markdown bullets,
+# re-wrapped lines, collapsed whitespace, punctuation changes.
+_GROUNDING_NGRAM = 6
+_GROUNDING_MIN_RATIO = 0.30
+# Below this many tokens there aren't enough n-grams for the ratio to
+# mean anything; the thin_description gate already covers that range.
+_GROUNDING_MIN_DESC_TOKENS = 40
+# Only LLM tiers can fabricate. Tier 0 is deterministic bs4/JSON-LD
+# parsing of `state.html`, and a JSON-LD description lives inside a
+# <script> block that never appears in the visible-text `job_content` —
+# checking it here would reject good $0 extractions.
+_FABRICATION_CAPABLE_TIERS = ("tier1", "tier2", "tier3")
+
+
+def _ngrams(tokens: list[str], n: int) -> set[tuple[str, ...]]:
+    return {tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)}
+
+
+def _description_grounding_ratio(
+    description: str, source: str,
+) -> float | None:
+    """Fraction of the description's n-grams that also occur in `source`.
+
+    Returns None when the check cannot be applied (no source captured,
+    or the description is too short for the ratio to carry signal) —
+    callers must treat None as "no verdict", never as a failure.
+    """
+    desc_tokens = _TOKEN_RE.findall((description or "").lower())
+    source_tokens = _TOKEN_RE.findall((source or "").lower())
+    if len(desc_tokens) < _GROUNDING_MIN_DESC_TOKENS:
+        return None
+    if len(source_tokens) < _GROUNDING_NGRAM:
+        return None
+    desc_ngrams = _ngrams(desc_tokens, _GROUNDING_NGRAM)
+    if not desc_ngrams:
+        return None
+    source_ngrams = _ngrams(source_tokens, _GROUNDING_NGRAM)
+    return len(desc_ngrams & source_ngrams) / len(desc_ngrams)
+
+
+# The honest stub. When every tier the ladder is allowed to try comes
+# back with no usable description — or with one it invented — we persist
+# the fields we DID read off the page (title, company, location, link)
+# and say plainly that the body is missing, instead of shipping prose
+# nobody wrote. Reuses the established
+# `_PARTIAL_RENDER_DESCRIPTION_PREFIX` sentinel so every "we didn't get
+# the body" description has one recognisable shape for the frontend, the
+# extension, and `_is_partial_render_placeholder` itself.
+_STUB_DESCRIPTION_TEMPLATE = (
+    "[DESCRIPTION NOT CAPTURED — the scrape reached this posting but "
+    "could not read its description ({reason}). Re-scrape the link, or "
+    "send the page from the browser extension while it is open.]"
+)
+_STUB_REASON_TEXT = {
+    "ungrounded": "the extracted text did not match anything on the page",
+    "no_description": "the page returned no description body",
+}
+
+
+def _stub_description(reason: str) -> str:
+    return _STUB_DESCRIPTION_TEMPLATE.format(
+        reason=_STUB_REASON_TEXT.get(reason, reason),
+    )
+
+
 def _api_base() -> str:
     return os.environ.get("CC_API_BASE_URL", "").rstrip("/")
 
@@ -356,12 +441,41 @@ class Tier3Sonnet(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-re
 
 @dataclass
 class EvaluateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
+    """Quality gate + escalation router for the tier ladder.
+
+    Three outcomes:
+
+    - **pass** → ValidateExtraction. Title, company, and a description
+      that is both substantial and *grounded in the captured source*.
+    - **escalate** → the next tier. Any reason at all, including a
+      description the model appears to have invented.
+    - **stub** → ValidateExtraction carrying an honest placeholder.
+      Escalation is exhausted, the description is unusable, but title
+      and company are real. We persist what we actually read and say
+      plainly that the body is missing; ReviewCompleteness then marks
+      the JobPost `complete=False` so the failure stays visible and the
+      repair paths stay open.
+
+    The stub branch exists because the alternative outcomes are both
+    worse. ExtractFail throws away a title and company we genuinely
+    read off the page. Passing the model's invented prose through is
+    worse still: fabricated text is indistinguishable from real text to
+    every downstream consumer, and a post that reads `complete=True`
+    actively suppresses the affordances (extension re-send, re-scrape
+    prompts) that would have repaired it.
+    """
+
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
     ) -> Union[ValidateExtraction, Tier2Haiku, Tier3Sonnet, ExtractFail]:
         started = time.time()
         state = ctx.state
         parsed = state.parsed or {}
+        # EvaluateExtraction runs once per tier. Clear any verdict left
+        # by the previous rung so a tier that escalated as a stub and
+        # then succeeded on retry doesn't drag a stale stub_reason into
+        # ReviewCompleteness and mark a good post incomplete.
+        state.stub_reason = None
         reasons: list[str] = []
         title = (parsed.get("title") or "").strip()
         company = (parsed.get("company_name") or "").strip()
@@ -377,26 +491,100 @@ class EvaluateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
             and len(description.split()) < _STUB_MIN_WORDS
         ):
             reasons.append("thin_description")
+
+        last_tier = state.tier_attempts[-1].tier if state.tier_attempts else ""
+
+        # Anti-fabrication: a description an LLM tier returned that does
+        # not appear in the captured source was invented. Treat it as a
+        # first-class escalation reason so a cheap tier that hallucinates
+        # gets ESCALATED past rather than rewarded with an early exit.
+        grounding: float | None = None
+        if (
+            description
+            and not partial_render
+            and last_tier in _FABRICATION_CAPABLE_TIERS
+        ):
+            grounding = _description_grounding_ratio(
+                description, state.job_content or "",
+            )
+            if grounding is not None and grounding < _GROUNDING_MIN_RATIO:
+                reasons.append("ungrounded_description")
+
         passed = not reasons
         state.evaluation = {
             "passed": passed,
             "reasons": reasons,
             "partial_render": partial_render,
+            "grounding_ratio": grounding,
         }
 
-        last_tier = state.tier_attempts[-1].tier if state.tier_attempts else ""
+        # The documented partial-render placeholder is an honest stub the
+        # profile's extraction_hints asked for. It passes the gate — but
+        # it is NOT real content, and saying so is the whole point.
+        if partial_render:
+            state.stub_reason = "partial_render"
+
         tier3_enabled = os.environ.get("SCRAPE_GRAPH_ENABLE_TIER3") == "1"
 
         if passed:
-            trace_node(state, "EvaluateExtraction", "ValidateExtraction", started)
+            trace_node(
+                state, "EvaluateExtraction", "ValidateExtraction", started,
+                {"stub_reason": state.stub_reason, "grounding_ratio": grounding},
+            )
             return ValidateExtraction()
         if last_tier in ("tier0", "tier1"):
-            trace_node(state, "EvaluateExtraction", "Tier2Haiku", started)
+            trace_node(
+                state, "EvaluateExtraction", "Tier2Haiku", started,
+                {"reasons": reasons, "grounding_ratio": grounding},
+            )
             return Tier2Haiku()
         if last_tier == "tier2" and tier3_enabled:
-            trace_node(state, "EvaluateExtraction", "Tier3Sonnet", started)
+            trace_node(
+                state, "EvaluateExtraction", "Tier3Sonnet", started,
+                {"reasons": reasons, "grounding_ratio": grounding},
+            )
             return Tier3Sonnet()
-        trace_node(state, "EvaluateExtraction", "ExtractFail", started)
+
+        # Escalation exhausted. Degrade to an honest stub when the only
+        # thing we failed to get is the description — title and company
+        # came off the page and are worth keeping. Anything else (no
+        # title, no company) means we never identified the posting at
+        # all, so there is nothing truthful to persist: fail hard and let
+        # ExtractFail capture the debug artifact.
+        description_only = bool(
+            title
+            and company
+            and not ({"missing_title", "missing_company"} & set(reasons))
+        )
+        if description_only:
+            stub_reason = (
+                "ungrounded" if "ungrounded_description" in reasons
+                else "no_description"
+            )
+            state.stub_reason = stub_reason
+            parsed["description"] = _stub_description(stub_reason)
+            state.parsed = parsed
+            state.evaluation = {
+                **state.evaluation,
+                "stubbed": True,
+                "stub_reason": stub_reason,
+            }
+            logger.info(
+                "EvaluateExtraction: degrading to honest stub scrape_id=%s "
+                "reason=%s reasons=%s grounding=%s",
+                state.scrape_id, stub_reason, reasons, grounding,
+            )
+            trace_node(
+                state, "EvaluateExtraction", "ValidateExtraction", started,
+                {"stubbed": True, "stub_reason": stub_reason,
+                 "reasons": reasons, "grounding_ratio": grounding},
+            )
+            return ValidateExtraction()
+
+        trace_node(
+            state, "EvaluateExtraction", "ExtractFail", started,
+            {"reasons": reasons, "grounding_ratio": grounding},
+        )
         return ExtractFail()
 
 
@@ -441,7 +629,6 @@ _UI_CHROME_PILL_PHRASES = (
 # carrying real prose (e.g. "$215K/yr - $250K/yr").
 _UI_CHROME_UNIT_TOKENS = frozenset({"yr", "hr", "wk", "mo", "k"})
 _UI_CHROME_PILL_RATIO = 0.6
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
 def _ui_chrome_vocab() -> frozenset[str]:
@@ -518,8 +705,16 @@ class ValidateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
         if hits >= _LOADING_SHELL_MIN_HITS:
             reasons.append("loading_shell_fingerprint")
 
+        # The ui-chrome heuristic asks "is this description just the
+        # page furniture?". An honest stub is neither — it is our own
+        # sentinel, deliberately emitted by EvaluateExtraction, and
+        # rejecting it here would throw away the title + company we did
+        # read and lose the visible-failure record Doug asked for.
         parsed_description = ((state.parsed or {}).get("description") or "")
-        if _is_ui_chrome_description(parsed_description):
+        if (
+            not _is_partial_render_placeholder(parsed_description)
+            and _is_ui_chrome_description(parsed_description)
+        ):
             reasons.append("ui_chrome_only")
 
         state.evaluation = {
@@ -598,20 +793,34 @@ class PersistJobPost(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no
 
 @dataclass
 class ReviewCompleteness(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
-    """Final LLM gate on the persisted JobPost — does this read like a
-    real job description?
+    """Final gate on the persisted JobPost — is this a real posting or a
+    stub we should flag?
 
-    Today the review fires as a side effect inside api's
-    /persist-extraction/ endpoint (which the upstream PersistJobPost
-    node calls). The reviewer flips JobPost.complete=False on rejection;
-    this node reads that flag back from the persist response (already
-    in state.* via the api meta) and routes accordingly.
+    Two independent reviewers converge here, and they answer different
+    questions:
 
-    Phase 1d will promote this to its own dedicated POST against an
-    /api/v1/job-posts/<id>/review-completeness/ endpoint and decouple
-    the review from persistence. For now the node is structurally
-    present so the graph visualization shows the gate, but its routing
-    is purely an outcome-of-persist read.
+    - **api's LLM CompletenessReviewer** fires as a side effect inside
+      `/persist-extraction/` (called by the upstream PersistJobPost
+      node). It asks a cheap model "does this read like a job posting?"
+      and flips `JobPost.complete=False` when it says no. It is a
+      judgement call, it costs a call, and it is instructed to default
+      to ACCEPT when uncertain.
+    - **This node** answers the question the graph already knows the
+      answer to, for free: *we* emitted this description as a stub. That
+      is not a judgement, it is a fact recorded in `state.stub_reason` by
+      EvaluateExtraction. It must not depend on a model agreeing.
+
+    Before this node did the write, that fact died in the graph:
+    EvaluateExtraction set `partial_render=True`, PersistJobPost POSTed
+    only `state.parsed`, and the JobPost landed on
+    `JobPost.complete`'s `default=True`. The one component that knew the
+    post was a stub told nobody — so the record presented as a normal
+    complete post, and `complete=True` suppressed the extension's
+    re-send affordance, disabling the repair path. jp `rHeRo6qWCG`
+    (Siemens / LinkedIn, scrape `X04b4IjnTi`) is the worked example.
+
+    The JobPost row always stays — we never delete or hide it. The flag
+    is the load-bearing signal.
     """
 
     async def run(
@@ -619,13 +828,69 @@ class ReviewCompleteness(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
     ) -> Union[UpdateProfile, ExtractFail]:
         started = time.time()
         state = ctx.state
-        # Persist already ran the reviewer; if it rejected, the api
-        # response would have surfaced a non-success outcome via meta.
-        # Today there's no dedicated `complete` field in the meta —
-        # promoting that signal is part of Phase 1d. Pass-through to
-        # UpdateProfile so the graph keeps moving.
-        trace_node(state, "ReviewCompleteness", "UpdateProfile", started)
+        marked = False
+        if state.stub_reason and state.job_post_id:
+            marked = _mark_job_post_incomplete(
+                state.job_post_id, reason=state.stub_reason,
+            )
+        trace_node(
+            state, "ReviewCompleteness", "UpdateProfile", started,
+            {"stub_reason": state.stub_reason, "marked_incomplete": marked}
+            if state.stub_reason else None,
+        )
         return UpdateProfile()
+
+
+def _mark_job_post_incomplete(job_post_id: str, *, reason: str) -> bool:
+    """PATCH ``JobPost.complete=False``. Returns True when the api took it.
+
+    `complete` is writable on `PATCH /api/v1/job-posts/<id>/` for the
+    owner or staff, and the runner's `CC_API_TOKEN` is a staff key. The
+    api never flips False back to True on its own — only a later
+    successful extraction does, which is exactly the repair we want to
+    stay possible.
+
+    Ordering matters and is safe: PersistJobPost's `/persist-extraction/`
+    call runs the api-side create/upgrade branches that set
+    `complete=True`, and it has already returned by the time this runs.
+
+    Failure is logged loudly rather than raised. A stub that stays
+    marked complete is the bug this node exists to prevent, so losing
+    the write silently would defeat the purpose — but it must not cost
+    us the JobPost we just persisted.
+    """
+    try:
+        resp = httpx.patch(
+            f"{_api_base()}/api/v1/job-posts/{job_post_id}/",
+            json={
+                "data": {
+                    "type": "job-post",
+                    "id": str(job_post_id),
+                    "attributes": {"complete": False},
+                }
+            },
+            headers={**_api_headers(), "Content-Type": "application/vnd.api+json"},
+            timeout=10.0,
+        )
+    except Exception:
+        logger.warning(
+            "ReviewCompleteness: complete=False PATCH errored "
+            "job_post_id=%s reason=%s — post will read as complete",
+            job_post_id, reason, exc_info=True,
+        )
+        return False
+    if resp.status_code >= 400:
+        logger.warning(
+            "ReviewCompleteness: complete=False PATCH rejected "
+            "job_post_id=%s reason=%s status=%s body=%s",
+            job_post_id, reason, resp.status_code, resp.text[:300],
+        )
+        return False
+    logger.info(
+        "ReviewCompleteness: marked JobPost %s incomplete (stub_reason=%s)",
+        job_post_id, reason,
+    )
+    return True
 
 
 @dataclass
@@ -1011,7 +1276,9 @@ __all__ = [
     "Tier2Haiku",
     "Tier3Sonnet",
     "EvaluateExtraction",
+    "ValidateExtraction",
     "PersistJobPost",
+    "ReviewCompleteness",
     "UpdateProfile",
     "ResolveApplyUrl",
     "ExtractFail",

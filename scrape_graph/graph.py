@@ -380,9 +380,17 @@ NODE_META: dict[str, dict[str, str]] = {
     "EvaluateExtraction": {
         "group": "extract", "label": "Evaluate extraction",
         "description": (
-            "LLM-output quality gate: checks for title, company, and "
-            "thin-description. Pass → ValidateExtraction; fail → next "
-            "tier or ExtractFail."
+            "LLM-output quality gate: checks for title, company, "
+            "thin-description, and — for LLM tiers — whether the "
+            "description is actually grounded in the captured source "
+            "(an ungrounded description was invented, and escalates "
+            "rather than passing). Pass → ValidateExtraction; fail → "
+            "next tier. When escalation is exhausted and only the "
+            "description is missing, replaces it with an honest "
+            "[DESCRIPTION NOT CAPTURED …] stub, records state."
+            "stub_reason for ReviewCompleteness, and continues to "
+            "ValidateExtraction; with no title/company it is "
+            "ExtractFail."
         ),
     },
     "ValidateExtraction": {
@@ -408,16 +416,17 @@ NODE_META: dict[str, dict[str, str]] = {
     "ReviewCompleteness": {
         "group": "extract", "label": "Review completeness",
         "description": (
-            "Final LLM gate (cheap Haiku-class) on the persisted JobPost: "
-            "does this title+description+company actually look like a real "
-            "job posting? Pass → leave JobPost.complete=True (parse_scrape "
-            "just flipped it) and route to UpdateProfile. Fail → set "
-            "JobPost.complete=False and route to ExtractFail; the JP still "
-            "exists so URL lookup works and the extension popup will offer "
-            "Send. Today the gate runs as a side effect inside parse_scrape "
-            "and persist-extraction; this node will be promoted to a real "
-            "graph node when Phase 1d wires the graph for production "
-            "execution."
+            "Marks the persisted JobPost complete=False when the graph "
+            "already knows the extraction is a stub — state.stub_reason "
+            "set by EvaluateExtraction (partial_render / ungrounded / "
+            "no_description) — via PATCH /api/v1/job-posts/:id/. Free "
+            "and deterministic; it does not ask a model. Complements "
+            "api's LLM CompletenessReviewer, which fires as a side "
+            "effect of persist-extraction and judges descriptions the "
+            "graph believed were real. The JobPost row always stays; "
+            "the flag is what keeps the failure visible and the repair "
+            "paths (re-scrape, extension re-send) open. Routes to "
+            "UpdateProfile either way."
         ),
     },
     "UpdateProfile": {
