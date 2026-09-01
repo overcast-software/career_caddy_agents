@@ -1,4 +1,9 @@
-# syntax=docker/dockerfile:1
+# No `# syntax=` directive on purpose. It makes BuildKit pull and run the
+# *floating* docker/dockerfile:1 frontend image, so a release of that image can
+# break this build with no change here at all — once it outpaces the builder's
+# own BuildKit the LLB it emits stops unmarshalling ("wrong wireType = 0 for
+# field LinuxResources"), which is what took the Deploy publish step down. This
+# file uses nothing the built-in frontend lacks. Re-add only pinned exactly.
 FROM python:3.13-slim AS base
 
 # Set to "true" to install the Camoufox Firefox binary (~700 MB).
