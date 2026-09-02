@@ -837,13 +837,48 @@ class ReviewCompleteness(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
         # declared canonical into state.canonical_url; without this write
         # it would die with the graph run and the whole ladder would
         # deliver nothing observable.
+        #
+        # NOT ON THE DUPLICATE PATH. When PersistJobPost's
+        # /persist-extraction/ came back outcome="duplicate",
+        # `state.job_post_id` is a PRE-EXISTING JobPost the api merely
+        # MATCHED us onto — `JobPostExtractor` looks it up with
+        # `filter(Q(link=link) | Q(canonical_link=canonical))`, with no
+        # owner filter, so it is frequently another user's row. The
+        # runner's CC_API_TOKEN is a staff key and `_upsert_django`
+        # (api jobs.py:984) lets staff PATCH anyone's post, so nothing
+        # downstream would stop us rewriting `canonical_link` — the
+        # PRIMARY DEDUPE KEY — on a row we do not own and did not
+        # create. Rewriting it makes that post unfindable at its own
+        # identity by `find_duplicate`'s canonical leg, by
+        # `federation_ingest`'s `filter(canonical_link=canonical)`, and
+        # by the serializer's sibling lookup, and starts federating a
+        # new value to instances that ingested the old one. The api's own
+        # duplicate branch is deliberately merge-empty-fields-only, and
+        # its dedup-verb allowlist names `canonical_link` as a column the
+        # caller may never carry across ("never dedupe-pipeline
+        # columns"). This hop honours the same policy.
+        #
+        # The narrowing mirrors `_mark_job_post_incomplete` above, which
+        # is likewise gated on THIS run's own verdict (`stub_reason`)
+        # rather than firing on whatever row we ended up pointed at.
         canonical_written = False
+        canonical_skipped = ""
         if state.canonical_source != "resolved" and state.job_post_id:
-            canonical_written = _persist_declared_canonical(
-                state.job_post_id,
-                state.canonical_url or "",
-                source=state.canonical_source,
-            )
+            if state.was_duplicate:
+                canonical_skipped = "duplicate_target"
+                logger.info(
+                    "ReviewCompleteness: declared canonical NOT written — "
+                    "JobPost %s is a pre-existing duplicate match, not ours "
+                    "to re-key (source=%s url=%s)",
+                    state.job_post_id, state.canonical_source,
+                    state.canonical_url,
+                )
+            else:
+                canonical_written = _persist_declared_canonical(
+                    state.job_post_id,
+                    state.canonical_url or "",
+                    source=state.canonical_source,
+                )
         payload = {}
         if state.stub_reason:
             payload = {
@@ -853,6 +888,8 @@ class ReviewCompleteness(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
         if state.canonical_source != "resolved":
             payload["canonical_source"] = state.canonical_source
             payload["canonical_written"] = canonical_written
+            if canonical_skipped:
+                payload["canonical_skipped"] = canonical_skipped
         trace_node(
             state, "ReviewCompleteness", "UpdateProfile", started,
             payload or None,
@@ -865,6 +902,12 @@ def _persist_declared_canonical(
 ) -> bool:
     """PATCH ``JobPost.canonical_link`` with a page-DECLARED canonical.
     Returns True when the api took it.
+
+    TWO gates, both at the call site in ``ReviewCompleteness.run``:
+    the value must be a DECLARATION (below), and the JobPost must be one
+    this run created or upgraded — never a duplicate the api matched us
+    onto (``state.was_duplicate``; see the call site for why that one is
+    a data-integrity gate and not a nicety).
 
     Gated on the value being a declaration (``state.canonical_source`` is
     one of link_rel / og_url / profile_selector), never on a merely

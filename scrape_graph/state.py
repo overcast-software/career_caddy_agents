@@ -122,7 +122,10 @@ class ScrapeGraphState:
     # persists canonical_link to the JobPost ONLY for a declaration — a
     # merely-resolved value has its own propagation path
     # (`_propagate_canonical_to_parent_jp`, the redirect branch) and must
-    # not be double-written from here.
+    # not be double-written from here — AND only when `was_duplicate` is
+    # False: on the duplicate path `job_post_id` is a pre-existing row the
+    # api matched us onto, often another user's, and canonical_link is the
+    # dedupe key. Both gates are load-bearing; see ReviewCompleteness.run.
     #
     # Deliberately NOT in to_payload(): the graph-transition endpoint's
     # tolerance for unknown keys is unverified, and the value is already

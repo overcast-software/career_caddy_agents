@@ -957,7 +957,26 @@ class Capture(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
         started = time.time()
         state = ctx.state
         page = getattr(state, "_browser_page", None)
+        canonical_trace: dict = {}
         if page:
+            # CC-248: read the page's own declared canonical while the DOM
+            # is in hand. Pure querySelector work — no extra fetch, no
+            # LLM, no per-host config on the common path.
+            #
+            # ORDER IS LOAD-BEARING — this runs BEFORE the content reads,
+            # not after. `_adopt_declared_canonical` re-raises a
+            # driver-closed error (the CC-160 convention for every except
+            # that wraps a Playwright call), and CC-160's contract is
+            # "fail BEFORE we bank a capture, so the runner relaunches and
+            # re-queues the scrape as hold". Below the reads, the same
+            # raise throws away a complete, usable `job_content` + `html`
+            # and pays for a whole re-scrape — a raise site Capture did
+            # not have before CC-248 (`_screenshot_and_upload` never
+            # raises by contract, `_discover_selectors` swallows
+            # everything). Above the reads it adds no new failure mode at
+            # all: any driver death that kills this query_selector kills
+            # `page.inner_text` on the very next line.
+            canonical_trace = await _adopt_declared_canonical(page, state)
             try:
                 state.job_content = await page.inner_text("body")
                 state.html = await page.content()
@@ -970,10 +989,6 @@ class Capture(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
                 _reraise_if_driver_closed(exc)
                 state.failure_reason = f"capture_failed: {exc}"
 
-            # CC-248: read the page's own declared canonical while the DOM
-            # is still in hand. Pure querySelector work — no extra fetch,
-            # no LLM, no per-host config on the common path.
-            await _adopt_declared_canonical(page, state)
             await _screenshot_and_upload(page, state)
             await _discover_selectors(page, state)
         # DetectClosedState runs while DOM is still live so the CSS path
@@ -984,6 +999,7 @@ class Capture(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
             {
                 "canonical_source": state.canonical_source,
                 "canonical_url": state.canonical_url,
+                **canonical_trace,
             },
         )
         return DetectClosedState()
@@ -1090,17 +1106,58 @@ def _declared_canonical_is_sane(candidate: str, landed: str) -> tuple[bool, str]
     return True, "ok"
 
 
-async def _read_declared_canonical(page, profile: dict | None):
-    """Walk the canonical ladder cheapest rung first; return
-    ``(raw_href, source)`` for the first rung that yields a non-empty
-    value, else ``None``.
+# Rungs 1 and 2 of the ladder — the two web standards, cheapest first.
+# `(selector, attributes to try in order, source label)`.
+#
+# `rel~="canonical"`, NOT `rel="canonical"`: `rel` is a
+# space-separated TOKEN LIST, and `<link rel="canonical alternate">` is
+# both legal and real on syndicated / i18n pages. `~=` is the CSS
+# operator for "contains this token"; `=` is an exact whole-value match
+# that silently misses the multi-token form. Playwright's selector
+# parser accepts `~=` (driver `lib/utils/isomorphic/selectorParser.js`
+# allows `=, *=, ^=, $=, |=, ~=`), and `~=` matches everything `=`
+# matched, so this is a strict widening.
+_STANDARD_CANONICAL_RUNGS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ('link[rel~="canonical"]', ("href",), "link_rel"),
+    ('meta[property="og:url"]', ("content",), "og_url"),
+)
 
-    1. ``link[rel="canonical"]``   — a web standard, zero config, every host.
+
+async def _read_declared_canonical(
+    page, profile: dict | None, landed: str
+) -> tuple[tuple[str, str] | None, list[dict]]:
+    """Walk the canonical ladder cheapest rung first. Returns
+    ``(accepted, rejections)``.
+
+    ``accepted`` is ``(absolute_url, source)`` for the first rung whose
+    declaration SURVIVES ``_declared_canonical_is_sane``, else ``None``.
+    ``rejections`` is the audit trail — one
+    ``{"source", "reason", "candidate"}`` dict per rung that produced a
+    value we then threw away — so a host being systematically rejected
+    shows up on the trace instead of only at ``logger.debug``.
+
+    1. ``link[rel~="canonical"]``  — a web standard, zero config, every host.
     2. ``meta[property="og:url"]`` — same.
     3. ``ScrapeProfile.extension_selectors.canonical_link_selectors`` — the
-       escape hatch, tried ONLY when 1 and 2 are both absent. Reaching this
-       rung for a host means that host emits neither standard tag (or emits
-       a wrong one), which is worth noticing rather than papering over.
+       escape hatch, reached only when 1 and 2 yield nothing USABLE.
+
+    THE GATE RUNS PER RUNG, INSIDE THE LADDER, and a rejected rung falls
+    through to the next one. This is the whole reason there are three
+    rungs. The escape hatch exists for a host that "emits neither
+    standard tag OR EMITS A WRONG ONE", and the wrong-one half is the
+    common case: an SPA shell with a hard-coded
+    ``<link rel="canonical" href="https://site/">`` on every page is
+    precisely the motivating anti-pattern for this ticket. Gate the
+    ladder's OUTPUT once at the caller instead and that junk rung 1
+    short-circuits rungs 2 and 3 — the operator's profile entry can
+    never rescue the exact case they configured it for. Reviewed and
+    fixed on CC-248 before merge; do not "simplify" the gate back out to
+    the caller.
+
+    Exceptions follow the same rule: every rung reads inside its own
+    try/except, so one throwing selector cannot blind the rungs below
+    it. A driver-closed error still propagates (CC-160) — that is infra
+    death, not a bad selector, and every rung below it would throw too.
 
     On rung 3, `extension_selectors` is read NESTED off the profile, not
     flattened: `_flatten_profile_attrs` lifts the keys of `css_selectors`
@@ -1109,7 +1166,9 @@ async def _read_declared_canonical(page, profile: dict | None):
     arrives at `state.profile["extension_selectors"]`. VERIFIED against
     api serializers.py ScrapeProfileSerializer.attributes.
     """
-    async def _first_attr(selector: str, *attrs: str) -> str:
+    from urllib.parse import urljoin
+
+    async def _first_attr(selector: str, attrs: tuple[str, ...]) -> str:
         el = await page.query_selector(selector)
         if not el:
             return ""
@@ -1119,38 +1178,67 @@ async def _read_declared_canonical(page, profile: dict | None):
                 return value.strip()
         return ""
 
-    href = await _first_attr('link[rel="canonical"]', "href")
-    if href:
-        return href, "link_rel"
+    def _rungs():
+        """Lazy so rung 3 is never even assembled when rung 1 wins."""
+        yield from _STANDARD_CANONICAL_RUNGS
+        extension = (profile or {}).get("extension_selectors")
+        selectors = (extension or {}).get("canonical_link_selectors") or []
+        if isinstance(selectors, str):
+            selectors = [selectors]
+        for selector in selectors:
+            if not isinstance(selector, str) or not selector.strip():
+                continue
+            yield selector.strip(), ("href", "content"), "profile_selector"
 
-    href = await _first_attr('meta[property="og:url"]', "content")
-    if href:
-        return href, "og_url"
-
-    extension = (profile or {}).get("extension_selectors")
-    selectors = (extension or {}).get("canonical_link_selectors") or []
-    if isinstance(selectors, str):
-        selectors = [selectors]
-    for selector in selectors:
-        if not isinstance(selector, str) or not selector.strip():
-            continue
+    rejections: list[dict] = []
+    for selector, attrs, source in _rungs():
         try:
-            href = await _first_attr(selector.strip(), "href", "content")
-        except Exception:
-            # One bad selector in a profile must not blind the whole rung.
+            raw = await _first_attr(selector, attrs)
+        except Exception as exc:
+            _reraise_if_driver_closed(exc)  # CC-160
+            # One throwing selector must not blind the rungs below it.
             logger.debug(
-                "Capture: canonical profile selector failed sel=%s",
-                selector, exc_info=True,
+                "Capture: canonical rung failed sel=%s source=%s",
+                selector, source, exc_info=True,
             )
             continue
-        if href:
-            return href, "profile_selector"
-    return None
+        if not raw:
+            continue
+        try:
+            # Relative hrefs are legal in link[rel=canonical]; resolve
+            # against the landed URL before the host gate can see them,
+            # or every `href="/jobs/123"` would fail as "no_host".
+            candidate = urljoin(landed, raw)
+        except ValueError:
+            rejections.append(
+                {"source": source, "reason": "unjoinable", "candidate": raw}
+            )
+            continue
+        ok, reason = _declared_canonical_is_sane(candidate, landed)
+        if ok:
+            return (candidate, source), rejections
+        logger.debug(
+            "Capture: rejected declared canonical source=%s reason=%s "
+            "candidate=%s landed=%s",
+            source, reason, candidate, landed,
+        )
+        rejections.append(
+            {"source": source, "reason": reason, "candidate": candidate}
+        )
+    return None, rejections
 
 
-async def _adopt_declared_canonical(page, state: ScrapeGraphState) -> None:
+async def _adopt_declared_canonical(page, state: ScrapeGraphState) -> dict:
     """Overwrite ``state.canonical_url`` with the page's OWN declared
     canonical when the page makes one and it survives the junk filter.
+
+    Returns a (possibly empty) dict of extras for Capture's trace
+    payload. ``canonical_source`` alone reads "resolved" identically for
+    "the page declared nothing" and "the page declared something we
+    threw away", so a host being systematically rejected by
+    ``_AUTH_PATH_SEGMENTS`` would be invisible in production — the
+    rejections ride here as ``canonical_rejected`` so the trace can
+    answer that without a re-scrape.
 
     PRECEDENCE — the declaration wins over the resolved URL. Reasoning,
     because this is the one open design question on CC-248:
@@ -1179,45 +1267,47 @@ async def _adopt_declared_canonical(page, state: ScrapeGraphState) -> None:
     every legitimate declaration on precisely the redirect scrapes this
     work exists for. Do not let this get "simplified".
 
-    Never raises, never fails a scrape. A missing or garbage canonical is
-    the normal case for most of the web — on any error or rejection
-    ``state.canonical_url`` is left exactly as ``ResolveFinalUrl`` set it
-    and ``state.canonical_source`` stays "resolved".
+    A missing or garbage canonical is the normal case for most of the
+    web — on any rejection or ordinary error ``state.canonical_url`` is
+    left exactly as ``ResolveFinalUrl`` set it and
+    ``state.canonical_source`` stays "resolved". The ONE exception is a
+    driver-closed error, which propagates per CC-160; Capture calls this
+    BEFORE the content reads precisely so that raise costs us nothing
+    (see the comment at the call site).
     """
-    from urllib.parse import urljoin
     landed = state.final_url or state.submitted_url or ""
     try:
-        found = await _read_declared_canonical(page, state.profile)
+        accepted, rejections = await _read_declared_canonical(
+            page, state.profile, landed,
+        )
     except Exception as exc:
         _reraise_if_driver_closed(exc)  # CC-160
         logger.debug("Capture: declared-canonical read failed", exc_info=True)
-        return
-    if not found:
-        return
-    raw, source = found
+        return {"canonical_read_failed": True}
+    extras: dict = {}
+    if rejections:
+        extras["canonical_rejected"] = rejections
+    if accepted is None:
+        return extras
+    absolute, source = accepted
     try:
-        # Relative hrefs are legal in link[rel=canonical]; resolve against
-        # the landed URL before the host gate can see them, or every
-        # `href="/jobs/123"` would fail as "no_host".
-        absolute = urljoin(landed, raw)
-        ok, reason = _declared_canonical_is_sane(absolute, landed)
-        if not ok:
-            logger.debug(
-                "Capture: rejected declared canonical source=%s reason=%s "
-                "candidate=%s landed=%s",
-                source, reason, absolute, landed,
-            )
-            return
-        state.canonical_url = canonicalize_url(absolute)
-        state.canonical_source = source
-        logger.info(
-            "Capture: adopted declared canonical source=%s url=%s",
-            source, state.canonical_url,
-        )
+        adopted = canonicalize_url(absolute)
     except Exception:
         logger.debug(
             "Capture: declared-canonical adoption failed", exc_info=True
         )
+        extras.setdefault("canonical_rejected", []).append(
+            {"source": source, "reason": "canonicalize_failed",
+             "candidate": absolute},
+        )
+        return extras
+    state.canonical_url = adopted
+    state.canonical_source = source
+    logger.info(
+        "Capture: adopted declared canonical source=%s url=%s",
+        source, state.canonical_url,
+    )
+    return extras
 
 
 async def _screenshot_and_upload(page, state: ScrapeGraphState) -> None:

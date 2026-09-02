@@ -1,6 +1,6 @@
 """CC-248 — the page's own declared canonical, read at scrape time.
 
-Before this, NOTHING in the submodule read `link[rel="canonical"]` or
+Before this, NOTHING in the submodule read `link[rel~="canonical"]` or
 `meta[property="og:url"]`: `grep -rn canonical scrape_graph/ browser/`
 returned only redirect-chain work (`ResolveFinalUrl`) and tracker-param
 stripping (`url_canonicalize.py`). `state.canonical_url` was therefore
@@ -19,17 +19,36 @@ anti-pattern (SPA shell declaring the host root, auth-wall declaring its
 own login URL, syndicated listing declaring an aggregator on another
 host) and must NOT clobber a good resolved URL.
 
-Two of these are load-bearing and easy to "simplify" into bugs:
+Five of these are load-bearing and easy to "simplify" into bugs:
 
 - The host gate compares against LANDED (`final_url or submitted_url`),
   never SUBMITTED. Comparing to the submitted tracker host would reject
   every legitimate declaration on exactly the redirect scrapes this work
   exists for — `test_declared_canonical_host_gate_uses_landed_not_submitted`.
+- The junk filter runs PER RUNG, INSIDE the ladder, with fall-through.
+  Gate the ladder's output once at the caller instead and a junk rung 1
+  short-circuits rungs 2 and 3 — the SPA shell that hard-codes
+  `<link rel=canonical href="https://site/">` on every page while still
+  emitting a correct og:url is the motivating case, and the operator's
+  profile escape hatch could never rescue it —
+  `test_declared_canonical_junk_link_rel_falls_through_to_og_url`,
+  `test_declared_canonical_profile_rung_reached_when_both_standard_tags_junk`.
+- Each rung reads inside its OWN try/except, so a throwing selector on
+  one rung cannot blind the rungs below it —
+  `test_declared_canonical_throwing_rung_does_not_blind_the_rungs_below`.
+- `_adopt_declared_canonical` runs BEFORE Capture's content reads. It
+  re-raises driver-closed errors (CC-160); below the reads that raise
+  would throw away a complete capture and buy a full re-scrape —
+  `test_declared_canonical_driver_death_raises_before_any_bytes_are_banked`.
 - The persistence hop fires ONLY for a declaration, never for a merely
-  resolved value: the resolved path already has its own propagation
-  (`_propagate_canonical_to_parent_jp`, the redirect branch) and a second
-  writer on `JobPost.canonical_link` buys nothing —
-  `test_declared_canonical_persist_hop_skipped_for_resolved_value`.
+  resolved value (the resolved path already has its own propagation,
+  `_propagate_canonical_to_parent_jp`, and a second writer on
+  `JobPost.canonical_link` buys nothing), and NEVER on the duplicate
+  path, where `job_post_id` is a pre-existing row the api matched us
+  onto — often another user's — and `canonical_link` is the dedupe key
+  we would be rewriting —
+  `test_declared_canonical_persist_hop_skipped_for_resolved_value`,
+  `test_declared_canonical_persist_hop_skipped_on_duplicate_job_post`.
 
 CONVENTIONS (copied from test_resolve_final_url_js_redirect.py)
 ==============================================================
@@ -45,6 +64,8 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from scrape_graph.nodes_extract import ReviewCompleteness, UpdateProfile
 from scrape_graph.nodes_scrape import Capture, DetectClosedState
@@ -67,21 +88,49 @@ class _FakeElement:
         return self._attrs.get(name)
 
 
+# The exact wire selectors Capture queries. `rel~=` (not `rel=`) because
+# `rel` is a space-separated TOKEN LIST: `<link rel="canonical alternate">`
+# is legal and appears on syndicated / i18n pages, and an exact-value
+# selector silently misses it. Named here so a "simplification" back to
+# `rel=` breaks every rung-1 test at once instead of quietly halving
+# rung-1 coverage in production.
+LINK_REL = 'link[rel~="canonical"]'
+OG_URL = 'meta[property="og:url"]'
+DRIVER_DEAD = "Connection closed while reading from the driver"
+
+
 class _FakePage:
     """Minimal Playwright Page stand-in for Capture.
 
     `selectors` maps a CSS selector to the attribute dict the matched
     element exposes; anything not in the map returns None (no match).
     `raise_on_query` makes every query_selector throw, standing in for a
-    page that dies or a DOM that rejects the query.
+    page that dies or a DOM that rejects the query; `query_error` sets
+    the message (the driver-closed marker phrase is load-bearing —
+    `is_driver_closed` substring-matches it). `raise_on` throws for
+    named selectors only, so a single bad rung can be tested against
+    healthy ones.
+
+    `read_body` records whether the content reads ever happened, which is
+    how the tests below pin Capture's ORDERING.
     """
 
-    def __init__(self, selectors: dict | None = None, raise_on_query: bool = False):
+    def __init__(
+        self,
+        selectors: dict | None = None,
+        raise_on_query: bool = False,
+        query_error: str = "Protocol error: Node with given id not found",
+        raise_on: dict | None = None,
+    ):
         self._selectors = selectors or {}
         self.raise_on_query = raise_on_query
+        self.query_error = query_error
+        self._raise_on = raise_on or {}
         self.queried: list[str] = []
+        self.read_body = False
 
     async def inner_text(self, selector: str) -> str:
+        self.read_body = True
         return "Senior Platform Engineer\nAcme Corp\nWe are hiring."
 
     async def content(self) -> str:
@@ -90,7 +139,9 @@ class _FakePage:
     async def query_selector(self, selector: str):
         self.queried.append(selector)
         if self.raise_on_query:
-            raise RuntimeError("Protocol error: Node with given id not found")
+            raise RuntimeError(self.query_error)
+        if selector in self._raise_on:
+            raise RuntimeError(self._raise_on[selector])
         attrs = self._selectors.get(selector)
         return _FakeElement(attrs) if attrs is not None else None
 
@@ -149,7 +200,7 @@ def test_declared_canonical_link_rel_wins_over_resolved_url():
         landed="https://www.example-boards.com/jobs/view/4453904340?position=2&pageNum=0",
     )
     page = _FakePage({
-        'link[rel="canonical"]': {
+        'link[rel~="canonical"]': {
             "href": "https://www.example-boards.com/jobs/view/4453904340"
         },
     })
@@ -186,7 +237,7 @@ def test_declared_canonical_link_rel_preferred_over_og_url():
         landed="https://jobs.example.org/p/998",
     )
     page = _FakePage({
-        'link[rel="canonical"]': {"href": "https://jobs.example.org/p/998-real"},
+        'link[rel~="canonical"]': {"href": "https://jobs.example.org/p/998-real"},
         'meta[property="og:url"]': {"content": "https://jobs.example.org/p/other"},
     })
 
@@ -204,7 +255,7 @@ def test_declared_canonical_relative_href_resolved_against_landed():
         submitted="https://careers.example.net/listing/77?ref=nl",
         landed="https://careers.example.net/listing/77?ref=nl",
     )
-    page = _FakePage({'link[rel="canonical"]': {"href": "/listing/77"}})
+    page = _FakePage({'link[rel~="canonical"]': {"href": "/listing/77"}})
 
     _capture(state, page)
 
@@ -221,7 +272,7 @@ def test_declared_canonical_tracker_params_stripped_on_adoption():
         landed="https://jobs.example.org/p/12",
     )
     page = _FakePage({
-        'link[rel="canonical"]': {
+        'link[rel~="canonical"]': {
             "href": "https://jobs.example.org/p/12?utm_source=rss&id=12"
         },
     })
@@ -242,7 +293,7 @@ def test_declared_canonical_host_gate_uses_landed_not_submitted():
         resolved_canonical="https://hiring.example.cafe/job/abc123",
     )
     page = _FakePage({
-        'link[rel="canonical"]': {
+        'link[rel~="canonical"]': {
             "href": "https://hiring.example.cafe/job/abc123"
         },
     })
@@ -261,7 +312,7 @@ def test_declared_canonical_www_variant_accepted():
         landed="https://example-boards.com/jobs/5",
     )
     page = _FakePage({
-        'link[rel="canonical"]': {"href": "https://www.example-boards.com/jobs/5"},
+        'link[rel~="canonical"]': {"href": "https://www.example-boards.com/jobs/5"},
     })
 
     _capture(state, page)
@@ -280,7 +331,7 @@ def test_declared_canonical_host_root_rejected():
     href="https://site/">` on every page. It identifies nothing."""
     resolved = "https://spa.example.io/careers/openings/9912"
     state = _state(submitted=resolved, landed=resolved)
-    page = _FakePage({'link[rel="canonical"]': {"href": "https://spa.example.io/"}})
+    page = _FakePage({'link[rel~="canonical"]': {"href": "https://spa.example.io/"}})
 
     _capture(state, page)
 
@@ -294,7 +345,7 @@ def test_declared_canonical_cross_host_rejected():
     resolved = "https://boards.example-ats.com/acme/jobs/42"
     state = _state(submitted=resolved, landed=resolved)
     page = _FakePage({
-        'link[rel="canonical"]': {
+        'link[rel~="canonical"]': {
             "href": "https://aggregator.example.com/listing/42"
         },
     })
@@ -312,7 +363,7 @@ def test_declared_canonical_login_path_rejected():
     resolved = "https://walled.example.com/jobs/view/4404587081"
     state = _state(submitted=resolved, landed=resolved)
     page = _FakePage({
-        'link[rel="canonical"]': {
+        'link[rel~="canonical"]': {
             "href": "https://walled.example.com/login?session_redirect=%2Fjobs"
         },
     })
@@ -332,7 +383,7 @@ def test_declared_canonical_job_slug_containing_auth_word_still_adopted():
         landed="https://jobs.example.org/careers/account-manager-1187?ref=x",
     )
     page = _FakePage({
-        'link[rel="canonical"]': {
+        'link[rel~="canonical"]': {
             "href": "https://jobs.example.org/careers/account-manager-1187"
         },
     })
@@ -350,7 +401,7 @@ def test_declared_canonical_non_http_scheme_rejected():
     resolved = "https://jobs.example.org/p/3"
     state = _state(submitted=resolved, landed=resolved)
     page = _FakePage({
-        'link[rel="canonical"]': {"href": "javascript:void(0)"},
+        'link[rel~="canonical"]': {"href": "javascript:void(0)"},
     })
 
     _capture(state, page)
@@ -380,7 +431,12 @@ def test_declared_canonical_absent_falls_through_to_resolved():
 
 def test_declared_canonical_query_selector_exception_is_swallowed():
     """A DOM that throws must not fail the scrape — the capture still
-    lands and the graph still routes to DetectClosedState."""
+    lands and the graph still routes to DetectClosedState.
+
+    Also pins the ordering from the other side: the canonical ladder runs
+    ahead of the content reads, so a NON-driver throw there must not stop
+    them.
+    """
     resolved = "https://brittle.example.com/jobs/1"
     state = _state(submitted=resolved, landed=resolved)
     page = _FakePage({}, raise_on_query=True)
@@ -391,6 +447,7 @@ def test_declared_canonical_query_selector_exception_is_swallowed():
     assert state.canonical_url == resolved
     assert state.canonical_source == "resolved"
     assert state.job_content  # the capture itself still happened
+    assert page.read_body is True
 
 
 # ----------------------------------------------------------------------
@@ -435,7 +492,7 @@ def test_declared_canonical_profile_selector_not_consulted_when_link_rel_present
         },
     )
     page = _FakePage({
-        'link[rel="canonical"]': {"href": "https://odd.example.com/req/551-std"},
+        'link[rel~="canonical"]': {"href": "https://odd.example.com/req/551-std"},
         "a.permalink": {"href": "https://odd.example.com/req/551-profile"},
     })
 
@@ -535,7 +592,7 @@ def test_declared_canonical_source_recorded_on_capture_trace():
         landed="https://jobs.example.org/p/998",
     )
     page = _FakePage({
-        'link[rel="canonical"]': {"href": "https://jobs.example.org/p/998"},
+        'link[rel~="canonical"]': {"href": "https://jobs.example.org/p/998"},
     })
 
     _capture(state, page)
@@ -543,3 +600,232 @@ def test_declared_canonical_source_recorded_on_capture_trace():
     entry = [e for e in state.node_trace if e.node == "Capture"][-1]
     assert entry.payload["canonical_source"] == "link_rel"
     assert entry.payload["canonical_url"] == "https://jobs.example.org/p/998"
+
+
+# ----------------------------------------------------------------------
+# The gate runs PER RUNG — a junk rung must not shadow a good one
+# ----------------------------------------------------------------------
+
+
+def test_declared_canonical_junk_link_rel_falls_through_to_og_url():
+    """LOAD-BEARING. The SPA shell hard-codes `<link rel=canonical
+    href="https://site/">` on every page while still emitting a correct
+    og:url — the exact anti-pattern this ticket exists for.
+
+    With the junk filter applied once to the ladder's OUTPUT, the
+    present-but-useless rung 1 short-circuits rungs 2 and 3 and the
+    page's own good declaration is thrown away. The gate has to run
+    INSIDE the ladder, per rung, and fall through on rejection.
+    """
+    resolved = "https://spa.example.io/careers/openings/9912?position=2"
+    state = _state(submitted=resolved, landed=resolved)
+    page = _FakePage({
+        LINK_REL: {"href": "https://spa.example.io/"},                    # host_root
+        OG_URL: {"content": "https://spa.example.io/careers/openings/9912"},
+    })
+
+    _capture(state, page)
+
+    assert state.canonical_url == "https://spa.example.io/careers/openings/9912"
+    assert state.canonical_source == "og_url"
+    assert OG_URL in page.queried
+
+
+def test_declared_canonical_profile_rung_reached_when_both_standard_tags_junk():
+    """The escape hatch's OWN stated purpose. Rung 3 is documented as the
+    rescue for a host that emits neither standard tag *or emits a wrong
+    one* — and the wrong-one half is unreachable unless a rejected rung
+    falls through. An operator configuring `canonical_link_selectors` for
+    precisely this host would otherwise watch it never be consulted.
+    """
+    resolved = "https://walled.example.com/jobs/view/4404587081?trk=feed"
+    state = _state(
+        submitted=resolved,
+        landed=resolved,
+        profile={
+            "extension_selectors": {"canonical_link_selectors": ["a.permalink"]},
+        },
+    )
+    page = _FakePage({
+        LINK_REL: {"href": "https://walled.example.com/login"},        # auth_path
+        OG_URL: {"content": "https://aggregator.example/listing/1"},   # cross_host
+        "a.permalink": {
+            "href": "https://walled.example.com/jobs/view/4404587081"
+        },
+    })
+
+    _capture(state, page)
+
+    assert (
+        state.canonical_url == "https://walled.example.com/jobs/view/4404587081"
+    )
+    assert state.canonical_source == "profile_selector"
+
+
+def test_declared_canonical_every_rung_junk_keeps_resolved_and_traces_reasons():
+    """All three rungs declare garbage: the resolved URL survives
+    untouched, and the trace records WHY each candidate was thrown away.
+
+    `canonical_source` alone reads "resolved" identically for "the page
+    declared nothing" and "we rejected three declarations", so a host
+    being systematically eaten by the `_AUTH_PATH_SEGMENTS` word list
+    would otherwise be invisible in production — the one case you would
+    actually go to the trace for.
+    """
+    resolved = "https://junk.example.com/jobs/view/77"
+    state = _state(
+        submitted=resolved,
+        landed=resolved,
+        profile={"extension_selectors": {"canonical_link_selectors": ["a.perma"]}},
+    )
+    page = _FakePage({
+        LINK_REL: {"href": "https://junk.example.com/"},
+        OG_URL: {"content": "https://elsewhere.example/jobs/view/77"},
+        "a.perma": {"href": "javascript:void(0)"},
+    })
+
+    _capture(state, page)
+
+    assert state.canonical_url == resolved
+    assert state.canonical_source == "resolved"
+    entry = [e for e in state.node_trace if e.node == "Capture"][-1]
+    assert [
+        (r["source"], r["reason"]) for r in entry.payload["canonical_rejected"]
+    ] == [
+        ("link_rel", "host_root"),
+        ("og_url", "cross_host"),
+        ("profile_selector", "bad_scheme"),
+    ]
+
+
+def test_declared_canonical_throwing_rung_does_not_blind_the_rungs_below():
+    """One selector that throws is a bad selector, not a dead browser. A
+    single try/except around the whole ladder makes rung 1 able to abort
+    rungs 2 and 3; each rung reads inside its own.
+    """
+    resolved = "https://brittle.example.com/jobs/1?utm_source=x"
+    state = _state(submitted=resolved, landed=resolved)
+    page = _FakePage(
+        {OG_URL: {"content": "https://brittle.example.com/jobs/1"}},
+        raise_on={LINK_REL: "Protocol error: Node with given id not found"},
+    )
+
+    _capture(state, page)
+
+    assert state.canonical_url == "https://brittle.example.com/jobs/1"
+    assert state.canonical_source == "og_url"
+
+
+def test_declared_canonical_link_rel_selector_is_a_token_match():
+    """`<link rel="canonical alternate">` is legal and does appear on
+    syndicated / i18n pages. `rel~=` matches one token of a
+    space-separated list; `rel=` is an exact whole-value match that
+    silently misses the multi-token form. Playwright's selector parser
+    accepts `~=` (driver `utils/isomorphic/selectorParser.js` allows
+    `=, *=, ^=, $=, |=, ~=`).
+
+    Pinned on the WIRE selector: `_FakePage` is a dict lookup and cannot
+    model CSS token matching itself.
+    """
+    resolved = "https://plain.example.com/jobs/1"
+    state = _state(submitted=resolved, landed=resolved)
+    page = _FakePage({})
+
+    _capture(state, page)
+
+    assert page.queried[0] == 'link[rel~="canonical"]'
+
+
+# ----------------------------------------------------------------------
+# Ordering — the ladder runs BEFORE the content reads (CC-160)
+# ----------------------------------------------------------------------
+
+
+def test_declared_canonical_driver_death_raises_before_any_bytes_are_banked():
+    """LOAD-BEARING. `_adopt_declared_canonical` re-raises a
+    driver-closed error, per the CC-160 convention for every except that
+    wraps a Playwright call — so it must run BEFORE the content reads.
+
+    Below the reads, that same raise discards a complete, usable
+    `job_content` + `html` and buys a full re-scrape (the runner treats
+    a raise out of the graph as infra-death: relaunch + re-queue hold).
+    Capture had no such raise site before CC-248 —
+    `_screenshot_and_upload` never raises by contract
+    (`_artifacts.upload_page_screenshot`) and `_discover_selectors`
+    swallows everything. Above the reads it costs nothing: the driver
+    death that kills this query_selector kills `page.inner_text` on the
+    next line anyway.
+    """
+    resolved = "https://dead.example.com/jobs/1"
+    state = _state(submitted=resolved, landed=resolved)
+    page = _FakePage({}, raise_on_query=True, query_error=DRIVER_DEAD)
+
+    with pytest.raises(RuntimeError, match="Connection closed"):
+        _capture(state, page)
+
+    # Nothing was captured, so nothing was thrown away.
+    assert page.read_body is False
+    assert not state.job_content
+    assert state.canonical_source == "resolved"
+
+
+# ----------------------------------------------------------------------
+# The persistence hop must not re-key a row we merely matched
+# ----------------------------------------------------------------------
+
+
+def test_declared_canonical_persist_hop_skipped_on_duplicate_job_post():
+    """LOAD-BEARING. `outcome="duplicate"` from /persist-extraction/ means
+    `state.job_post_id` is a PRE-EXISTING JobPost the api matched us onto.
+    `JobPostExtractor` finds it with
+    `filter(Q(link=link) | Q(canonical_link=canonical))` — no owner
+    filter — so it is frequently another user's row, and the runner's
+    staff `CC_API_TOKEN` sails straight through the owner-or-staff check
+    on `PATCH /api/v1/job-posts/<id>/`.
+
+    `canonical_link` is the PRIMARY DEDUPE KEY. Rewriting it on a row we
+    merely matched makes that post unfindable at its own identity by
+    `find_duplicate`'s canonical leg, by federation ingest's
+    `filter(canonical_link=canonical)`, and by the serializer's sibling
+    lookup — and starts federating a new value to instances that ingested
+    the old one. The api's own duplicate branch merges empty fields only,
+    and its dedup-verb field allowlist explicitly excludes
+    "dedupe-pipeline columns (canonical_link, fingerprints)". This hop
+    honours the same policy.
+    """
+    state = _extract_state("link_rel")
+    state.was_duplicate = True
+
+    with patch("scrape_graph.nodes_extract.httpx.patch") as mock_patch, \
+            patch("scrape_graph.tracing._post_transition"):
+        mock_patch.return_value.status_code = 200
+        nxt = _run(ReviewCompleteness(), state)
+
+    assert isinstance(nxt, UpdateProfile)
+    assert mock_patch.call_count == 0
+    entry = [
+        e for e in state.node_trace if e.node == "ReviewCompleteness"
+    ][-1]
+    assert entry.payload["canonical_skipped"] == "duplicate_target"
+    assert entry.payload["canonical_written"] is False
+
+
+def test_declared_canonical_persist_hop_still_fires_on_a_non_duplicate():
+    """The duplicate guard must narrow, not disable. A run that CREATED
+    or upgraded the post still writes its declaration — that is the whole
+    delivery mechanism for the ladder.
+    """
+    state = _extract_state("og_url")
+    assert state.was_duplicate is False   # the dataclass default
+
+    with patch("scrape_graph.nodes_extract.httpx.patch") as mock_patch, \
+            patch("scrape_graph.tracing._post_transition"):
+        mock_patch.return_value.status_code = 200
+        _run(ReviewCompleteness(), state)
+
+    assert mock_patch.call_count == 1
+    entry = [
+        e for e in state.node_trace if e.node == "ReviewCompleteness"
+    ][-1]
+    assert entry.payload["canonical_written"] is True
+    assert "canonical_skipped" not in entry.payload
