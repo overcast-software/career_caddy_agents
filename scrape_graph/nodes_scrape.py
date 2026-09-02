@@ -970,13 +970,254 @@ class Capture(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
                 _reraise_if_driver_closed(exc)
                 state.failure_reason = f"capture_failed: {exc}"
 
+            # CC-248: read the page's own declared canonical while the DOM
+            # is still in hand. Pure querySelector work — no extra fetch,
+            # no LLM, no per-host config on the common path.
+            await _adopt_declared_canonical(page, state)
             await _screenshot_and_upload(page, state)
             await _discover_selectors(page, state)
         # DetectClosedState runs while DOM is still live so the CSS path
         # can probe the page; passes through to PersistScrape regardless
         # of verdict (closed-state is metadata, never terminal).
-        trace_node(state, "Capture", "DetectClosedState", started)
+        trace_node(
+            state, "Capture", "DetectClosedState", started,
+            {
+                "canonical_source": state.canonical_source,
+                "canonical_url": state.canonical_url,
+            },
+        )
         return DetectClosedState()
+
+
+# ---------------------------------------------------------------------------
+# CC-248 — the declared-canonical ladder.
+# ---------------------------------------------------------------------------
+
+# Generic path segments that mean "you are at the front door, not at a
+# posting". A declared canonical whose path contains one of these is an
+# auth-wall or account shell declaring ITSELF, not the job we came for —
+# adopting it would replace a usable identity with a URL that identifies
+# nothing.
+#
+# This is a CLOSED SET OF WEB CONVENTIONS applied uniformly to every host,
+# the same shape as `_STRIP_EXACT` in url_canonicalize.py. It is NOT
+# per-host tuning: no hostname appears anywhere in this module's
+# canonical code, and adding one here would be the signal to stop and ask
+# rather than to extend the set.
+#
+# Matched on WHOLE, lowercased path segments so ordinary job slugs that
+# merely contain one of these words survive — "/jobs/account-manager" and
+# "/careers/registered-nurse" are unaffected.
+_AUTH_PATH_SEGMENTS = frozenset({
+    "login", "signin", "sign-in", "sign_in",
+    "signup", "sign-up", "sign_up",
+    "register", "registration",
+    "auth", "authwall", "authenticate", "oauth", "sso",
+    "account", "session", "logout", "signout", "sign-out",
+})
+
+
+def _host_key(url: str) -> str:
+    """Lowercased, `www.`-stripped hostname — the repo-wide convention for
+    comparing hosts (LoadProfile does the same strip before the profile
+    lookup, so a profile keyed `example.com` serves `www.example.com`).
+    Returns "" when the URL has no parseable host.
+    """
+    from urllib.parse import urlparse
+    try:
+        host = (urlparse(url or "").hostname or "").lower()
+    except ValueError:
+        return ""
+    return host.removeprefix("www.")
+
+
+def _declared_canonical_is_sane(candidate: str, landed: str) -> tuple[bool, str]:
+    """Junk filter for a page-declared canonical. Returns (ok, reason).
+
+    A declaration is untrusted input: we did not compute it, and job
+    boards routinely emit garbage — an SPA shell with a hard-coded
+    `<link rel="canonical" href="https://site.com/">`, an auth-wall
+    declaring its own login URL, a syndicated listing pointing at an
+    aggregator on another host. Adopting any of those would destroy the
+    only identity we had (the resolved URL), so a declaration is only
+    allowed to win when it is at least as SPECIFIC as what we already
+    hold.
+
+    Three host-agnostic gates:
+
+    1. absolute, with an http/https scheme. Rules out `javascript:`,
+       `about:blank`, mailto:, and any relative leftover that urljoin
+       failed to resolve.
+    2. same host as `landed`. A cross-host declaration is a syndication
+       pointer, not this document's identity: we never fetched that URL
+       and cannot verify it names this job. This gate also has a second,
+       quieter job — `UpdateProfile` derives the profile host key from
+       `state.canonical_url` (nodes_extract.py:903), so pinning the host
+       guarantees an adopted declaration can never cause profile
+       learning to be written under the wrong hostname.
+    3. path is non-empty, is not `/`, and contains no `_AUTH_PATH_SEGMENTS`
+       segment. A host root cannot identify a posting; a login path
+       identifies the wall, not what is behind it.
+
+    Deliberately NOT gated: same-host SEARCH/listing pages
+    (`/jobs?q=engineer`). Recognizing those means guessing at path
+    vocabulary per site, which is exactly the bespoke per-host work this
+    ticket forbids, and the failure is soft — a listing URL is still the
+    right host and still round-trips. If it ever bites, it is a ruling to
+    get, not a heuristic to sneak in.
+    """
+    from urllib.parse import urlparse
+    if not candidate:
+        return False, "empty"
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        return False, "unparseable"
+    if parsed.scheme not in ("http", "https"):
+        return False, "bad_scheme"
+    cand_host = _host_key(candidate)
+    if not cand_host:
+        return False, "no_host"
+    landed_host = _host_key(landed)
+    if not landed_host or cand_host != landed_host:
+        return False, "cross_host"
+    path = parsed.path or ""
+    if not path.strip("/"):
+        return False, "host_root"
+    segments = {seg.lower() for seg in path.split("/") if seg}
+    if segments & _AUTH_PATH_SEGMENTS:
+        return False, "auth_path"
+    return True, "ok"
+
+
+async def _read_declared_canonical(page, profile: dict | None):
+    """Walk the canonical ladder cheapest rung first; return
+    ``(raw_href, source)`` for the first rung that yields a non-empty
+    value, else ``None``.
+
+    1. ``link[rel="canonical"]``   — a web standard, zero config, every host.
+    2. ``meta[property="og:url"]`` — same.
+    3. ``ScrapeProfile.extension_selectors.canonical_link_selectors`` — the
+       escape hatch, tried ONLY when 1 and 2 are both absent. Reaching this
+       rung for a host means that host emits neither standard tag (or emits
+       a wrong one), which is worth noticing rather than papering over.
+
+    On rung 3, `extension_selectors` is read NESTED off the profile, not
+    flattened: `_flatten_profile_attrs` lifts the keys of `css_selectors`
+    only, and the api serializes attribute names with underscores
+    (BaseSerializer.to_resource emits the raw field names), so the bundle
+    arrives at `state.profile["extension_selectors"]`. VERIFIED against
+    api serializers.py ScrapeProfileSerializer.attributes.
+    """
+    async def _first_attr(selector: str, *attrs: str) -> str:
+        el = await page.query_selector(selector)
+        if not el:
+            return ""
+        for attr in attrs:
+            value = await el.get_attribute(attr)
+            if value and value.strip():
+                return value.strip()
+        return ""
+
+    href = await _first_attr('link[rel="canonical"]', "href")
+    if href:
+        return href, "link_rel"
+
+    href = await _first_attr('meta[property="og:url"]', "content")
+    if href:
+        return href, "og_url"
+
+    extension = (profile or {}).get("extension_selectors")
+    selectors = (extension or {}).get("canonical_link_selectors") or []
+    if isinstance(selectors, str):
+        selectors = [selectors]
+    for selector in selectors:
+        if not isinstance(selector, str) or not selector.strip():
+            continue
+        try:
+            href = await _first_attr(selector.strip(), "href", "content")
+        except Exception:
+            # One bad selector in a profile must not blind the whole rung.
+            logger.debug(
+                "Capture: canonical profile selector failed sel=%s",
+                selector, exc_info=True,
+            )
+            continue
+        if href:
+            return href, "profile_selector"
+    return None
+
+
+async def _adopt_declared_canonical(page, state: ScrapeGraphState) -> None:
+    """Overwrite ``state.canonical_url`` with the page's OWN declared
+    canonical when the page makes one and it survives the junk filter.
+
+    PRECEDENCE — the declaration wins over the resolved URL. Reasoning,
+    because this is the one open design question on CC-248:
+
+    ``ResolveFinalUrl`` computes a TRANSPORT fact — where the browser
+    ended up after the redirect chain, minus known tracker params. It is
+    an excellent answer to "what did we fetch" and a mediocre answer to
+    "what job is this", because it cannot know which of the surviving
+    query params are identity and which are presentation:
+    `/jobs/view/123?position=2&pageNum=0` and `/jobs/view/123` are one
+    posting and `_STRIP_EXACT` has no way to learn that.
+    ``link[rel="canonical"]`` is an IDENTITY fact — the URL the site
+    itself publishes as the name of this document. Everything downstream
+    that consumes `JobPost.canonical_link` (the api's duplicate-candidate
+    scoring) is asking the identity question, so the identity signal is
+    the one worth storing. When the two disagree, the site is the better
+    authority about its own URL space.
+
+    The gates in ``_declared_canonical_is_sane`` are what make "declared
+    wins" safe rather than reckless: the declaration only wins when it is
+    at least as specific as the resolved URL we would be discarding.
+
+    Comparison is against the LANDED url (``final_url or submitted_url``),
+    never the SUBMITTED one. After a tracker redirect the landed host is
+    the real host; comparing to the submitted tracker host would reject
+    every legitimate declaration on precisely the redirect scrapes this
+    work exists for. Do not let this get "simplified".
+
+    Never raises, never fails a scrape. A missing or garbage canonical is
+    the normal case for most of the web — on any error or rejection
+    ``state.canonical_url`` is left exactly as ``ResolveFinalUrl`` set it
+    and ``state.canonical_source`` stays "resolved".
+    """
+    from urllib.parse import urljoin
+    landed = state.final_url or state.submitted_url or ""
+    try:
+        found = await _read_declared_canonical(page, state.profile)
+    except Exception as exc:
+        _reraise_if_driver_closed(exc)  # CC-160
+        logger.debug("Capture: declared-canonical read failed", exc_info=True)
+        return
+    if not found:
+        return
+    raw, source = found
+    try:
+        # Relative hrefs are legal in link[rel=canonical]; resolve against
+        # the landed URL before the host gate can see them, or every
+        # `href="/jobs/123"` would fail as "no_host".
+        absolute = urljoin(landed, raw)
+        ok, reason = _declared_canonical_is_sane(absolute, landed)
+        if not ok:
+            logger.debug(
+                "Capture: rejected declared canonical source=%s reason=%s "
+                "candidate=%s landed=%s",
+                source, reason, absolute, landed,
+            )
+            return
+        state.canonical_url = canonicalize_url(absolute)
+        state.canonical_source = source
+        logger.info(
+            "Capture: adopted declared canonical source=%s url=%s",
+            source, state.canonical_url,
+        )
+    except Exception:
+        logger.debug(
+            "Capture: declared-canonical adoption failed", exc_info=True
+        )
 
 
 async def _screenshot_and_upload(page, state: ScrapeGraphState) -> None:

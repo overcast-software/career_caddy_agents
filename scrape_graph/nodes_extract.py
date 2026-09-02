@@ -833,12 +833,92 @@ class ReviewCompleteness(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
             marked = _mark_job_post_incomplete(
                 state.job_post_id, reason=state.stub_reason,
             )
+        # CC-248 persistence hop. Capture may have adopted the page's own
+        # declared canonical into state.canonical_url; without this write
+        # it would die with the graph run and the whole ladder would
+        # deliver nothing observable.
+        canonical_written = False
+        if state.canonical_source != "resolved" and state.job_post_id:
+            canonical_written = _persist_declared_canonical(
+                state.job_post_id,
+                state.canonical_url or "",
+                source=state.canonical_source,
+            )
+        payload = {}
+        if state.stub_reason:
+            payload = {
+                "stub_reason": state.stub_reason,
+                "marked_incomplete": marked,
+            }
+        if state.canonical_source != "resolved":
+            payload["canonical_source"] = state.canonical_source
+            payload["canonical_written"] = canonical_written
         trace_node(
             state, "ReviewCompleteness", "UpdateProfile", started,
-            {"stub_reason": state.stub_reason, "marked_incomplete": marked}
-            if state.stub_reason else None,
+            payload or None,
         )
         return UpdateProfile()
+
+
+def _persist_declared_canonical(
+    job_post_id: str, canonical_url: str, *, source: str
+) -> bool:
+    """PATCH ``JobPost.canonical_link`` with a page-DECLARED canonical.
+    Returns True when the api took it.
+
+    Gated on the value being a declaration (``state.canonical_source`` is
+    one of link_rel / og_url / profile_selector), never on a merely
+    RESOLVED one. That is not squeamishness: the resolved value already
+    has its own propagation path — ``_propagate_canonical_to_parent_jp``
+    in the ResolveFinalUrl redirect branch — which targets the PARENT
+    scrape's pre-existing JobPost. Writing resolved values from here too
+    would duplicate that path onto a different row for no gain and put a
+    second writer on the same column.
+
+    ``JobPost.save()`` only re-derives ``canonical_link`` when it is
+    empty, so a direct PATCH sticks. ``link`` is deliberately untouched —
+    Doug's 2026-08-25 ruling is that the stored original link is
+    preserved, and the api's PATCH path leaves it alone.
+
+    Best-effort. This is dedupe-recall enrichment, not load-bearing for
+    the scrape: a failure is logged and the graph continues to
+    UpdateProfile with the JobPost intact.
+    """
+    if not canonical_url:
+        return False
+    try:
+        resp = httpx.patch(
+            f"{_api_base()}/api/v1/job-posts/{job_post_id}/",
+            json={
+                "data": {
+                    "type": "job-post",
+                    "id": str(job_post_id),
+                    "attributes": {"canonical_link": canonical_url},
+                }
+            },
+            headers={**_api_headers(), "Content-Type": "application/vnd.api+json"},
+            timeout=10.0,
+        )
+    except Exception:
+        logger.warning(
+            "ReviewCompleteness: declared canonical_link PATCH errored "
+            "job_post_id=%s source=%s url=%s",
+            job_post_id, source, canonical_url, exc_info=True,
+        )
+        return False
+    if resp.status_code >= 400:
+        logger.warning(
+            "ReviewCompleteness: declared canonical_link PATCH rejected "
+            "job_post_id=%s source=%s status=%s body=%s",
+            job_post_id, source, resp.status_code, resp.text[:300],
+        )
+        return False
+    logger.info(
+        "ReviewCompleteness: stored declared canonical_link on JobPost %s "
+        "(source=%s url=%s)",
+        job_post_id, source, canonical_url,
+    )
+    return True
 
 
 def _mark_job_post_incomplete(job_post_id: str, *, reason: str) -> bool:
