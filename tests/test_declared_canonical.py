@@ -267,23 +267,42 @@ def test_declared_canonical_relative_href_resolved_against_landed():
     assert state.canonical_source == "link_rel"
 
 
-def test_declared_canonical_tracker_params_stripped_on_adoption():
-    """The adopted declaration still goes through canonicalize_url — a
-    site that publishes its own canonical with utm_ on it does not get to
-    poison the identity we store."""
+def test_declared_canonical_adopted_verbatim_api_owns_the_stripping():
+    """The declaration is adopted AS PUBLISHED; stripping is the api's job.
+
+    REPLACES test_declared_canonical_tracker_params_stripped_on_adoption,
+    which asserted that adoption ran the declaration through this module's
+    canonicalize_url. That was removed deliberately, and the concern it
+    protected is unchanged — a site publishing its own canonical with utm_ on
+    it still must not poison the stored identity. What moved is WHO enforces
+    it.
+
+    Why it moved: whatever lands in `state.canonical_url` is PATCHed onto
+    JobPost.canonical_link by ReviewCompleteness, and that column is the api's
+    primary dedupe key. Canonicalizing here wrote an agents-shaped value into
+    it — this module's param set is disjoint from the api's (not a superset),
+    it applies no ScrapeProfile url_rewrites, and it strips `src`, which the
+    api deliberately KEEPS because worksourcewa encodes part of the job id
+    there. So the api's own matcher could not reproduce the stored key for the
+    same input URL.
+
+    The guarantee now lives in the api, which canonicalizes an inbound
+    canonical_link at write (api PR #271) — one owner of the rules, and
+    callers send raw. Same end state on the row, enforced by the side that
+    defines what canonical means.
+    """
     state = _state(
         submitted="https://jobs.example.org/p/12",
         landed="https://jobs.example.org/p/12",
     )
-    page = _FakePage({
-        'link[rel~="canonical"]': {
-            "href": "https://jobs.example.org/p/12?utm_source=rss&id=12"
-        },
-    })
+    declared = "https://jobs.example.org/p/12?utm_source=rss&id=12"
+    page = _FakePage({'link[rel~="canonical"]': {"href": declared}})
 
     _capture(state, page)
 
-    assert state.canonical_url == "https://jobs.example.org/p/12?id=12"
+    # Verbatim — including the utm the api will strip on write.
+    assert state.canonical_url == declared
+    assert state.canonical_source == "link_rel"
 
 
 def test_declared_canonical_host_gate_uses_landed_not_submitted():
