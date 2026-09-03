@@ -24,8 +24,8 @@ class TestScopes:
     def test_all_scope_matches_registry(self):
         assert SCOPES["all"] == set(TOOL_REGISTRY.keys())
 
-    def test_career_caddy_scope_has_30_tools(self):
-        # 23 core CRUD + 7 Agent Wizard tools (show/edit resume + cover letter,
+    def test_career_caddy_scope_has_29_tools(self):
+        # 22 core CRUD + 7 Agent Wizard tools (show/edit resume + cover letter,
         # import_resume_from_url, edit_profile_onboarding, reconcile_onboarding).
         # AW intentionally does NOT get a tool for writing user account fields
         # (first_name, email, etc.) — those edits go through the settings UI.
@@ -35,8 +35,11 @@ class TestScopes:
         # for "what's my name?" questions); bumped 21→22 when
         # get_duplicate_candidates was added to surface likely dupes; bumped
         # 22→23 when find_duplicate_candidates was added as a composite
-        # pre-POST check over the existing primitives.
-        assert len(SCOPES["career_caddy"]) == 30
+        # pre-POST check over the existing primitives; back to 22 when
+        # find_duplicate_candidates was removed (CC-257) — the api owns
+        # canonicalization, so a client-side identity guess has no place
+        # in the chat surface.
+        assert len(SCOPES["career_caddy"]) == 29
 
     def test_career_caddy_scope_includes_agent_wizard_tools(self):
         aw_tools = {

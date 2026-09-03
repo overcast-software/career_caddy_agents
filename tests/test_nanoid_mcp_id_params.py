@@ -157,12 +157,12 @@ class TestApiToolsNanoIdRuntime:
         on a NanoID. The company's NanoID must now ride the relationship."""
         api = MagicMock()
         api.get_data = AsyncMock(side_effect=[
-            ({"data": []}, None, 200),  # dup check: no existing link
             (
                 {"data": [{"type": "company", "id": "Co8nanoidX",
                            "attributes": {"name": "Acme"}}]},
                 None, 200,
-            ),  # company search: a hit
+            ),  # company search: a hit. The pre-POST dup probe that used to
+                # run first was removed in CC-257 — the api owns job identity.
         ])
         api.post_data = AsyncMock(return_value=(
             {"data": {"type": "job-post", "id": "Jp9nanoid00",
