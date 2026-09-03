@@ -686,6 +686,142 @@ def _is_ui_chrome_description(description: str) -> bool:
     return (chrome / len(tokens)) >= _UI_CHROME_PILL_RATIO
 
 
+# Error / 404 / expired-posting fingerprints (CC-118).
+#
+# An error page is neither a loading shell nor UI chrome: it renders
+# fully, it carries the host's real nav + footer (so it clears
+# _SOURCE_MIN_WORDS), and an extraction tier dutifully reads its <h1> as
+# the "title". The observed damage is two-sided:
+#
+#   1. a JobPost titled "Not Found" whose body is "The page you are
+#      looking for doesn't exist." is minted `complete=True`;
+#   2. worse, PersistJobPost records a SUCCESS, which inflates the host's
+#      success_rate — the very signal that auto-promotes a host to
+#      is_known_good / Tier 0. So error pages don't just make junk rows,
+#      they steer the profile learning loop toward false promotion.
+#
+# Refusing here routes to ExtractFail, which persists no JobPost, keeps
+# success_rate honest, and fires the debug-artifact invariant. A refusal
+# is cheaper than an invention.
+#
+# Host-agnostic on purpose. DetectClosedState is the per-host,
+# profile-configured closed-posting path, and it skips its LLM leg below
+# `min_chars_for_llm` (1000) — a thin 404 slips under exactly that bar.
+# This guard is the floor beneath it, not a replacement for it.
+_ERROR_PAGE_TITLE_SENTINELS = frozenset({
+    "404",
+    "404 not found",
+    "not found",
+    "page not found",
+    "job not found",
+    "posting not found",
+    "job posting not found",
+    "page unavailable",
+    "job unavailable",
+    "page no longer available",
+    "error",
+    "an error occurred",
+    "server error",
+    "internal server error",
+    "bad request",
+    "service unavailable",
+    "access denied",
+    "forbidden",
+    "oops",
+    "oops something went wrong",
+    "something went wrong",
+})
+
+# Body sentinels are deliberately NARROWER than the phrases a human would
+# reach for. A bare "no longer exists" appears in ordinary marketing prose
+# ("we build for a world that no longer exists"), so every entry here names
+# the *page* or the *posting* explicitly.
+_ERROR_PAGE_BODY_PHRASES = (
+    "page you are looking for doesn't exist",
+    "page you are looking for does not exist",
+    "page you're looking for doesn't exist",
+    "page you requested could not be found",
+    "page cannot be found",
+    "page could not be found",
+    "page no longer exists",
+    "job no longer exists",
+    "posting no longer exists",
+    "job posting no longer exists",
+    "job posting not found",
+    "position is no longer available",
+    "posting is no longer available",
+    "this job is no longer accepting",
+    "this position is no longer accepting",
+    "error 404",
+    "404 not found",
+)
+
+# A description longer than this is prose, not an error page's one-liner.
+# Kept under the ~390 chars a 60-word (_STUB_MIN_WORDS) description runs to,
+# so a real body that happens to quote one of the phrases above survives.
+_ERROR_PAGE_DESC_MAX_CHARS = 300
+
+# Split a <title> on the separators sites use to append their own name
+# ("404 · Workday", "Not Found | Acme Careers"). A bare hyphen only counts
+# when spaced, so "Senior Engineer - Remote" is not shredded into segments.
+_ERROR_PAGE_TITLE_SPLIT_RE = re.compile(r"[|/·»–—:]+|\s-\s")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_title_segment(text: str) -> str:
+    """Lowercase, drop punctuation, collapse whitespace. 'Oops!' → 'oops'."""
+    return _NON_ALNUM_RE.sub(" ", text.lower()).strip()
+
+
+def _is_error_page_title(title: str) -> bool:
+    """Does the extracted title EXACTLY match an error sentinel?
+
+    Exact (post-normalization) on purpose: a `"error" in title` test would
+    eat "Error Budget Engineer", and a substring test on "not found" would
+    eat "Lost and Not Found Coordinator". The whole title is tested first,
+    then each separator-delimited segment so a site-name suffix can't hide
+    a 404.
+    """
+    raw = (title or "").strip()
+    if not raw:
+        return False
+    for candidate in (raw, *_ERROR_PAGE_TITLE_SPLIT_RE.split(raw)):
+        normalized = _normalize_title_segment(candidate)
+        if normalized and normalized in _ERROR_PAGE_TITLE_SENTINELS:
+            return True
+    return False
+
+
+def _is_error_page(title: str, description: str, source: str) -> bool:
+    """Is this extraction an error / 404 / dead-posting page?
+
+    Two independent signals, both conservative:
+
+    - the title is a near-exact error sentinel — decisive on its own,
+      because no real posting is titled "Not Found"; or
+    - a body sentinel appears in the description or the captured source
+      AND the description looks like an error page's one-liner (short,
+      with none of the real-job vocabulary a genuine body carries). The
+      second half matters: a body phrase alone is weak evidence, and the
+      cost of a false positive here is a refused good scrape.
+
+    The source is scanned as well as the description because a tier that
+    invented a description off a 404 leaves the evidence only in the
+    capture — the same case EvaluateExtraction's grounding check demotes
+    to a stub, which then arrives here with a short sentinel body.
+    """
+    if _is_error_page_title(title):
+        return True
+    desc = (description or "").strip()
+    haystack = f"{desc}\n{source or ''}".lower().replace("’", "'")
+    if not any(phrase in haystack for phrase in _ERROR_PAGE_BODY_PHRASES):
+        return False
+    if len(desc) > _ERROR_PAGE_DESC_MAX_CHARS:
+        return False
+    lowered_desc = desc.lower()
+    return not any(p in lowered_desc for p in _UI_CHROME_REAL_JOB_PHRASES)
+
+
 @dataclass
 class ValidateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     """Content-quality gate between EvaluateExtraction-passed and PersistJobPost.
@@ -695,7 +831,8 @@ class ValidateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
     (scrape 172) where the LLM hallucinated a plausible job from
     `Loading…Sorry to interrupt` text. This node adds invariants the
     LLM can't judge: is the *source* material big enough to contain a
-    real posting? Does it match known SPA-shell fingerprints?
+    real posting? Does it match known SPA-shell fingerprints? Is it an
+    error / 404 page wearing a job posting's URL?
 
     Failing here routes to ExtractFail so PR 35's debug-artifact
     invariant fires — we get a screenshot + DOM snapshot on the
@@ -724,12 +861,22 @@ class ValidateExtraction(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
         # sentinel, deliberately emitted by EvaluateExtraction, and
         # rejecting it here would throw away the title + company we did
         # read and lose the visible-failure record Doug asked for.
-        parsed_description = ((state.parsed or {}).get("description") or "")
+        parsed = state.parsed or {}
+        parsed_description = (parsed.get("description") or "")
         if (
             not _is_partial_render_placeholder(parsed_description)
             and _is_ui_chrome_description(parsed_description)
         ):
             reasons.append("ui_chrome_only")
+
+        # Error / 404 / dead-posting pages. Unlike the stub case above,
+        # there is nothing truthful to keep here: the title we "read" is
+        # the host's error heading, not a job. Persisting it would both
+        # mint a junk row and bank a false success against the profile.
+        if _is_error_page(
+            (parsed.get("title") or ""), parsed_description, source,
+        ):
+            reasons.append("error_page")
 
         state.evaluation = {
             **(state.evaluation or {}),
