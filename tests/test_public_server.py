@@ -28,9 +28,13 @@ class TestPublicServerTools:
         # (inspect_scrape_html, test_url_rewrite, find_selectors_for_text).
         # 31→33 when the ActivityPub publish/unpublish tools landed
         # (publish_job_post, unpublish_job_post — CC-60).
+        # 33→32 when find_duplicate_candidates was removed (CC-257) — the api
+        # owns canonicalization and job identity; get_duplicate_candidates
+        # against /job-posts/:id/duplicate-candidates/ is the sanctioned
+        # read path.
         # Asserts the REGISTERED total, not the filtered surface a
         # non-staff client sees (see TestStaffOnlyToolFilter for that).
-        assert len(self.tools) == 33
+        assert len(self.tools) == 32
 
     def test_has_all_expected_tools(self):
         expected = {
@@ -38,7 +42,7 @@ class TestPublicServerTools:
             "create_job_post_with_company_check", "find_job_post_by_link",
             "search_job_posts", "get_job_posts", "update_job_post",
             "publish_job_post", "unpublish_job_post",
-            "get_duplicate_candidates", "find_duplicate_candidates",
+            "get_duplicate_candidates",
             "create_job_application", "get_job_applications",
             "get_applications_for_job_post", "update_job_application",
             "get_career_data", "get_current_user",
