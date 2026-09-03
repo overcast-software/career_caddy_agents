@@ -604,6 +604,20 @@ _LOADING_SHELL_PHRASES = (
 )
 _LOADING_SHELL_MIN_HITS = 2
 
+# persist-extraction outcomes meaning "the api matched us onto a JobPost row
+# that already existed and that we did not create". The api reaches a duplicate
+# two independent ways and reports them under two different strings:
+#   "duplicate"                  — link / canonical_link hit
+#                                  (lib/parsers/job_post_extractor.py:937)
+#   "duplicate_via_fingerprint"  — title+company hit, via a bare
+#                                  JobPost.objects.get_or_create(title=, company=)
+#                                  with no owner filter (:969-1009)
+# Both then merge empty fields only. Matching just the first string is a trap:
+# the fingerprint branch is precisely the one that fires when the scraped link
+# does NOT match the stored one — which is exactly the case a declared canonical
+# exists to describe. See ReviewCompleteness, which must not re-key such a row.
+_DUPLICATE_MATCH_OUTCOMES = frozenset({"duplicate", "duplicate_via_fingerprint"})
+
 _SOURCE_MIN_WORDS = 40
 
 # UI-chrome-only description fingerprint. LinkedIn's lazy-hydrated
@@ -752,7 +766,9 @@ class PersistJobPost(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no
             body = resp.json() if resp.status_code < 500 else {}
             meta = (body or {}).get("meta") or {}
             state.job_post_id = meta.get("job_post_id")
-            state.was_duplicate = (meta.get("outcome") == "duplicate")
+            state.was_duplicate = (
+                meta.get("outcome") in _DUPLICATE_MATCH_OUTCOMES
+            )
         except Exception:
             logger.warning("PersistJobPost: post failed", exc_info=True)
             trace_node(state, "PersistJobPost", "ExtractFail", started)
@@ -833,12 +849,135 @@ class ReviewCompleteness(BaseNode[ScrapeGraphState, None, dict]):  # type: ignor
             marked = _mark_job_post_incomplete(
                 state.job_post_id, reason=state.stub_reason,
             )
+        # CC-248 persistence hop. Capture may have adopted the page's own
+        # declared canonical into state.canonical_url; without this write
+        # it would die with the graph run and the whole ladder would
+        # deliver nothing observable.
+        #
+        # NOT ON THE DUPLICATE PATH. When PersistJobPost's
+        # /persist-extraction/ came back outcome="duplicate",
+        # `state.job_post_id` is a PRE-EXISTING JobPost the api merely
+        # MATCHED us onto — `JobPostExtractor` looks it up with
+        # `filter(Q(link=link) | Q(canonical_link=canonical))`, with no
+        # owner filter, so it is frequently another user's row. The
+        # runner's CC_API_TOKEN is a staff key and `_upsert_django`
+        # (api jobs.py:984) lets staff PATCH anyone's post, so nothing
+        # downstream would stop us rewriting `canonical_link` — the
+        # PRIMARY DEDUPE KEY — on a row we do not own and did not
+        # create. Rewriting it makes that post unfindable at its own
+        # identity by `find_duplicate`'s canonical leg, by
+        # `federation_ingest`'s `filter(canonical_link=canonical)`, and
+        # by the serializer's sibling lookup, and starts federating a
+        # new value to instances that ingested the old one. The api's own
+        # duplicate branch is deliberately merge-empty-fields-only, and
+        # its dedup-verb allowlist names `canonical_link` as a column the
+        # caller may never carry across ("never dedupe-pipeline
+        # columns"). This hop honours the same policy.
+        #
+        # The narrowing mirrors `_mark_job_post_incomplete` above, which
+        # is likewise gated on THIS run's own verdict (`stub_reason`)
+        # rather than firing on whatever row we ended up pointed at.
+        canonical_written = False
+        canonical_skipped = ""
+        if state.canonical_source != "resolved" and state.job_post_id:
+            if state.was_duplicate:
+                canonical_skipped = "duplicate_target"
+                logger.info(
+                    "ReviewCompleteness: declared canonical NOT written — "
+                    "JobPost %s is a pre-existing duplicate match, not ours "
+                    "to re-key (source=%s url=%s)",
+                    state.job_post_id, state.canonical_source,
+                    state.canonical_url,
+                )
+            else:
+                canonical_written = _persist_declared_canonical(
+                    state.job_post_id,
+                    state.canonical_url or "",
+                    source=state.canonical_source,
+                )
+        payload = {}
+        if state.stub_reason:
+            payload = {
+                "stub_reason": state.stub_reason,
+                "marked_incomplete": marked,
+            }
+        if state.canonical_source != "resolved":
+            payload["canonical_source"] = state.canonical_source
+            payload["canonical_written"] = canonical_written
+            if canonical_skipped:
+                payload["canonical_skipped"] = canonical_skipped
         trace_node(
             state, "ReviewCompleteness", "UpdateProfile", started,
-            {"stub_reason": state.stub_reason, "marked_incomplete": marked}
-            if state.stub_reason else None,
+            payload or None,
         )
         return UpdateProfile()
+
+
+def _persist_declared_canonical(
+    job_post_id: str, canonical_url: str, *, source: str
+) -> bool:
+    """PATCH ``JobPost.canonical_link`` with a page-DECLARED canonical.
+    Returns True when the api took it.
+
+    TWO gates, both at the call site in ``ReviewCompleteness.run``:
+    the value must be a DECLARATION (below), and the JobPost must be one
+    this run created or upgraded — never a duplicate the api matched us
+    onto (``state.was_duplicate``; see the call site for why that one is
+    a data-integrity gate and not a nicety).
+
+    Gated on the value being a declaration (``state.canonical_source`` is
+    one of link_rel / og_url / profile_selector), never on a merely
+    RESOLVED one. That is not squeamishness: the resolved value already
+    has its own propagation path — ``_propagate_canonical_to_parent_jp``
+    in the ResolveFinalUrl redirect branch — which targets the PARENT
+    scrape's pre-existing JobPost. Writing resolved values from here too
+    would duplicate that path onto a different row for no gain and put a
+    second writer on the same column.
+
+    ``JobPost.save()`` only re-derives ``canonical_link`` when it is
+    empty, so a direct PATCH sticks. ``link`` is deliberately untouched —
+    Doug's 2026-08-25 ruling is that the stored original link is
+    preserved, and the api's PATCH path leaves it alone.
+
+    Best-effort. This is dedupe-recall enrichment, not load-bearing for
+    the scrape: a failure is logged and the graph continues to
+    UpdateProfile with the JobPost intact.
+    """
+    if not canonical_url:
+        return False
+    try:
+        resp = httpx.patch(
+            f"{_api_base()}/api/v1/job-posts/{job_post_id}/",
+            json={
+                "data": {
+                    "type": "job-post",
+                    "id": str(job_post_id),
+                    "attributes": {"canonical_link": canonical_url},
+                }
+            },
+            headers={**_api_headers(), "Content-Type": "application/vnd.api+json"},
+            timeout=10.0,
+        )
+    except Exception:
+        logger.warning(
+            "ReviewCompleteness: declared canonical_link PATCH errored "
+            "job_post_id=%s source=%s url=%s",
+            job_post_id, source, canonical_url, exc_info=True,
+        )
+        return False
+    if resp.status_code >= 400:
+        logger.warning(
+            "ReviewCompleteness: declared canonical_link PATCH rejected "
+            "job_post_id=%s source=%s status=%s body=%s",
+            job_post_id, source, resp.status_code, resp.text[:300],
+        )
+        return False
+    logger.info(
+        "ReviewCompleteness: stored declared canonical_link on JobPost %s "
+        "(source=%s url=%s)",
+        job_post_id, source, canonical_url,
+    )
+    return True
 
 
 def _mark_job_post_incomplete(job_post_id: str, *, reason: str) -> bool:

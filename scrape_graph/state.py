@@ -109,6 +109,28 @@ class ScrapeGraphState:
     canonical_url: Optional[str] = None
     rewritten_url: Optional[str] = None  # set by Navigate when profile.url_rewrites fires
     did_redirect: bool = False
+    # Which rung of the canonical ladder produced `canonical_url` (CC-248).
+    # "resolved"         — ResolveFinalUrl's redirect-follow + tracker strip.
+    #                      The floor; every scrape starts here.
+    # "link_rel"         — the page's own <link rel="canonical">.
+    # "og_url"           — the page's own <meta property="og:url">.
+    # "profile_selector" — ScrapeProfile.extension_selectors
+    #                      .canonical_link_selectors, the escape hatch for
+    #                      hosts that emit neither of the above.
+    # Writers: ResolveFinalUrl (leaves the default) and Capture's
+    # `_adopt_declared_canonical`. Read by ReviewCompleteness, which
+    # persists canonical_link to the JobPost ONLY for a declaration — a
+    # merely-resolved value has its own propagation path
+    # (`_propagate_canonical_to_parent_jp`, the redirect branch) and must
+    # not be double-written from here — AND only when `was_duplicate` is
+    # False: on the duplicate path `job_post_id` is a pre-existing row the
+    # api matched us onto, often another user's, and canonical_link is the
+    # dedupe key. Both gates are load-bearing; see ReviewCompleteness.run.
+    #
+    # Deliberately NOT in to_payload(): the graph-transition endpoint's
+    # tolerance for unknown keys is unverified, and the value is already
+    # carried on Capture's trace payload where it is wanted.
+    canonical_source: str = "resolved"
 
     # Scrape-side
     profile: Optional[dict] = None
