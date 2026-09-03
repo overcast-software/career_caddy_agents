@@ -370,7 +370,7 @@ class Navigate(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef
 
 
 def _propagate_canonical_to_parent_jp(
-    parent_scrape_id: str, resolved_canonical_url: str
+    parent_scrape_id: str, landed_url: str
 ) -> None:
     """Best-effort: when a parent scrape's URL resolves through a
     redirect chain, propagate the resolved canonical URL back to the
@@ -388,14 +388,31 @@ def _propagate_canonical_to_parent_jp(
     accumulates an unmerged duplicate the first time the destination
     is captured directly.
 
+    Takes the RAW landed URL and lets the api canonicalize it. This
+    module has its own canonicalizer whose rules DIFFER from the api's
+    — the param sets are disjoint, not nested, it applies no
+    ScrapeProfile url_rewrites, and it strips `src`, which the api
+    deliberately keeps. Sending our form put values into the primary
+    dedupe key that the api's own matcher would never reproduce for the
+    same input. The api canonicalizes an inbound canonical_link at
+    write, so there is exactly one owner of those rules and it is not
+    this file.
+
     Behavior:
     - GET the parent scrape; if no `job_post` relationship, no-op.
-    - GET the JobPost; if its canonical_link already equals the
-      resolved URL (idempotent re-run), no-op.
+    - GET the JobPost; if its canonical_link already equals what we are
+      about to send, no-op.
     - Otherwise PATCH the JobPost's `canonical_link`. The api's PATCH
-      path leaves `link` alone (audit / wrapper preserved) and the
-      JobPost.save() guard only re-derives canonical_link when it's
-      empty, so the value we send lands verbatim.
+      path leaves `link` alone (audit / wrapper preserved).
+
+    NOTE on the idempotence check: the stored value is canonical and
+    `landed_url` is raw, so they now compare equal only when the URL
+    was already canonical. A re-run on a URL that needed normalizing
+    therefore re-PATCHes with the same end result rather than
+    short-circuiting — one redundant, idempotent write on a
+    best-effort path. Reproducing the api's canonicalization here to
+    avoid it would reintroduce exactly the divergence this change
+    removes.
 
     All exceptions are swallowed and logged — this is enhancement
     for downstream dedupe, not load-bearing for the scrape itself.
@@ -434,7 +451,7 @@ def _propagate_canonical_to_parent_jp(
             .get("attributes", {})
             .get("canonical_link")
         )
-        if current_canonical == resolved_canonical_url:
+        if current_canonical == landed_url:
             return
 
         httpx.patch(
@@ -443,7 +460,7 @@ def _propagate_canonical_to_parent_jp(
                 "data": {
                     "type": "job-post",
                     "id": str(jp_id),
-                    "attributes": {"canonical_link": resolved_canonical_url},
+                    "attributes": {"canonical_link": landed_url},
                 }
             },
             headers={**_api_headers(), "Content-Type": "application/json"},
@@ -477,7 +494,16 @@ def _resolve_final_url_body(state: ScrapeGraphState) -> None:
             json={
                 "data": {
                     "attributes": {
-                        "url": state.canonical_url,
+                        # RAW landed URL, not our canonicalized form. This
+                        # becomes the child scrape's url and then JobPost.link,
+                        # which the api treats as the untouched original and
+                        # exact-matches on in four places. Sending our version
+                        # put an agents-shaped string into that column: this
+                        # module strips `src`, which the api DELIBERATELY keeps
+                        # (worksourcewa encodes part of the job id there — see
+                        # api job_post_dedupe._TRACKING_PARAMS), so distinct
+                        # jobs could collapse on the way in.
+                        "url": landed,
                         "source": "redirect",
                     },
                     "relationships": {
@@ -517,9 +543,10 @@ def _resolve_final_url_body(state: ScrapeGraphState) -> None:
                 # swap below. Best-effort — failures don't block the
                 # handoff. See _propagate_canonical_to_parent_jp for
                 # the JP 3036 motivating incident.
-                _propagate_canonical_to_parent_jp(
-                    state.scrape_id, state.canonical_url
-                )
+                # Send the RAW landed URL. The api canonicalizes an inbound
+                # canonical_link at write now, so it owns the rules and this
+                # side does not have to know them.
+                _propagate_canonical_to_parent_jp(state.scrape_id, landed)
                 # Scrape ids are NanoID strings (CC-77) — int() would raise
                 # ValueError, get swallowed by the except below, and the
                 # child-scrape swap would silently fail (the child's outcome
@@ -633,7 +660,15 @@ class CheckLinkDedup(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no
     ) -> Union[DuplicateShortCircuit, WaitReadySelector]:
         started = time.time()
         state = ctx.state
-        canonical = state.canonical_url or state.submitted_url
+        # Send the RAW landed URL, not our canonicalized form. The api
+        # canonicalizes the filter value itself and builds a four-leg OR
+        # (link, apply_url, canonical_link, canonicalized apply_url), so
+        # handing it a pre-canonicalized string meant the composition was
+        # api(agents(u)) rather than api(u) — and since the stored `link` is
+        # the untouched original, the exact-`link` leg could then only match
+        # by luck. The two param sets are disjoint, not nested, so neither is
+        # a superset of the other.
+        canonical = state.final_url or state.submitted_url
         non_stub_id: str | None = None
         try:
             resp = httpx.get(
@@ -1290,18 +1325,21 @@ async def _adopt_declared_canonical(page, state: ScrapeGraphState) -> dict:
     if accepted is None:
         return extras
     absolute, source = accepted
-    try:
-        adopted = canonicalize_url(absolute)
-    except Exception:
-        logger.debug(
-            "Capture: declared-canonical adoption failed", exc_info=True
-        )
-        extras.setdefault("canonical_rejected", []).append(
-            {"source": source, "reason": "canonicalize_failed",
-             "candidate": absolute},
-        )
-        return extras
-    state.canonical_url = adopted
+    # Adopt the declaration AS THE PAGE STATED IT. This used to run through
+    # this module's canonicalize_url first, and the result was PATCHed
+    # straight onto JobPost.canonical_link by ReviewCompleteness — putting an
+    # agents-shaped value into the api's primary dedupe key, which its own
+    # matcher would never reproduce for the same input (disjoint param sets,
+    # no ScrapeProfile url_rewrites, and we strip `src` where the api
+    # deliberately keeps it). The api canonicalizes an inbound canonical_link
+    # at write, so it owns those rules and this file no longer guesses at them.
+    #
+    # Safe for the other readers: outside the persist hop and the trace
+    # payload, `state.canonical_url` is only ever read for its hostname
+    # (nodes_extract.py, nodes_obstacle.py), and canonicalization never
+    # touched the host. The sanity gates already ran on this candidate,
+    # per-rung, inside _read_declared_canonical.
+    state.canonical_url = absolute
     state.canonical_source = source
     logger.info(
         "Capture: adopted declared canonical source=%s url=%s",
