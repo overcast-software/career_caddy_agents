@@ -604,6 +604,20 @@ _LOADING_SHELL_PHRASES = (
 )
 _LOADING_SHELL_MIN_HITS = 2
 
+# persist-extraction outcomes meaning "the api matched us onto a JobPost row
+# that already existed and that we did not create". The api reaches a duplicate
+# two independent ways and reports them under two different strings:
+#   "duplicate"                  — link / canonical_link hit
+#                                  (lib/parsers/job_post_extractor.py:937)
+#   "duplicate_via_fingerprint"  — title+company hit, via a bare
+#                                  JobPost.objects.get_or_create(title=, company=)
+#                                  with no owner filter (:969-1009)
+# Both then merge empty fields only. Matching just the first string is a trap:
+# the fingerprint branch is precisely the one that fires when the scraped link
+# does NOT match the stored one — which is exactly the case a declared canonical
+# exists to describe. See ReviewCompleteness, which must not re-key such a row.
+_DUPLICATE_MATCH_OUTCOMES = frozenset({"duplicate", "duplicate_via_fingerprint"})
+
 _SOURCE_MIN_WORDS = 40
 
 # UI-chrome-only description fingerprint. LinkedIn's lazy-hydrated
@@ -752,7 +766,9 @@ class PersistJobPost(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no
             body = resp.json() if resp.status_code < 500 else {}
             meta = (body or {}).get("meta") or {}
             state.job_post_id = meta.get("job_post_id")
-            state.was_duplicate = (meta.get("outcome") == "duplicate")
+            state.was_duplicate = (
+                meta.get("outcome") in _DUPLICATE_MATCH_OUTCOMES
+            )
         except Exception:
             logger.warning("PersistJobPost: post failed", exc_info=True)
             trace_node(state, "PersistJobPost", "ExtractFail", started)

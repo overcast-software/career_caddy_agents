@@ -67,7 +67,11 @@ from unittest.mock import patch
 
 import pytest
 
-from scrape_graph.nodes_extract import ReviewCompleteness, UpdateProfile
+from scrape_graph.nodes_extract import (
+    PersistJobPost,
+    ReviewCompleteness,
+    UpdateProfile,
+)
 from scrape_graph.nodes_scrape import Capture, DetectClosedState
 from scrape_graph.state import ScrapeGraphState
 
@@ -829,3 +833,113 @@ def test_declared_canonical_persist_hop_still_fires_on_a_non_duplicate():
     ][-1]
     assert entry.payload["canonical_written"] is True
     assert "canonical_skipped" not in entry.payload
+
+
+# ---------------------------------------------------------------------------
+# CC-248 review follow-up: the duplicate guard is only as wide as the flag
+# that feeds it.
+#
+# The two tests above set `state.was_duplicate` BY HAND, so they pin the guard
+# in ReviewCompleteness but say nothing about what actually sets that flag.
+# PersistJobPost does, from the api's `meta.outcome` string — and the api
+# reaches a duplicate two ways under two names:
+#
+#   "duplicate"                 lib/parsers/job_post_extractor.py:937
+#                               link / canonical_link hit
+#   "duplicate_via_fingerprint" lib/parsers/job_post_extractor.py:1009
+#                               title+company hit, from a bare
+#                               JobPost.objects.get_or_create(title=, company=)
+#                               with NO owner filter, merging empty fields only
+#
+# An `== "duplicate"` test passes the fingerprint match straight through the
+# guard. That is not a corner: the fingerprint branch is reached precisely
+# when the link leg MISSES, i.e. when the stored link differs from the scraped
+# one — which is the exact situation a declared canonical exists to describe.
+# So the one outcome the guard most needed to catch was the one it dropped,
+# and the canonical_link of a pre-existing, possibly another user's, row would
+# be rewritten by the runner's staff token.
+# ---------------------------------------------------------------------------
+
+def _persist_state() -> ScrapeGraphState:
+    state = ScrapeGraphState(
+        scrape_id=SCRAPE_ID,
+        submitted_url="https://jobs.example.org/p/12?position=2",
+    )
+    state.parsed = {"title": "Staff Engineer"}
+    return state
+
+
+@pytest.mark.parametrize(
+    "outcome, expected",
+    [
+        ("duplicate", True),
+        ("duplicate_via_fingerprint", True),   # the branch the guard dropped
+        ("created", False),
+        ("updated_stub", False),
+        ("force_updated", False),
+    ],
+)
+def test_declared_canonical_duplicate_flag_covers_both_api_outcomes(
+    outcome, expected,
+):
+    """`was_duplicate` must be true for EVERY outcome that means "the api
+    pointed us at a row it did not create for us".
+    """
+    state = _persist_state()
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"meta": {"job_post_id": JOB_POST_ID, "outcome": outcome}}
+
+    with patch("scrape_graph.nodes_extract.httpx.post", return_value=_Resp()), \
+            patch("scrape_graph.tracing._post_transition"):
+        _run(PersistJobPost(), state)
+
+    assert state.job_post_id == JOB_POST_ID
+    assert state.was_duplicate is expected
+
+
+def test_declared_canonical_not_rekeyed_on_a_fingerprint_duplicate():
+    """End to end for the branch the first fix missed: a fingerprint duplicate
+    must reach ReviewCompleteness with the guard armed, so no PATCH is sent.
+
+    This is the test that bites. With `== "duplicate"` the flag comes back
+    False here and the hop PATCHes canonical_link onto a row the api merely
+    matched us onto.
+    """
+    state = _persist_state()
+    state.canonical_url = "https://jobs.example.org/p/12"
+    state.canonical_source = "link_rel"
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "meta": {
+                    "job_post_id": JOB_POST_ID,
+                    "outcome": "duplicate_via_fingerprint",
+                },
+            }
+
+    with patch("scrape_graph.nodes_extract.httpx.post", return_value=_Resp()), \
+            patch("scrape_graph.tracing._post_transition"):
+        _run(PersistJobPost(), state)
+
+    assert state.was_duplicate is True
+
+    with patch("scrape_graph.nodes_extract.httpx.patch") as mock_patch, \
+            patch("scrape_graph.tracing._post_transition"):
+        mock_patch.return_value.status_code = 200
+        _run(ReviewCompleteness(), state)
+
+    assert mock_patch.call_count == 0
+    entry = [
+        e for e in state.node_trace if e.node == "ReviewCompleteness"
+    ][-1]
+    assert entry.payload["canonical_skipped"] == "duplicate_target"
+    assert entry.payload["canonical_written"] is False
