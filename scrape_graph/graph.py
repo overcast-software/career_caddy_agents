@@ -41,6 +41,7 @@ from .nodes_scrape import (
     DetectClosedState,
     DuplicateShortCircuit,
     ExpandTruncations,
+    LandingPageFail,
     LoadProfile,
     Navigate,
     PersistScrape,
@@ -59,7 +60,8 @@ from .state import ScrapeGraphState
 __all_nodes__ = (
     StartScrape, LoadProfile, Navigate, ResolveFinalUrl, CheckLinkDedup,
     DuplicateShortCircuit, WaitReadySelector, SettleWait, ScrollToLoad,
-    ExpandTruncations, Capture, DetectClosedState, PersistScrape, DetectObstacle,
+    ExpandTruncations, Capture, LandingPageFail, DetectClosedState,
+    PersistScrape, DetectObstacle,
     ObstacleRememberMe, ObstacleWaitRetry, ObstacleAgent, ObstacleFail,
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
     EvaluateExtraction, ValidateExtraction, PersistJobPost,
@@ -85,7 +87,7 @@ _SCRAPE_NODES = [
     ResolveFinalUrl, CheckLinkDedup,
     DuplicateShortCircuit, WaitReadySelector, SettleWait, ScrollToLoad,
     ExpandTruncations,
-    Capture, DetectClosedState, PersistScrape,
+    Capture, LandingPageFail, DetectClosedState, PersistScrape,
     StartExtract, Tier0CSS, Tier1Mini, Tier2Haiku, Tier3Sonnet,
     EvaluateExtraction, ValidateExtraction, PersistJobPost,
     ReviewCompleteness, UpdateProfile, ResolveApplyUrl, ExtractFail,
@@ -246,7 +248,26 @@ NODE_META: dict[str, dict[str, str]] = {
         "description": (
             "Reads page.inner_text('body') and page.content() into "
             "state.job_content / state.html. This is the moment the "
-            "browser is 'done'."
+            "browser is 'done'. Then runs the CC-226 landing-page guard "
+            "over the text it just captured: a page that never matched "
+            "the profile's ready_selector and carries search-listing "
+            "signature routes to LandingPageFail instead of paying for "
+            "the closed-state LLM, the full-DOM PATCH and the tier ladder."
+        ),
+    },
+    "LandingPageFail": {
+        "group": "terminal", "label": "Landing page fail",
+        "description": (
+            "Terminal: the page we landed on is a search-listing or "
+            "interstitial, not a job posting. Fires only when the profile "
+            "HAD a ready_selector, nothing ever matched it (neither "
+            "WaitReadySelector nor ScrollToLoad), at least two independent "
+            "landing signals are present (result counts, listing controls, "
+            "a what/where search form, a search-shaped URL) and fewer than "
+            "two job-detail phrases are. Exists so these stop burning the "
+            "runner's 240s graph cap in the extraction ladder and become "
+            "queryable apart from real timeouts: outcome='failure' with "
+            "failure_reason='landing_page_not_detail'."
         ),
     },
     "DetectClosedState": {

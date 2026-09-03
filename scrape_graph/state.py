@@ -137,6 +137,14 @@ class ScrapeGraphState:
     html: Optional[str] = None
     job_content: Optional[str] = None
     screenshot_name: Optional[str] = None
+    # The profile ready_selector that actually matched, if any — writers =
+    # WaitReadySelector and ScrollToLoad (both, and only on a hit; neither
+    # ever clears it). Distinct from `candidate_ready_selector`, which is
+    # a DISCOVERED selector proposed back to the profile. Capture reads it
+    # as the precondition for the CC-226 landing-page fast-fail: a page
+    # whose detail anchor appeared at any point is a detail page, whatever
+    # listing furniture surrounds it.
+    matched_ready_selector: Optional[str] = None
     candidate_ready_selector: Optional[str] = None
     candidate_obstacle_click_selector: Optional[str] = None
     discovered_selectors: Optional[dict] = None  # e.g. {"title": "h1", "company": ".company"}

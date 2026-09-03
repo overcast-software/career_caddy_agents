@@ -21,11 +21,19 @@ import httpx
 from pydantic_graph import BaseNode, End, GraphRunContext
 
 from browser.resident import is_driver_closed
+from .landing_page_detector import detect_landing_page
 from .state import ScrapeGraphState
 from .tracing import trace_node
 from .url_canonicalize import apply_url_rewrites, canonicalize_url, urls_differ
 
 logger = logging.getLogger(__name__)
+
+# CC-226. The distinct terminal note for a page that is a search-landing /
+# interstitial rather than a job detail page. Deliberately NOT the generic
+# "graph run exceeded 240s cap" the runner writes on a timeout, nor
+# ExtractFail's "extraction" — the whole point of the ticket is that these
+# are queryable apart from real timeouts and real extraction failures.
+_LANDING_PAGE_FAILURE_REASON = "landing_page_not_detail"
 
 
 def _reraise_if_driver_closed(exc: BaseException) -> None:
@@ -113,6 +121,10 @@ class Capture(BaseNode[ScrapeGraphState, None, dict]):
 
 
 class DetectClosedState(BaseNode[ScrapeGraphState, None, dict]):
+    pass
+
+
+class LandingPageFail(BaseNode[ScrapeGraphState, None, dict]):
     pass
 
 
@@ -823,6 +835,10 @@ class WaitReadySelector(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore
                         matched_selector = sel
                         matched_index = idx
                         matched_pass = passes
+                        # CC-226: record the hit on state so Capture's
+                        # landing-page guard knows the detail anchor
+                        # appeared and must not refuse the page.
+                        state.matched_ready_selector = sel
                         break
                 # If the entire pass returned in negligible wall time
                 # (no real Playwright sleeping), we're in test/fake
@@ -925,6 +941,9 @@ class ScrollToLoad(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-r
                             handle = await page.query_selector(sel)
                             if handle is not None:
                                 matched = sel
+                                # CC-226: a late hydration hit still means
+                                # this is a detail page — tell Capture.
+                                state.matched_ready_selector = sel
                                 break
                         except Exception as exc:
                             _reraise_if_driver_closed(exc)
@@ -988,7 +1007,7 @@ class ExpandTruncations(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore
 class Capture(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
-    ) -> "DetectClosedState":
+    ) -> Union["DetectClosedState", "LandingPageFail"]:
         started = time.time()
         state = ctx.state
         page = getattr(state, "_browser_page", None)
@@ -1026,16 +1045,42 @@ class Capture(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
 
             await _screenshot_and_upload(page, state)
             await _discover_selectors(page, state)
+
+        # CC-226 — search-landing / interstitial fast-fail. The screenshot
+        # above is already banked, so the post-mortem is intact; what we
+        # are cutting is everything AFTER this point on a page that will
+        # never yield a posting: DetectClosedState's LLM leg, a full-DOM
+        # PATCH, and the tier ladder whose two LLM rungs carry 120s
+        # timeouts each and can reach the runner's 240s graph cap on their
+        # own. Costs one regex pass over text we already hold.
+        selectors = _normalize_ready_selectors(
+            (state.profile or {}).get("ready_selector")
+        )
+        landing = detect_landing_page(
+            state.job_content or "",
+            url=state.final_url or state.canonical_url or state.submitted_url or "",
+            ready_selector_configured=bool(selectors),
+            ready_selector_matched=bool(state.matched_ready_selector),
+        )
+        capture_payload = {
+            "canonical_source": state.canonical_source,
+            "canonical_url": state.canonical_url,
+            "matched_ready_selector": state.matched_ready_selector,
+            **canonical_trace,
+        }
+        if landing:
+            state.failure_reason = _LANDING_PAGE_FAILURE_REASON
+            trace_node(
+                state, "Capture", "LandingPageFail", started,
+                {**capture_payload, "landing_page": landing},
+            )
+            return LandingPageFail()
+
         # DetectClosedState runs while DOM is still live so the CSS path
         # can probe the page; passes through to PersistScrape regardless
         # of verdict (closed-state is metadata, never terminal).
         trace_node(
-            state, "Capture", "DetectClosedState", started,
-            {
-                "canonical_source": state.canonical_source,
-                "canonical_url": state.canonical_url,
-                **canonical_trace,
-            },
+            state, "Capture", "DetectClosedState", started, capture_payload,
         )
         return DetectClosedState()
 
@@ -1646,6 +1691,57 @@ class DetectClosedState(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore
 
 
 @dataclass
+class LandingPageFail(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
+    """Terminal: the page we landed on is a search-listing / interstitial,
+    not a job detail page (CC-226).
+
+    Same shape as ObstacleFail — snapshot first, then finalize — with one
+    difference that matters: Capture has already banked a screenshot, and
+    PersistScrape never ran, so `scrape.html` is still empty. That is
+    exactly the case `capture_debug_artifact`'s write-to-empty branch
+    exists for, which means the admin UI's "view raw html" link works on
+    these rows without the full-DOM PATCH the happy path pays for.
+
+    The failure_reason is its own string rather than a reuse of
+    "extraction" or the runner's timeout note, because the ticket's ask is
+    that these become queryable APART from real timeouts: before this
+    node, a landing page and a genuinely stuck node were the same row.
+    """
+
+    async def run(
+        self, ctx: GraphRunContext[ScrapeGraphState, None]
+    ) -> End[dict]:
+        from ._artifacts import capture_debug_artifact
+        started = time.time()
+        state = ctx.state
+        state.outcome = "failure"
+        state.failure_reason = state.failure_reason or _LANDING_PAGE_FAILURE_REASON
+
+        page = getattr(state, "_browser_page", None)
+        artifact_info: dict = {}
+        try:
+            artifact_info = await capture_debug_artifact(
+                page, state, reason="landing_page",
+            )
+        except Exception:
+            logger.warning(
+                "LandingPageFail: debug artifact capture failed scrape_id=%s",
+                state.scrape_id, exc_info=True,
+            )
+
+        _patch_scrape_status(state.scrape_id, "failed", note=state.failure_reason)
+        trace_node(
+            state, "LandingPageFail", "End", started,
+            payload=artifact_info or None,
+        )
+        return End({
+            "outcome": "failure",
+            "failure_reason": state.failure_reason,
+            "scrape_id": state.scrape_id,
+        })
+
+
+@dataclass
 class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-redef]
     async def run(
         self, ctx: GraphRunContext[ScrapeGraphState, None]
@@ -1872,6 +1968,7 @@ __all__ = [
     "ScrollToLoad",
     "ExpandTruncations",
     "Capture",
+    "LandingPageFail",
     "PersistScrape",
     "SkipBrowserTier",
 ]
