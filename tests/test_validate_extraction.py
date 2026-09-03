@@ -120,6 +120,167 @@ def test_validate_passes_on_real_description_short_but_meaningful():
     assert isinstance(next_node, PersistJobPost)
 
 
+# ── CC-118: error / 404 / dead-posting pages ────────────────────────────
+
+# A 404 rendered by a real ATS still ships the host's nav + footer, so it
+# clears _SOURCE_MIN_WORDS comfortably. That is exactly why the word-count
+# floor never caught these.
+_ERROR_PAGE_SOURCE = (
+    "Visa Careers Search Jobs Sign In Create Account Help "
+    "Job Posting Not Found The page you are looking for doesn't exist. "
+    "Return to the job search page to browse current openings. "
+    "About Visa Investor Relations Newsroom Careers Contact Us "
+    "Privacy Notice Terms of Use Cookie Preferences Accessibility "
+    "Copyright 2026 Visa Inc. All Rights Reserved Follow us on social media"
+)
+
+
+def test_validate_rejects_404_error_page():
+    """Workday /apply deep-link repro (JobPost 2w4MaSFCra). The capture
+    clears the 40-word floor on nav chrome alone and matches no loading-
+    shell phrase, so before CC-118 a `title="Not Found"` extraction went
+    straight to PersistJobPost — minting a junk post AND banking a false
+    success against the host's success_rate.
+    """
+    state = ScrapeGraphState(
+        scrape_id="FeTWuow8AR",
+        submitted_url=(
+            "https://visa.wd5.myworkdayjobs.com/en-US/Visa/job/"
+            "Sr-Consultant-SW-Engineer_REF080924W/apply?isWholefeeds=1"
+        ),
+    )
+    state.parsed = {
+        "title": "Not Found",
+        "company_name": "Visa",
+        "description": "The page you are looking for doesn't exist.",
+    }
+    state.job_content = _ERROR_PAGE_SOURCE
+    next_node = _run(ValidateExtraction(), state)
+    assert isinstance(next_node, ExtractFail)
+    assert "error_page" in state.evaluation["validate_reasons"]
+    assert state.evaluation["validate_passed"] is False
+    assert state.failure_reason.startswith("validate_failed:")
+
+
+def test_validate_rejects_job_posting_not_found_title():
+    """Second junk post from the same batch (YGYTFc7iLf)."""
+    state = ScrapeGraphState(scrape_id="YGYTFc7iLf", submitted_url="https://x.com/job/9")
+    state.parsed = {
+        "title": "Job Posting Not Found",
+        "company_name": "Visa",
+        "description": "The page you are looking for doesn't exist.",
+    }
+    state.job_content = _ERROR_PAGE_SOURCE
+    next_node = _run(ValidateExtraction(), state)
+    assert isinstance(next_node, ExtractFail)
+    assert "error_page" in state.evaluation["validate_reasons"]
+
+
+def test_validate_rejects_error_title_with_site_name_suffix():
+    """Hosts append their own name to the <title>. A sentinel hiding
+    behind ' | Acme Careers' must still be caught.
+    """
+    state = ScrapeGraphState(scrape_id="a1", submitted_url="https://acme.com/jobs/1")
+    state.parsed = {
+        "title": "404 | Acme Careers",
+        "company_name": "Acme",
+        "description": "Sorry, we can't find that.",
+    }
+    state.job_content = _ERROR_PAGE_SOURCE
+    next_node = _run(ValidateExtraction(), state)
+    assert isinstance(next_node, ExtractFail)
+    assert "error_page" in state.evaluation["validate_reasons"]
+
+
+def test_validate_rejects_dead_posting_body_behind_an_honest_stub():
+    """The body-sentinel arm. When a tier invents prose off a dead
+    posting, EvaluateExtraction's grounding check demotes it to an honest
+    stub — so the only surviving evidence is in the captured source. A
+    stub is worth persisting when the posting is real; on a dead page it
+    is a junk row with a plausible title, so refuse.
+    """
+    state = ScrapeGraphState(scrape_id="b2", submitted_url="https://boards.x.com/job/2")
+    state.parsed = {
+        "title": "Senior Platform Engineer",
+        "company_name": "Acme",
+        "description": (
+            "[DESCRIPTION NOT CAPTURED — the scrape reached this posting "
+            "but could not read its description (the page returned no "
+            "description body). Re-scrape the link, or send the page from "
+            "the browser extension while it is open.]"
+        ),
+    }
+    state.job_content = (
+        "Acme Careers Search Openings Departments Locations Sign In "
+        "Create an account to track your applications. "
+        "This job posting no longer exists. It may have been filled or "
+        "withdrawn. Browse our current openings instead. "
+        "About Acme Newsroom Investors Diversity Benefits Life at Acme "
+        "Privacy Terms Cookie Preferences Accessibility Statement "
+        "Copyright 2026 Acme Inc. All Rights Reserved"
+    )
+    next_node = _run(ValidateExtraction(), state)
+    assert isinstance(next_node, ExtractFail)
+    assert "error_page" in state.evaluation["validate_reasons"]
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Error Budget Engineer",
+        "Site Reliability Engineer",
+        "Senior Engineer - Remote",
+        "Lost and Found Operations Coordinator",
+        "Oops Media — Content Designer",
+    ],
+)
+def test_validate_passes_titles_that_merely_contain_error_words(good_state, title):
+    """False-positive guard. The title check is EXACT after
+    normalization; a substring test would eat every one of these.
+    """
+    good_state.parsed = {**good_state.parsed, "title": title}
+    next_node = _run(ValidateExtraction(), good_state)
+    assert isinstance(next_node, PersistJobPost)
+    assert good_state.evaluation["validate_reasons"] == []
+
+
+def test_validate_passes_real_posting_that_quotes_a_dead_posting_phrase():
+    """A real body long enough to be prose is not an error page even when
+    it contains one of the body sentinels verbatim.
+    """
+    state = ScrapeGraphState(scrape_id="c3", submitted_url="https://x.com/job/3")
+    state.parsed = {
+        "title": "Backend Engineer",
+        "company_name": "Acme",
+        "description": (
+            "Responsibilities: keep our job board honest. You will build "
+            "the sweeper that marks a listing dead the moment the position "
+            "is no longer available, and the notifier that tells applicants "
+            "before they waste a submission. Requirements: 5+ years of "
+            "Python, comfort with distributed systems, and the patience to "
+            "chase down every last stale record in a very large table. "
+            "Experience with Django and Postgres is a strong plus."
+        ),
+    }
+    state.job_content = " ".join(["word"] * 80)
+    next_node = _run(ValidateExtraction(), state)
+    assert isinstance(next_node, PersistJobPost)
+
+
+def test_validate_passes_real_workday_posting(good_state):
+    """The non-404 Workday page the guard must never touch."""
+    good_state.parsed = {
+        "title": "Sr. Consultant, SW Engineer",
+        "company_name": "Visa",
+        "description": (
+            "Requirements: 8+ years of software engineering experience. "
+            "You will design and build payment infrastructure at scale."
+        ),
+    }
+    next_node = _run(ValidateExtraction(), good_state)
+    assert isinstance(next_node, PersistJobPost)
+
+
 def test_validate_preserves_prior_evaluation(good_state):
     good_state.evaluation = {"passed": True, "reasons": []}
     _run(ValidateExtraction(), good_state)
