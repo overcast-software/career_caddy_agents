@@ -1789,10 +1789,14 @@ class PersistScrape(BaseNode[ScrapeGraphState, None, dict]):  # type: ignore[no-
         # via the same shared helper the Fail path uses — a LinkedIn DOM is
         # multi-MB and the success path would otherwise PATCH it uncapped.
         # Covers both the Capture-set html and the re-grab above, since both
-        # land in state.html before this gate.
+        # land in state.html before this gate. truncate_dom strips
+        # script/style before it cuts (CC-284) so a head-heavy host still
+        # persists its <body>, and marks the html loudly if it cannot.
         if state.html:
             from ._artifacts import truncate_dom
-            attributes["html"] = truncate_dom(state.html)
+            attributes["html"] = truncate_dom(
+                state.html, scrape_id=state.scrape_id,
+            )
 
         try:
             httpx.patch(

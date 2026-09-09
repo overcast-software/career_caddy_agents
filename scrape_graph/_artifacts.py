@@ -37,10 +37,33 @@ logger = logging.getLogger(__name__)
 
 _MAX_DOM_BYTES = 200_000
 _DOM_TRUNCATION_TRAILER = "\n<!-- [truncated] -->"
+_DOM_NOISE_STRIPPED_TRAILER = (
+    "\n<!-- [script/style stripped to fit the capture cap] -->"
+)
+# Loud marker for the one outcome that used to be silent: the cap landing
+# before <body>, so the persisted DOM is a <head> and nothing else. Probing
+# for it is a substring check on the stored html — no size arithmetic.
+# The marker text deliberately spells the tag out rather than writing
+# "<body>", so that probing the stored html for "<body" (here and in the
+# enhancer) cannot match the marker announcing the tag's absence.
+_DOM_BODY_LOST_TRAILER = (
+    "\n<!-- [truncated BEFORE the opening BODY tag"
+    " — NO body markup persisted] -->"
+)
+
+# Hard ceiling on what we hand the api, matching the historical maximum
+# (`_MAX_DOM_BYTES` + the truncation trailer = 200_021 bytes) so the 200KB
+# column expectation from CC-134 holds no matter which trailer we append.
+_MAX_PERSISTED_BYTES = _MAX_DOM_BYTES + len(_DOM_TRUNCATION_TRAILER)
 
 
-def truncate_dom(dom: str) -> str:
-    """Cap a captured DOM at ``_MAX_DOM_BYTES`` with a truncation trailer.
+def _has_body_markup(html: str) -> bool:
+    """True when ``html`` reaches the opening ``<body>`` tag."""
+    return "<body" in html.lower()
+
+
+def truncate_dom(dom: str, *, scrape_id: object = None) -> str:
+    """Cap a captured DOM at ``_MAX_DOM_BYTES``, keeping ``<body>`` if we can.
 
     Shared by every path that persists ``scrape.html`` — the Fail-path
     debug-artifact backfill (``capture_debug_artifact`` below) and the
@@ -48,10 +71,70 @@ def truncate_dom(dom: str) -> str:
     Cloudflare DOM can be multiple MB; without a cap the success path
     would PATCH the whole thing on every scrape. Keeping the cap + the
     trailer convention in one place means both paths stay in lockstep.
+
+    The cap is a PREFIX slice, which on a head-heavy host threw the whole
+    document away: jobright.ai is a Next.js app whose 27 stylesheet links
+    plus inline Ant Design / emotion critical CSS blow 200KB before
+    ``<body>`` is ever reached, so the persisted DOM held zero ``div`` /
+    ``a`` / ``button`` elements while ``html_size_bytes`` reported a
+    healthy 200,021. Nothing said so — every selector probe just returned
+    ``match_count: 0``. That is PACA CC-284.
+
+    So an oversized DOM now takes three steps, not one:
+
+    1. Strip ``<script>`` / ``<style>`` (JSON-LD kept — see
+       ``lib.scrape_inspector.strip_dom_noise``). This is the read-time
+       prune behind ``inspect_scrape_html`` moved earlier, and it takes
+       jobright from 200KB+ to a few KB, so the entire body fits.
+    2. If the stripped DOM fits, persist all of it.
+    3. Only if it STILL does not fit, slice — and if the slice lands
+       before ``<body>``, say so loudly: a distinct trailer on the stored
+       html and a WARNING log line, rather than a healthy-looking row.
+
+    Under-cap DOMs are returned byte-for-byte unchanged, as before; the
+    strip only ever runs on documents that would otherwise be cut.
     """
-    if len(dom) > _MAX_DOM_BYTES:
-        return dom[:_MAX_DOM_BYTES] + _DOM_TRUNCATION_TRAILER
-    return dom
+    if len(dom) <= _MAX_DOM_BYTES:
+        return dom
+
+    original_len = len(dom)
+    try:
+        from lib.scrape_inspector import strip_dom_noise
+
+        stripped = strip_dom_noise(dom)
+    except Exception:
+        # Best-effort: a bs4 parse failure must never cost us the capture.
+        logger.warning(
+            "truncate_dom: noise strip failed scrape_id=%s", scrape_id,
+            exc_info=True,
+        )
+        stripped = dom
+
+    if len(stripped) <= _MAX_DOM_BYTES - len(_DOM_NOISE_STRIPPED_TRAILER):
+        logger.info(
+            "truncate_dom: script/style strip fit the cap scrape_id=%s "
+            "%d -> %d bytes",
+            scrape_id, original_len, len(stripped),
+        )
+        return stripped + _DOM_NOISE_STRIPPED_TRAILER
+
+    dom = stripped if len(stripped) < original_len else dom
+    cut = dom[:_MAX_DOM_BYTES]
+    if _has_body_markup(cut):
+        return cut + _DOM_TRUNCATION_TRAILER
+
+    logger.warning(
+        "truncate_dom: cap landed BEFORE the opening BODY tag scrape_id=%s "
+        "— persisting a head-only DOM "
+        "(%d bytes captured, %d after script/style strip). "
+        "Tier-0 selector work on this host is impossible until the pre-body "
+        "markup shrinks. See PACA CC-284.",
+        scrape_id, original_len, len(stripped),
+    )
+    # Reserve room for the longer trailer so the persisted value never
+    # exceeds the historical `_MAX_PERSISTED_BYTES` ceiling.
+    cut = dom[: _MAX_PERSISTED_BYTES - len(_DOM_BODY_LOST_TRAILER)]
+    return cut + _DOM_BODY_LOST_TRAILER
 
 
 def _api_base() -> str:
@@ -177,7 +260,7 @@ async def capture_debug_artifact(
         dom = None
 
     if dom:
-        dom = truncate_dom(dom)
+        dom = truncate_dom(dom, scrape_id=state.scrape_id)
         # Use the api to check if scrape.html is already set. Read-first-
         # then-maybe-write costs a round trip but keeps us from silently
         # overwriting a successful captured DOM. On any read/write
