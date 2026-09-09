@@ -1,0 +1,31 @@
+# Build-context hygiene (CC-233).
+#
+# The Dockerfile ends with `COPY . /app`, which copies the whole checkout.
+# Without this file every image built from a working tree carried the host
+# `.venv` (a ~370 MB dead layer — the image rebuilds its own venv on top of
+# it), plus tool caches and operator-only files. That is the whole of the
+# 413 MB -> 657 MB growth the ticket recorded; the dependency layer itself
+# grew 11 MB.
+#
+# Dagger's build_ai already strips .venv and screenshots; this makes a plain
+# `docker build` behave the same way.
+.git
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.logfire
+.claude
+.vscode
+.envrc
+screenshots
+
+# Operator-only. Never belongs in an image, whatever built it.
+secrets.yml
+.env
+.env.*
+!.env.prod.example
+notes.org
+notes.org_archive
