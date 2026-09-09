@@ -105,6 +105,40 @@ def _strip_noise(soup: BeautifulSoup) -> None:
             img.decompose()
 
 
+def strip_dom_noise(html: str) -> str:
+    """Drop `<script>` / `<style>` bulk from a captured DOM, keeping JSON-LD.
+
+    The CAPTURE-time counterpart to `_strip_noise`, which is the READ-time
+    prune behind `trim_html` / `extract_skeleton`. It is deliberately
+    narrower than `_strip_noise` in two ways, and both are load-bearing:
+
+    - **JSON-LD survives.** `<script type="application/ld+json">` is the
+      Tier-0 JSON-LD extractor's only input (`jsonld_extract_job_data`).
+      `_strip_noise` decomposes every `<script>`, which is correct when the
+      output is going to an LLM and fatal when the output is the DOM we
+      persist for later re-extraction.
+    - **Structure survives.** `svg` / `iframe` / `noscript` / `template` and
+      the attribute scrub stay, because the persisted DOM is an archive of
+      what the browser saw, not a token-budgeted summary of it.
+
+    Used by `scrape_graph._artifacts.truncate_dom` to get a head-heavy host
+    under the persistence cap without losing `<body>`. See PACA CC-284.
+    Returns `html` unchanged when there is nothing to strip.
+    """
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    stripped = False
+    for tag in soup.find_all(("script", "style")):
+        if tag.name == "script":
+            tag_type = (tag.get("type") or "").strip().lower()
+            if "ld+json" in tag_type:
+                continue
+        tag.decompose()
+        stripped = True
+    return str(soup) if stripped else html
+
+
 def trim_html(html: str, limit_chars: int = _MAX_OUTPUT_CHARS) -> str:
     """Return `html` with noise tags / attrs / comments stripped.
 

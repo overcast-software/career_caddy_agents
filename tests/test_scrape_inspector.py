@@ -17,6 +17,7 @@ from lib.scrape_inspector import (
     find_selectors_for_text,
     jsonld_extract_job_data,
     query_selector,
+    strip_dom_noise,
     trim_html,
 )
 
@@ -146,6 +147,58 @@ def test_trim_respects_char_limit_with_truncation_sentinel():
     out = trim_html(huge, limit_chars=2_000)
     assert len(out) <= 2_100  # 2k cap + sentinel
     assert "truncated at" in out
+
+
+# --- strip_dom_noise ----------------------------------------------------------
+
+
+def test_strip_dom_noise_drops_scripts_and_styles():
+    out = strip_dom_noise(_LINKEDIN_LIKE_HTML)
+    assert "<script>" not in out
+    assert "<style>" not in out
+
+
+def test_strip_dom_noise_keeps_jsonld():
+    """CC-284 — the capture-time strip must not eat Tier-0's JSON-LD input.
+
+    `_strip_noise` (the read-time prune) decomposes every `<script>`, which
+    is right for an LLM-facing summary and wrong for a DOM we persist and
+    re-extract from later.
+    """
+    html = (
+        '<html><head>'
+        '<script>window.__NEXT_DATA__ = 1;</script>'
+        '<script type="application/ld+json">{"@type": "JobPosting"}</script>'
+        '</head><body><div id="x">hi</div></body></html>'
+    )
+    out = strip_dom_noise(html)
+    assert '"@type": "JobPosting"' in out
+    assert "__NEXT_DATA__" not in out
+    assert 'id="x"' in out
+
+
+def test_strip_dom_noise_keeps_structure_and_attrs():
+    """Narrower than `_strip_noise`: svg/iframe and the attrs all survive."""
+    html = (
+        '<html><body>'
+        '<svg viewBox="0 0 1 1"></svg>'
+        '<iframe src="/embed"></iframe>'
+        '<a href="/apply" onclick="track()" data-tracking="x">Apply</a>'
+        '</body></html>'
+    )
+    out = strip_dom_noise(html)
+    assert "<svg" in out
+    assert "<iframe" in out
+    assert "onclick" in out
+    assert "data-tracking" in out
+
+
+def test_strip_dom_noise_returns_input_unchanged_when_nothing_to_strip():
+    """No reserialization when there is no noise — the persisted capture
+    stays byte-for-byte what the browser handed us."""
+    html = '<html><head><link rel="stylesheet" href="/a.css"></head><body>ok</body></html>'
+    assert strip_dom_noise(html) == html
+    assert strip_dom_noise("") == ""
 
 
 # --- extract_skeleton ---------------------------------------------------------
