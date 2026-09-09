@@ -143,8 +143,25 @@ _CANDIDATE_SCAN_JS = r"""
       .join("");
     return tag + classes.map((c) => `.${c}`).join("") + dataAttrs;
   };
+  // Pass 3 gate: a tagless element only counts as a control if it LOOKS
+  // clickable. Attribute checks first — getComputedStyle forces style
+  // resolution and is the expensive one, so it goes last.
+  const clickAffordance = (el) => {
+    if (el.hasAttribute("onclick") || typeof el.onclick === "function") {
+      return "onclick handler";
+    }
+    const ti = el.getAttribute("tabindex");
+    if (ti !== null && ti !== "-1") { return "tabindex"; }
+    try {
+      const cs = window.getComputedStyle(el);
+      if (cs && cs.cursor === "pointer") { return "cursor: pointer"; }
+    } catch (e) { /* detached / cross-origin — no affordance signal */ }
+    return null;
+  };
   const out = [];
+  const seen = new Set();
   for (const a of document.querySelectorAll("a[href]")) {
+    seen.add(a);
     const href = a.href || a.getAttribute("href") || "";
     const text = (a.innerText || "").trim().slice(0, 100);
     const aria = a.getAttribute("aria-label") || "";
@@ -164,6 +181,7 @@ _CANDIDATE_SCAN_JS = r"""
     });
   }
   for (const b of document.querySelectorAll('button, [role="button"]')) {
+    seen.add(b);
     const text = (b.innerText || "").trim().slice(0, 100);
     const aria = b.getAttribute("aria-label") || "";
     let score = 0;
@@ -180,6 +198,51 @@ _CANDIDATE_SCAN_JS = r"""
       reason: reasons.join(" AND "),
     });
   }
+  // Pass 3 — div/span-rendered controls (CC-285). jobright.ai's
+  // "Apply on Employer Site", the only control that leads to the real
+  // ATS, is a plain div and is invisible to both passes above; the two
+  // buttons that ARE visible are decoys. Gated on applyish text AND a
+  // click affordance so a text-heavy page cannot flood the list, and
+  // capped independently of max_candidates.
+  const EXTRA_CAP = 15;
+  const MAX_TEXT = 120;
+  let extra = 0;
+  for (const el of document.querySelectorAll('div, span, a:not([href])')) {
+    if (extra >= EXTRA_CAP) break;
+    if (seen.has(el)) continue;
+    const full = (el.innerText || "").trim();
+    const text = full.slice(0, 100);
+    const aria = el.getAttribute("aria-label") || "";
+    if (!isApplyish(text) && !isApplyish(aria)) continue;
+    // Cheap containment guard, applied before any subtree walk: a page
+    // section is not a control. Everything past here has a small subtree.
+    if (full.length > MAX_TEXT) continue;
+    // A wrapper whose applyish text comes from a nested element is not
+    // itself the control — the inner one is the candidate, not this.
+    if (el.querySelector('a[href], button, [role="button"]')) continue;
+    let wrapsInner = false;
+    for (const d of el.querySelectorAll("*")) {
+      if (isApplyish(d.innerText || "")) { wrapsInner = true; break; }
+    }
+    if (wrapsInner) continue;
+    const affordance = clickAffordance(el);
+    if (!affordance) continue;
+    let score = 0;
+    const reasons = [];
+    if (isApplyish(text)) { score += 0.4; reasons.push("text 'apply'"); }
+    if (isApplyish(aria)) { score += 0.3; reasons.push("aria-label 'apply'"); }
+    if (score === 0) continue;
+    reasons.push(affordance);
+    out.push({
+      selector: buildSelector(el),
+      href: null,
+      text: text,
+      tag: el.tagName.toLowerCase(),
+      score: Math.min(score, 1),
+      reason: reasons.join(" AND "),
+    });
+    extra += 1;
+  }
   return out;
 })()
 """
@@ -195,10 +258,17 @@ async def scan_apply_candidates(page: Any, max_candidates: int = 50) -> list[dic
     ``ScrapeProfile.apply_resolver_config`` is a separate slice; this
     function is capture-only.
 
+    Three passes: ``a[href]``, then ``button, [role="button"]``, then
+    (CC-285) ``div, span, a:not([href])`` gated on applyish text AND a
+    click affordance and capped at 15, so div-rendered controls are
+    visible without a text-heavy page flooding the list.
+
     Returns a list of ``{"selector", "href", "text", "tag", "score",
     "reason"}`` dicts, sorted by score descending, capped at
-    ``max_candidates`` (default 50). Empty list if the page is None or
-    the scan crashes — never raises.
+    ``max_candidates`` (default 50). ``tag`` is the element's own tag
+    name, so a consumer can tell a ``div`` (no href to read) from an
+    href-bearing anchor without re-deriving it. Empty list if the page is
+    None or the scan crashes — never raises.
     """
     if page is None:
         return []
