@@ -50,7 +50,12 @@ from browser.engine import (
     get_engine,
     launch_browser,
 )
-from browser.resident import ResidentBrowser, ResidentDriverDead, is_driver_closed
+from browser.resident import (
+    ResidentBrowser,
+    ResidentDriverDead,
+    ResidentSupervisor,
+    is_driver_closed,
+)
 from lib.url_unwrap import unwrap_url
 
 # Module-level resident browser; set by the headed main() before the poll loop.
@@ -61,9 +66,26 @@ _RESIDENT: ResidentBrowser | None = None
 # whose relaunch keeps failing would otherwise poll claim-next forever and
 # drain the hold queue into `failed` rows (CC-141). Small bound, loud error.
 _DRIVER_DEATH_BACKOFF_THRESHOLD = 3
-# Seconds to sleep after the threshold trips, on top of POLL_INTERVAL, to
-# give a supervisor (systemd Restart / operator) time to respawn the browser.
+# Seconds to sleep once the runner has given up on recovering the browser, on
+# top of POLL_INTERVAL. Reached only when a resident's process relaunch has
+# also failed its budget (CC-172) or when there is no resident to relaunch —
+# i.e. the host genuinely cannot run a browser.
 _DRIVER_DEATH_BACKOFF_SECONDS = 120
+
+# Bounds on browser-PROCESS relaunches (CC-172). Consecutive launch FAILURES
+# and consecutive relaunches that produced no completed scrape are counted
+# separately: the first catches a host that cannot start a browser, the second
+# a browser that starts and instantly dies. Either bound stops the relaunching;
+# a completed scrape restores both, so a merely flaky browser heals forever.
+_MAX_FAILED_BROWSER_RELAUNCHES = int(
+    os.environ.get("HOLD_MAX_FAILED_BROWSER_RELAUNCHES", "5")
+)
+_MAX_UNPRODUCTIVE_BROWSER_RELAUNCHES = int(
+    os.environ.get("HOLD_MAX_UNPRODUCTIVE_BROWSER_RELAUNCHES", "5")
+)
+_BROWSER_RELAUNCH_BACKOFF_SECONDS = float(
+    os.environ.get("HOLD_BROWSER_RELAUNCH_BACKOFF", "15")
+)
 
 
 class DriverDeath(Exception):
@@ -554,84 +576,90 @@ async def _run_batch(api: ApiClient, running_flag, headed: bool) -> bool:
     idle cost this mode exists to remove. So the browser is launched per
     batch and torn down after.
     """
-    global _RESIDENT
     if not headed:
         return await _run_poll_loop(api, running_flag, drain=True)
 
-    clean = True
-    try:
-        async with launch_browser(get_engine(), headless=False) as browser:
-            _RESIDENT = ResidentBrowser(browser)
-            await _RESIDENT.ensure_ready()
-            logger.info(
-                "Headed batch: window open. Solve any login/captcha in the "
-                "live tab; the window closes when the queue is drained."
-            )
-            try:
-                clean = await _run_poll_loop(api, running_flag, drain=True)
-            finally:
-                try:
-                    saved = await _RESIDENT.save_sessions()
-                    logger.info("Headed: saved sessions for %d domain(s)", saved)
-                except Exception:
-                    logger.warning("Headed: save_sessions failed", exc_info=True)
-                try:
-                    await _RESIDENT.close()
-                except Exception:
-                    logger.debug("Headed: resident close raised", exc_info=True)
-                _RESIDENT = None
-    except Exception as exc:
-        # Camoufox/Playwright can raise on teardown if the subprocess already
-        # took a signal. Sessions are persisted per-scrape, so a noisy close
-        # is cosmetic and must not mark the batch failed.
-        logger.info("Headed: browser shutdown finished with: %s", exc)
-    return clean
+    return await _run_supervised(api, running_flag, drain=True)
 
 
 async def _run_daemon(api: ApiClient, running_flag, headed: bool) -> bool:
     """--continuous: the original forever-poll, resident browser for its life.
 
-    Unchanged behaviour, kept for the case the schedule does not fit — a host
-    where scrapes genuinely arrive at unpredictable times. Not the default any
-    more, because for digest email they do not.
+    Kept for the case the schedule does not fit — a host where scrapes
+    genuinely arrive at unpredictable times. Not the default any more, because
+    for digest email they do not.
+
+    This is the mode CC-172 mattered most for: a batch at least got a fresh
+    browser at the next window, but a daemon that lost its browser process sat
+    in a 120s backoff cycle for as long as it was left running, because the
+    death counter only reset on a successful poll and no poll could succeed.
+    It now relaunches the process instead.
     """
-    global _RESIDENT
     if not headed:
         return await _run_poll_loop(api, running_flag)
 
-    clean = True
+    return await _run_supervised(api, running_flag, drain=False)
+
+
+async def _run_supervised(api: ApiClient, running_flag, drain: bool) -> bool:
+    """Headed run with browser-PROCESS supervision (CC-172).
+
+    Shared by the batch (``drain=True``) and daemon (``drain=False``) headed
+    paths, which differ only in how the poll loop decides it is finished.
+
+    The browser is deliberately NOT held in an ``async with`` here. The
+    context manager is owned by the :class:`ResidentSupervisor` instead, which
+    is the whole point: a manager pinned to this stack frame cannot be swapped,
+    so a dead browser process could only be waited on. Owning it means the
+    runner can bury the corpse and launch a replacement without unwinding, and
+    then keep claiming.
+    """
+    global _RESIDENT
+    supervisor = ResidentSupervisor(
+        lambda: launch_browser(get_engine(), headless=False),
+        max_failed_relaunches=_MAX_FAILED_BROWSER_RELAUNCHES,
+        max_unproductive_relaunches=_MAX_UNPRODUCTIVE_BROWSER_RELAUNCHES,
+        backoff_seconds=_BROWSER_RELAUNCH_BACKOFF_SECONDS,
+    )
+
     try:
-        async with launch_browser(get_engine(), headless=False) as browser:
-            _RESIDENT = ResidentBrowser(browser)
-            # Build the context + persistent work-page eagerly so the resident
-            # window is up before the first scrape (idle = one tab on
-            # about:blank), not conjured lazily on first claim.
-            await _RESIDENT.ensure_ready()
+        _RESIDENT = await supervisor.start()
+    except Exception:
+        # Unlike a teardown error, a launch error is fatal: no browser means
+        # no scrape will ever succeed. Report it rather than idling politely.
+        logger.exception("Headed: initial browser launch failed — claiming nothing")
+        _RESIDENT = None
+        return False
+
+    if drain:
+        logger.info(
+            "Headed batch: window open. Solve any login/captcha in the live "
+            "tab; the window closes when the queue is drained."
+        )
+    else:
+        logger.info(
+            "Headed: ready. One persistent tab stays open in the resident "
+            "window; each scrape navigates that same tab to the job URL and "
+            "leaves it there. Solve captchas in the live tab as scrapes arrive."
+        )
+
+    try:
+        return await _run_poll_loop(api, running_flag, drain=drain, supervisor=supervisor)
+    finally:
+        _RESIDENT = None
+        try:
+            saved = await supervisor.close()
             logger.info(
-                "Headed: ready. One persistent tab stays open in the resident "
-                "window; each scrape navigates that same tab to the job URL "
-                "and leaves it there. Solve captchas in the live tab as "
-                "scrapes arrive."
+                "Headed: saved sessions for %d domain(s); browser was "
+                "relaunched %d time(s) this run",
+                saved,
+                supervisor.total_relaunches,
             )
-            try:
-                clean = await _run_poll_loop(api, running_flag)
-            finally:
-                try:
-                    saved = await _RESIDENT.save_sessions()
-                    logger.info("Headed: saved sessions for %d domain(s)", saved)
-                except Exception:
-                    logger.warning("Headed: save_sessions failed", exc_info=True)
-                try:
-                    await _RESIDENT.close()
-                except Exception:
-                    logger.debug("Headed: resident close raised", exc_info=True)
-                _RESIDENT = None
-    except Exception as exc:
-        # Camoufox / Playwright can raise here if the subprocess received
-        # SIGINT ahead of us — the pipe is already closed so browser.close()
-        # has nothing to reply. Session state is already on disk.
-        logger.info("Headed: browser shutdown finished with: %s", exc)
-    return clean
+        except Exception as exc:
+            # Camoufox/Playwright can raise on teardown if the subprocess
+            # already took a signal. Sessions are persisted per-scrape, so a
+            # noisy close is cosmetic and must not change the run's verdict.
+            logger.info("Headed: browser shutdown finished with: %s", exc)
 
 
 async def run_scheduled(
@@ -665,7 +693,39 @@ async def run_scheduled(
     return all_clean
 
 
-async def _run_poll_loop(api: ApiClient, running_flag, drain: bool = False) -> bool:
+async def _relaunch_dead_browser(supervisor: ResidentSupervisor, exc) -> bool:
+    """Relaunch the browser PROCESS after repeated driver deaths (CC-172).
+
+    ``ResidentBrowser`` has already rebuilt its context and failed, so the
+    process is gone. Nothing outside this runner will respawn it: it is
+    launched from tmux, the runner never exits, and a ``Restart=`` unit
+    therefore never fires. So the runner respawns it here.
+
+    Returns True when a live resident is ready and claiming can resume.
+    """
+    global _RESIDENT
+    logger.error(
+        "Browser driver dead %d cycles running (%s) — the browser PROCESS is "
+        "gone. Relaunching it in-process (CC-172); holds stay claimable and "
+        "nothing is marked failed.",
+        _DRIVER_DEATH_BACKOFF_THRESHOLD,
+        exc,
+    )
+    # Drop the corpse before the swap so a scrape claimed mid-relaunch cannot
+    # reach through _RESIDENT to a browser that is being torn down.
+    _RESIDENT = None
+    if not await supervisor.relaunch_process():
+        return False
+    _RESIDENT = supervisor.resident
+    return True
+
+
+async def _run_poll_loop(
+    api: ApiClient,
+    running_flag,
+    drain: bool = False,
+    supervisor: ResidentSupervisor | None = None,
+) -> bool:
     """Claim and process hold scrapes.
 
     Default (drain=False) is the long-lived daemon: poll forever at
@@ -681,6 +741,13 @@ async def _run_poll_loop(api: ApiClient, running_flag, drain: bool = False) -> b
     Returns True if the loop ended cleanly, False if it gave up on a dead
     browser — main() turns that into a non-zero exit so a scheduled run is
     recorded as failed rather than silently doing nothing.
+
+    ``supervisor`` (headed runs only) owns the browser process. Given one, a
+    run of consecutive driver deaths escalates to relaunching that process and
+    resuming, instead of backing off and waiting for an external supervisor
+    that does not exist (CC-172). Without one — headless mode, where
+    ``_run_graph`` already launches a fresh browser per scrape — behaviour is
+    unchanged.
     """
     consecutive_driver_deaths = 0
     idle_polls = 0
@@ -695,6 +762,12 @@ async def _run_poll_loop(api: ApiClient, running_flag, drain: bool = False) -> b
                 processed += count
                 did_work = True
                 idle_polls = 0
+                # Real work on the current browser — restore its relaunch
+                # budget. A browser that dies occasionally but keeps earning
+                # its keep should be healed indefinitely; only one that never
+                # gets a scrape done exhausts the budget (CC-172).
+                if supervisor is not None:
+                    supervisor.note_progress()
             else:
                 idle_polls += 1
             consecutive_driver_deaths = 0
@@ -702,10 +775,23 @@ async def _run_poll_loop(api: ApiClient, running_flag, drain: bool = False) -> b
             # The resident browser is dead and could not be rebuilt. The
             # claimed scrape was already re-queued as `hold` (not failed).
             # Stop hammering claim-next: count the death and, once we cross
-            # the threshold, back off hard with a loud ERROR so the outage is
-            # visible in logfire instead of silently draining the queue.
+            # the threshold, relaunch the browser process (CC-172) or — if
+            # that is not possible or has run out of budget — back off hard
+            # with a loud ERROR so the outage is visible in logfire instead of
+            # silently draining the queue.
             consecutive_driver_deaths += 1
             if consecutive_driver_deaths >= _DRIVER_DEATH_BACKOFF_THRESHOLD:
+                # CC-172: before giving up, try to fix the actual problem —
+                # relaunch the browser process. Only a relaunch that fails (or
+                # a spent budget) falls through to the give-up paths below.
+                if supervisor is not None and await _relaunch_dead_browser(
+                    supervisor, exc
+                ):
+                    consecutive_driver_deaths = 0
+                    # Straight back to claiming on the fresh browser rather
+                    # than sitting out a poll interval; the queue is full of
+                    # holds this outage re-queued.
+                    continue
                 if drain:
                     # A batch run has nobody watching and no reason to sit in
                     # a backoff cycle until the next timer fires. Give up
